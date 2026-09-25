@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.sqlite3*
+data/
+backups/
+secrets/
+docker-compose.authorization.yml
+.coverage
