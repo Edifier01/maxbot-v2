@@ -46,6 +46,33 @@ def test_group_proxy_invite_and_message_pool_are_owner_scoped(tmp_path, monkeypa
     assert client.put("/api/messages", headers=headers, json={"texts": ["same", "same"]}).status_code == 422
 
 
+def test_proxy_url_only_accepts_schemes_supported_by_pinned_pymax(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    for scheme in ("https", "socks5h"):
+        response = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": scheme, "url": f"{scheme}://127.0.0.1:1080"})
+        assert response.status_code == 422
+        assert response.json()["detail"] == "invalid_proxy_url"
+    for url in ("socks5://127.0.0.1", "http://127.0.0.1:99999"):
+        response = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "invalid", "url": url})
+        assert response.status_code == 422
+    for scheme in ("http", "socks5"):
+        response = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": scheme, "url": f"{scheme}://127.0.0.1:1080"})
+        assert response.status_code == 201
+
+
+def test_group_invite_link_must_be_resolvable_by_pinned_pymax(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    response = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/group/test"})
+    assert response.status_code == 422
+    assert response.json()["detail"] == "invalid_max_invite_link"
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    response = client.put(f"/api/groups/{group_id}", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/group/test", "active": True})
+    assert response.status_code == 422
+
+
 def test_guest_auth_stays_closed_without_authorization_and_csrf_is_required(tmp_path, monkeypatch):
     client, _csrf = owner_client(tmp_path, monkeypatch)
     no_csrf = client.post("/api/groups", json={"name": "Клуб", "invite_link": "https://max.ru/join/test"})

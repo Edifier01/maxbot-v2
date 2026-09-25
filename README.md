@@ -28,7 +28,7 @@ python scripts/hash_password.py
 
 ## PyMax
 
-Используется только версия `maxapi-python==2.4.1`. Документация: [Client](https://docs.pymax.org/client.html), [ExtraConfig](https://docs.pymax.org/api/client-config.html), [Messages](https://docs.pymax.org/messages.html). Клиент подключается с закреплённым прокси и отдельно зашифрованным session snapshot; временная SQLite-сессия находится в tmpfs контейнера. Эта интеграция опирается на неофициальный API MAX.
+Используется только версия `maxapi-python==2.4.1`. Документация: [Client](https://docs.pymax.org/client.html), [ExtraConfig](https://docs.pymax.org/api/client-config.html), [Messages](https://docs.pymax.org/messages.html). Клиент подключается с закреплённым прокси и отдельно зашифрованным session snapshot; временная SQLite-сессия находится в tmpfs контейнера. Для TCP-клиента принимаются прокси `http://` и `socks5://` с портом. Ссылка группы должна иметь вид `https://max.ru/join/...` или `https://max.im/join/...`: `resolve_group_by_link()` обрабатывает только ссылки с `/join/`. Эта интеграция опирается на неофициальный API MAX.
 
 ## Документы
 

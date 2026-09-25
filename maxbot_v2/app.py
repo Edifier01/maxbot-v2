@@ -73,6 +73,22 @@ class OperationResolutionBody(BaseModel):
     provider_message_id: str | None = Field(default=None, max_length=200)
 
 
+def _valid_max_invite_link(link: str) -> bool:
+    try:
+        parsed = urlsplit(link.strip())
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname in {"max.ru", "max.im"}
+            and parsed.port is None
+            and parsed.path.startswith("/join/")
+            and len(parsed.path) > len("/join/")
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
+
+
 def create_app(
     *,
     db_path: str | Path | None = None,
@@ -292,9 +308,12 @@ def create_app(
 
     @app.post("/api/groups/{group_id}/proxies", status_code=201)
     def add_proxy(group_id: int, body: ProxyBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
-        from urllib.parse import urlsplit
-        parsed = urlsplit(body.url)
-        if parsed.scheme not in ("http", "https", "socks5", "socks5h") or not parsed.hostname:
+        try:
+            parsed = urlsplit(body.url)
+            valid = parsed.scheme in ("http", "socks5") and bool(parsed.hostname) and parsed.port is not None and parsed.port > 0
+        except ValueError:
+            valid = False
+        if not valid:
             raise HTTPException(422, "invalid_proxy_url")
         try:
             encrypted = SecretBox().encrypt(body.url)
@@ -602,7 +621,7 @@ def create_app(
 
     @app.post("/api/groups", status_code=201)
     async def add_group(body: GroupBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
-        if not body.invite_link.startswith(("https://max.ru/", "https://max.im/")):
+        if not _valid_max_invite_link(body.invite_link):
             raise HTTPException(422, "invalid_max_invite_link")
         with db() as connection:
             cursor = connection.execute("INSERT INTO groups(name,invite_link) VALUES(?,?)", (body.name.strip(), body.invite_link.strip()))
@@ -613,7 +632,7 @@ def create_app(
 
     @app.put("/api/groups/{group_id}")
     async def update_group(group_id: int, body: GroupUpdateBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
-        if not body.invite_link.startswith(("https://max.ru/", "https://max.im/")):
+        if not _valid_max_invite_link(body.invite_link):
             raise HTTPException(422, "invalid_max_invite_link")
         with db() as connection:
             old = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
