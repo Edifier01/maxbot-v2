@@ -6,6 +6,7 @@ services:
       - path: .env
         required: false
     expose: ["8000"]
+    # MAX calls use the configured account and group proxy directly.
     volumes:
       - maxbot_data:/data
     tmpfs:

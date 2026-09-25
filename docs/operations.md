@@ -1,28 +1,8 @@
 # Эксплуатация и защита действий MAX
 
-## Закрытый по умолчанию шлюз
+## Вызовы PyMax
 
-Приложение не выполняет внешний вызов MAX, если не может прочитать `MAX_AUTHORIZATION_FILE` и проверить запись со следующей структурой. В обычном `docker-compose.yml` secret не подключён, поэтому шлюз закрыт. Только если применение разрешено, создайте каталог `secrets` и файл разрешения вне Git, скопируйте overlay и запустите Compose с двумя файлами:
-
-```sh
-cp docker-compose.authorization.yml.example docker-compose.authorization.yml
-mkdir -p secrets
-# Создайте secrets/max-authorization.json из подтверждённой операторской записи.
-docker compose -f docker-compose.yml -f docker-compose.authorization.yml up -d --build
-```
-
-Путь secret в контейнере — `/run/secrets/max-authorization.json`, он read-only.
-
-```json
-{
-  "status": "authorized",
-  "contract_reference": "internal reference",
-  "expires_at": "2030-01-01T00:00:00Z",
-  "scopes": ["connect", "request_otp", "verify_auth", "resolve_group", "check_membership", "send"]
-}
-```
-
-Поместите файл вне Git и смонтируйте read-only в app-контейнер. Это операторская запись для выпуска, не пользовательский API и не переключатель в панели. Установка, файл и области действия должны соответствовать реально разрешённому сценарию на платформе MAX. Условия MAX отдельно оговаривают массовые рассылки и наличие соответствующего договора: <https://dev.max.ru/docs/legal/requirements>.
+Подключение, проверка участия и отправка выполняются через единственный адаптер PyMax и назначенный аккаунту прокси. До запуска проверьте правильность ссылки группы, прокси и тестового аккаунта: при отсутствии отдельного локального файла-блокиратора приложение сразу выполняет настроенные действия MAX.
 
 ## Резервное копирование
 

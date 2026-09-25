@@ -5,27 +5,23 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from .action_gate import ActionGate
 from .max_adapter import PyMaxAdapter
 from .scheduling import assign_proxy
 
 
 class WebCodeAuthFlow:
     """PyMax AuthFlow bridge to short-lived web OTP / 2FA queues."""
-    def __init__(self, gate: ActionGate, update: Callable[[str, str], None]):
-        self.gate = gate
+    def __init__(self, update: Callable[[str, str], None]):
         self.update = update
         self.codes: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
         self.passwords: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
 
     async def authenticate(self, app: Any):
         from pymax.auth.models import AuthResult
-        self.gate.require("request_otp")
         self.update("requesting_code", "")
         start = await app.api.auth.request_code(str(app.config.phone))
         self.update("waiting_code", "")
         code = await asyncio.wait_for(self.codes.get(), timeout=300)
-        self.gate.require("verify_auth")
         self.update("verifying_code", "")
         result = await app.api.auth.send_code(start.token, code)
         login_token = result.login_token
@@ -34,7 +30,6 @@ class WebCodeAuthFlow:
             for _ in range(5):
                 self.update("waiting_password", str(result.password_challenge.hint or ""))
                 password = await asyncio.wait_for(self.passwords.get(), timeout=300)
-                self.gate.require("verify_auth")
                 try:
                     answer = await app.api.auth.check_password(track_id, password)
                 except Exception:

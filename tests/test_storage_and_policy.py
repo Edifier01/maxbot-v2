@@ -1,11 +1,7 @@
-import json
 import sqlite3
 import asyncio
 from types import SimpleNamespace
 
-import pytest
-
-from maxbot_v2.action_gate import ActionGate, ActionsClosed
 from maxbot_v2.crypto import SecretBox
 from maxbot_v2.db import initialize
 from maxbot_v2.session_vault import EncryptedSessionFile
@@ -15,22 +11,7 @@ from scripts.backup import create_backup
 from scripts.restore import restore_backup
 
 
-def test_action_gate_fails_closed_then_checks_scope_and_expiry(tmp_path):
-    gate = ActionGate(tmp_path / "missing.json")
-    with pytest.raises(ActionsClosed):
-        gate.require("send")
-    path = tmp_path / "authorization.json"
-    path.write_text(json.dumps({"status": "authorized", "contract_reference": "ref-1", "expires_at": "2099-01-01T00:00:00Z", "scopes": ["connect"]}))
-    gate = ActionGate(path)
-    gate.require("connect")
-    with pytest.raises(ActionsClosed):
-        gate.require("send")
-
-
-def test_pymax_adapter_checks_gate_and_requires_provider_message_id(tmp_path):
-    path = tmp_path / "authorization.json"
-    path.write_text(json.dumps({"status": "authorized", "contract_reference": "ref", "expires_at": "2099-01-01T00:00:00Z", "scopes": ["connect", "send"]}))
-
+def test_pymax_adapter_calls_provider_without_local_authorization_file():
     class FakeClient:
         def __init__(self):
             self.calls = []
@@ -43,14 +24,11 @@ def test_pymax_adapter_checks_gate_and_requires_provider_message_id(tmp_path):
             self.calls.append("close")
 
     client = FakeClient()
-    adapter = PyMaxAdapter(client, ActionGate(path))
+    adapter = PyMaxAdapter(client)
     asyncio.run(adapter.connect())
     accepted = asyncio.run(adapter.send_message(chat_id=12, text="hello"))
     assert accepted.message_id == "msg-1"
     assert client.calls == ["connect", {"chat_id": 12, "text": "hello"}]
-    closed = PyMaxAdapter(client, ActionGate(tmp_path / "missing.json"))
-    with pytest.raises(ActionsClosed):
-        asyncio.run(closed.send_message(chat_id=12, text="hello"))
     assert len(client.calls) == 2
 
 
@@ -58,7 +36,7 @@ def test_pinned_pymax_client_constructs_with_proxy_and_encrypted_session_vault(t
     from importlib.metadata import version
     assert version("maxapi-python") == "2.4.1"
     vault = EncryptedSessionFile(10, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
-    adapter = PyMaxAdapter.create(phone="+70000000000", work_dir="", session_name="", proxy="socks5://127.0.0.1:1080", gate=ActionGate(tmp_path / "no-permission.json"), session_vault=vault)
+    adapter = PyMaxAdapter.create(phone="+70000000000", work_dir="", session_name="", proxy="socks5://127.0.0.1:1080", session_vault=vault)
     assert adapter.client is not None
     assert adapter.client.extra_config.proxy == "socks5://127.0.0.1:1080"
     assert not (tmp_path / "encrypted" / "account-10.session.enc").exists()

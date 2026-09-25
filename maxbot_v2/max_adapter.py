@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 from importlib.metadata import version
 from typing import Any
 
-from .action_gate import ActionGate
 from .session_vault import EncryptedSessionFile
 
 
@@ -28,13 +27,12 @@ class NoInteractiveAuthFlow:
 
 
 class PyMaxAdapter:
-    """The single boundary for PyMax calls. No network call bypasses ActionGate."""
-    def __init__(self, client: Any, gate: ActionGate):
+    """The single boundary for PyMax calls."""
+    def __init__(self, client: Any):
         self.client = client
-        self.gate = gate
 
     @classmethod
-    def create(cls, *, phone: str, work_dir: str, session_name: str, proxy: str | None, gate: ActionGate, auth_flow: Any = None, session_vault: EncryptedSessionFile | None = None):
+    def create(cls, *, phone: str, work_dir: str, session_name: str, proxy: str | None, auth_flow: Any = None, session_vault: EncryptedSessionFile | None = None):
         try:
             if not proxy:
                 raise AdapterUnavailable("proxy_assignment_required")
@@ -51,24 +49,20 @@ class PyMaxAdapter:
             raise
         except Exception as exc:
             raise AdapterUnavailable("pymax_unavailable") from exc
-        result = cls(client, gate)
+        result = cls(client)
         result._session_vault = session_vault
         return result
 
     async def connect(self) -> None:
-        self.gate.require("connect")
         await self.client.connect()
 
     async def resolve_group_by_link(self, link: str):
-        self.gate.require("resolve_group")
         return await self.client.resolve_group_by_link(link)
 
     async def get_chat(self, chat_id: int):
-        self.gate.require("check_membership")
         return await self.client.get_chat(chat_id)
 
     async def send_message(self, *, chat_id: int, text: str) -> AcceptedMessage:
-        self.gate.require("send")
         response = await self.client.send_message(chat_id=chat_id, text=text)
         message_id = str(getattr(response, "id", "") or "").strip()
         if not message_id:

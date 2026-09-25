@@ -9,7 +9,6 @@ from typing import Callable, Any
 from zoneinfo import ZoneInfo
 
 from .db import connect
-from .action_gate import ActionsClosed
 from .planning import prepare_week
 from .sender import KnownPreSendFailure, Sender
 
@@ -142,9 +141,6 @@ class GroupWorkerManager:
                     try:
                         provider = await self.provider_factory(slot)
                         await Sender(db, provider, sleep=self.sleep).send_slot(slot["slot_id"], chat_id=int(slot["chat_id"]))
-                    except ActionsClosed:
-                        # Missing/expired authorization is a hard hold, not a send attempt.
-                        break
                     except Exception:
                         class ConnectionFailure:
                             async def send_message(self, **kwargs):

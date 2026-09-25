@@ -22,7 +22,6 @@ from .crypto import SecretBox
 from .message_pool import replace_message_pool
 from .onboarding import WebCodeAuthFlow, attach_group_on_first_account, member_proof, prepare_account
 from .max_adapter import PyMaxAdapter
-from .action_gate import ActionGate
 from .session_vault import EncryptedSessionFile
 from .workers import GroupWorkerManager
 from .sender import recover_in_flight
@@ -122,10 +121,7 @@ def create_app(
 
     runtime_dir = Path(os.getenv("SESSION_RUNTIME_DIR", "/run/maxbot-sessions"))
     sessions_dir = data / "sessions"
-    action_gate = ActionGate()
-
     async def scheduled_provider(slot):
-        action_gate.require("send")
         with db() as connection:
             row = connection.execute(
                 "SELECT a.phone,p.url_ciphertext FROM accounts a JOIN proxy_assignments pa ON pa.account_id=a.id "
@@ -136,7 +132,7 @@ def create_app(
             raise RuntimeError("proxy_assignment_unavailable")
         proxy = SecretBox().decrypt(row["url_ciphertext"])
         vault = EncryptedSessionFile(slot["account_id"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
-        adapter = PyMaxAdapter.create(phone=row["phone"], work_dir="", session_name="", proxy=proxy, gate=action_gate, session_vault=vault)
+        adapter = PyMaxAdapter.create(phone=row["phone"], work_dir="", session_name="", proxy=proxy, session_vault=vault)
         await adapter.connect()
         return adapter
 
@@ -256,7 +252,7 @@ def create_app(
                 for table in ("groups", "accounts", "weekly_slots")
             }
             settings = dict(connection.execute("SELECT key,value FROM settings WHERE key IN ('auto_run','global_stop')").fetchall())
-        return {"counts": counts, "auto_run": settings.get("auto_run") == "1", "stopped": settings.get("global_stop") == "1", "max_actions_enabled": action_gate.enabled("send")}
+        return {"counts": counts, "auto_run": settings.get("auto_run") == "1", "stopped": settings.get("global_stop") == "1"}
 
     @app.get("/api/groups")
     def groups(_session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
@@ -356,7 +352,7 @@ def create_app(
     def settings(_session: sqlite3.Row = Depends(current_session)) -> dict[str, object]:
         with db() as connection:
             values = dict(connection.execute("SELECT key,value FROM settings").fetchall())
-        return {"timezone": values["timezone"], "send_windows_weekday": values["send_windows_weekday"], "send_windows_weekend": values["send_windows_weekend"], "delay_min_sec": int(values["delay_min_sec"]), "delay_max_sec": int(values["delay_max_sec"]), "auto_run": values["auto_run"] == "1", "global_stop": values["global_stop"] == "1", "max_actions_enabled": action_gate.enabled("send")}
+        return {"timezone": values["timezone"], "send_windows_weekday": values["send_windows_weekday"], "send_windows_weekend": values["send_windows_weekend"], "delay_min_sec": int(values["delay_min_sec"]), "delay_max_sec": int(values["delay_max_sec"]), "auto_run": values["auto_run"] == "1", "global_stop": values["global_stop"] == "1"}
 
     @app.put("/api/settings")
     def update_settings(body: SettingsBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
@@ -453,11 +449,6 @@ def create_app(
         remote = request.client.host if request.client else "unknown"
         if rate_limited(f"guest-start:{digest_token(remote)}:{digest_token(token)}", 5, 900):
             raise HTTPException(429, "onboarding_rate_limited")
-        try:
-            for action in ("connect", "request_otp", "verify_auth", "resolve_group"):
-                action_gate.require(action)
-        except Exception as exc:
-            raise HTTPException(503, "max_actions_not_authorized") from exc
         payload = await request.json()
         full_name = str(payload.get("full_name", "")).strip()[:120]
         phone = str(payload.get("phone", "")).strip()
@@ -491,7 +482,7 @@ def create_app(
                 raise HTTPException(503, "proxy_unavailable") from exc
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "phone_already_exists") from exc
-        flow = WebCodeAuthFlow(action_gate, lambda state, hint: (set_onboarding_state(session_id, state, hint), setattr(flow, "hint", hint)))
+        flow = WebCodeAuthFlow(lambda state, hint: (set_onboarding_state(session_id, state, hint), setattr(flow, "hint", hint)))
         app.state.onboarding_flows[session_id] = {"flow": flow, "account_id": account_id, "group_id": row["group_id"], "phone": phone, "proxy": proxy_url}
         asyncio.create_task(run_onboarding_auth(session_id, row["invite_link"]))
         return {"session_id": session_id, "state": "starting", "group": row["name"]}
@@ -507,7 +498,7 @@ def create_app(
         vault = EncryptedSessionFile(runtime["account_id"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
         adapter = None
         try:
-            adapter = PyMaxAdapter.create(phone=runtime["phone"], work_dir="", session_name="", proxy=runtime["proxy"], gate=action_gate, auth_flow=runtime["flow"], session_vault=vault)
+            adapter = PyMaxAdapter.create(phone=runtime["phone"], work_dir="", session_name="", proxy=runtime["proxy"], auth_flow=runtime["flow"], session_vault=vault)
             await adapter.connect()
             profile = getattr(adapter.client, "me", None)
             contact = getattr(profile, "contact", None)
@@ -602,9 +593,8 @@ def create_app(
             raise HTTPException(404, "onboarding_session_unavailable")
         try:
             proxy_url = SecretBox().decrypt(row["url_ciphertext"])
-            gate = action_gate
             vault = EncryptedSessionFile(row["account_id"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
-            adapter = PyMaxAdapter.create(phone=row["phone"], work_dir="", session_name="", proxy=proxy_url, gate=gate, session_vault=vault)
+            adapter = PyMaxAdapter.create(phone=row["phone"], work_dir="", session_name="", proxy=proxy_url, session_vault=vault)
             try:
                 await adapter.connect()
                 chat = await adapter.get_chat(int(row["chat_id"]))
@@ -678,11 +668,6 @@ def create_app(
 
     @app.post("/api/groups/{group_id}/verify-destination")
     async def verify_destination(group_id: int, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
-        for action in ("connect", "resolve_group", "check_membership"):
-            try:
-                action_gate.require(action)
-            except Exception as exc:
-                raise HTTPException(503, "max_actions_not_authorized") from exc
         with db() as connection:
             group = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
             accounts = connection.execute(
@@ -701,7 +686,7 @@ def create_app(
             try:
                 proxy = SecretBox().decrypt(account["url_ciphertext"])
                 vault = EncryptedSessionFile(account["id"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
-                adapter = PyMaxAdapter.create(phone=account["phone"], work_dir="", session_name="", proxy=proxy, gate=action_gate, session_vault=vault)
+                adapter = PyMaxAdapter.create(phone=account["phone"], work_dir="", session_name="", proxy=proxy, session_vault=vault)
                 await adapter.connect()
                 if index == 0:
                     resolved = await adapter.resolve_group_by_link(group["invite_link"])

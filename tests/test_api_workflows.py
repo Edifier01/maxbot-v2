@@ -1,3 +1,5 @@
+import asyncio
+
 import bcrypt
 from fastapi.testclient import TestClient
 
@@ -73,16 +75,32 @@ def test_group_invite_link_must_be_resolvable_by_pinned_pymax(tmp_path, monkeypa
     assert response.status_code == 422
 
 
-def test_guest_auth_stays_closed_without_authorization_and_csrf_is_required(tmp_path, monkeypatch):
+def test_guest_auth_start_is_not_blocked_by_local_authorization_file(tmp_path, monkeypatch):
+    async def no_worker_sync(_manager):
+        return None
+
+    real_create_task = asyncio.create_task
+
+    def skip_onboarding_network(coroutine, **kwargs):
+        if coroutine.cr_code.co_name == "run_onboarding_auth":
+            coroutine.close()
+            return None
+        return real_create_task(coroutine, **kwargs)
+
+    monkeypatch.setenv("MAX_AUTHORIZATION_FILE", str(tmp_path / "missing.json"))
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", skip_onboarding_network)
+    monkeypatch.setattr("maxbot_v2.workers.GroupWorkerManager._sync_group_workers", no_worker_sync)
     client, _csrf = owner_client(tmp_path, monkeypatch)
     no_csrf = client.post("/api/groups", json={"name": "Клуб", "invite_link": "https://max.ru/join/test"})
     assert no_csrf.status_code == 403
     csrf = client.cookies.get("owner_csrf")
     group = client.post("/api/groups", headers={"X-CSRF-Token": csrf}, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"})
+    client.post(f"/api/groups/{group.json()['id']}/proxies", headers={"X-CSRF-Token": csrf}, json={"label": "test", "url": "socks5://127.0.0.1:1080"})
     link = client.post(f"/api/groups/{group.json()['id']}/onboarding-link", headers={"X-CSRF-Token": csrf}, json={}).json()["url"]
     token = link.rsplit("/", 1)[1]
     response = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
-    assert response.status_code == 503
+    assert response.status_code == 200
+    assert response.json()["state"] == "starting"
 
 
 def test_unknown_operation_can_be_manually_resolved_without_duplicate_count(tmp_path, monkeypatch):

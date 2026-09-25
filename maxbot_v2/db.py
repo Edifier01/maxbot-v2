@@ -161,7 +161,6 @@ DEFAULTS = {
     "delay_max_sec": "15",
     "auto_run": "1",
     "global_stop": "0",
-    "max_actions_enabled": "0",
 }
 
 

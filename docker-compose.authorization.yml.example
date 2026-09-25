@@ -1,8 +1,0 @@
-services:
-  app:
-    secrets:
-      - source: max-authorization
-        target: max-authorization.json
-secrets:
-  max-authorization:
-    file: ./secrets/max-authorization.json
