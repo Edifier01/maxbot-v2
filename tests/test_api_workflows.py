@@ -308,3 +308,174 @@ def test_unknown_operation_can_be_manually_resolved_without_duplicate_count(tmp_
         assert connection.execute("SELECT status FROM weekly_slots").fetchone()[0] == "accepted"
     finally:
         connection.close()
+
+
+def test_broken_proxy_does_not_leave_a_stuck_onboarding_attempt(tmp_path, monkeypatch):
+    async def no_worker_sync(_manager):
+        return None
+
+    real_create_task = asyncio.create_task
+
+    def skip_onboarding_network(coroutine, **kwargs):
+        if coroutine.cr_code.co_name == "run_onboarding_auth":
+            coroutine.close()
+            return None
+        return real_create_task(coroutine, **kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", skip_onboarding_network)
+    monkeypatch.setattr("maxbot_v2.workers.GroupWorkerManager._sync_group_workers", no_worker_sync)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    proxy = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"}).json()
+    link = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={}).json()["url"]
+    token = link.rsplit("/", 1)[1]
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("UPDATE proxies SET url_ciphertext='broken-ciphertext' WHERE id=?", (proxy["id"],))
+    finally:
+        connection.close()
+
+    failed = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
+    assert failed.status_code == 503
+    connection = connect(client.app.state.database)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM onboarding_sessions WHERE state='starting'").fetchone()[0] == 0
+        connection.execute("UPDATE proxies SET url_ciphertext=? WHERE id=?", (SecretBox().encrypt("socks5://127.0.0.1:1080"), proxy["id"]))
+    finally:
+        connection.close()
+
+    retried = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
+    assert retried.status_code == 200
+
+
+def test_rotating_guest_link_cancels_existing_attempt_and_rejects_otp(tmp_path, monkeypatch):
+    async def no_worker_sync(_manager):
+        return None
+
+    real_create_task = asyncio.create_task
+
+    def skip_onboarding_network(coroutine, **kwargs):
+        if coroutine.cr_code.co_name == "run_onboarding_auth":
+            coroutine.close()
+            return None
+        return real_create_task(coroutine, **kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", skip_onboarding_network)
+    monkeypatch.setattr("maxbot_v2.workers.GroupWorkerManager._sync_group_workers", no_worker_sync)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"})
+    token = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={}).json()["url"].rsplit("/", 1)[1]
+    started = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"}).json()
+    session_id = started["session_id"]
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("UPDATE onboarding_sessions SET state='waiting_code' WHERE id=?", (session_id,))
+    finally:
+        connection.close()
+
+    rotated = client.post(f"/api/groups/{group_id}/onboarding-link?rotate=1", headers=headers, json={})
+
+    assert rotated.status_code == 200
+    status = client.get(f"/api/public/onboarding/{token}/{session_id}")
+    assert status.status_code == 200
+    assert status.json()["state"] == "cancelled"
+    rejected = client.post(f"/api/public/onboarding/{token}/{session_id}/code", json={"code": "123456"})
+    assert rejected.status_code == 410
+
+
+def test_destination_verification_includes_accounts_needing_membership(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    class FakeAdapter:
+        async def connect(self):
+            return None
+
+        async def resolve_group_by_link(self, _link):
+            return SimpleNamespace(id=123)
+
+        async def get_chat(self, _chat_id):
+            return SimpleNamespace(id=123, status="member", join_time=1)
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(lambda _cls, **_kwargs: FakeAdapter()))
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    proxy = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"}).json()
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'needs_membership')", (group_id, "+79990000000", "Иван"))
+        account_id = connection.execute("SELECT id FROM accounts WHERE phone='+79990000000'").fetchone()[0]
+        connection.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy["id"]))
+    finally:
+        connection.close()
+
+    response = client.post(f"/api/groups/{group_id}/verify-destination", headers=headers, json={})
+
+    assert response.status_code == 200
+    assert response.json()["verified_accounts"] == 1
+    assert client.get(f"/api/groups/{group_id}/accounts").json()[0]["status"] == "active"
+
+
+def test_destination_verification_button_requires_an_assigned_enabled_proxy(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    proxy = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"}).json()
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'needs_membership')", (group_id, "+79990000000", "Иван"))
+        account_id = connection.execute("SELECT id FROM accounts WHERE phone='+79990000000'").fetchone()[0]
+    finally:
+        connection.close()
+
+    assert client.get("/api/groups").json()[0]["verifiable_account_count"] == 0
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy["id"]))
+        connection.execute("UPDATE proxies SET enabled=0 WHERE id=?", (proxy["id"],))
+    finally:
+        connection.close()
+    assert client.get("/api/groups").json()[0]["verifiable_account_count"] == 0
+
+
+def test_manual_run_control_is_independent_from_restart_autostart(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUILD_REVISION", "test-revision")
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    settings = client.get("/api/settings").json()
+    settings["auto_run"] = False
+    assert client.put("/api/settings", headers=headers, json=settings).status_code == 200
+
+    assert client.post("/api/run/stop", headers=headers, json={}).json()["stopped"] is True
+    started = client.post("/api/run/start", headers=headers, json={})
+
+    assert started.json()["stopped"] is False
+    overview = client.get("/api/overview").json()
+    assert overview["stopped"] is False
+    assert overview["auto_run"] is False
+    assert overview["run_wait_reason"]
+    assert client.get("/health").json() == {"status": "ok", "revision": "test-revision"}
+
+
+def test_autostart_off_starts_stopped_but_manual_start_works(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("UPDATE settings SET value='0' WHERE key='auto_run'")
+        connection.execute("UPDATE settings SET value='0' WHERE key='global_stop'")
+    finally:
+        connection.close()
+
+    with client:
+        overview = client.get("/api/overview").json()
+        assert overview["auto_run"] is False
+        assert overview["stopped"] is True
+        assert client.post("/api/run/start", headers=headers, json={}).json()["stopped"] is False
+        assert client.get("/api/overview").json()["stopped"] is False

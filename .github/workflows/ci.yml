@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-and-browser:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Install development dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Install Chromium on Linux
+        if: runner.os == 'Linux'
+        run: python -m playwright install --with-deps chromium
+      - name: Install Chromium on Windows
+        if: runner.os == 'Windows'
+        run: python -m playwright install chromium
+      - name: Run Python tests
+        run: python -m pytest -q --ignore=tests/test_browser_workflows.py
+      - name: Run browser tests in an isolated pytest process
+        run: python -m pytest -q tests/test_browser_workflows.py
+      - name: Check browser scripts
+        run: |
+          node --check static/app.js
+          node --check static/join.js
+          node --test tests/test_join_start.cjs
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Docker image
+        run: docker build --build-arg BUILD_REVISION=${{ github.sha }} -t maxbot-v2:${{ github.sha }} .

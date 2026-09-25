@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import sqlite3
 import uuid
@@ -10,7 +11,10 @@ from zoneinfo import ZoneInfo
 
 from .db import connect
 from .planning import prepare_week
-from .sender import KnownPreSendFailure, Sender
+from .sender import DispatchPaused, KnownPreSendFailure, Sender
+
+
+logger = logging.getLogger(__name__)
 
 
 class GroupWorkerManager:
@@ -38,11 +42,16 @@ class GroupWorkerManager:
 
     async def stop(self) -> None:
         self._stopping.set()
-        tasks = list(self.tasks.values()) + ([self.planner] if self.planner else [])
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        planner = self.planner
+        if planner is not None:
+            planner.cancel()
+            await asyncio.gather(planner, return_exceptions=True)
+        workers = list(self.tasks.values())
+        if workers:
+            _done, pending = await asyncio.wait(workers, timeout=30)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
         for group_id in list(self.tasks):
             self._release_lease(group_id)
         self.tasks.clear()
@@ -113,7 +122,7 @@ class GroupWorkerManager:
             db = connect(self.db_path)
             try:
                 setting = dict(db.execute("SELECT key,value FROM settings").fetchall())
-                if setting.get("auto_run") != "1" or setting.get("global_stop") == "1":
+                if setting.get("global_stop") == "1":
                     await self.sleep(self.poll_seconds)
                     continue
                 tz = ZoneInfo(setting.get("timezone", "Europe/Moscow"))
@@ -134,24 +143,17 @@ class GroupWorkerManager:
                         return
                     if not self._claim_lease(group_id):
                         break
-                    current = dict(db.execute("SELECT key,value FROM settings WHERE key IN ('global_stop','auto_run')").fetchall())
-                    if current.get("global_stop") == "1" or current.get("auto_run") != "1":
+                    current = dict(db.execute("SELECT key,value FROM settings WHERE key IN ('global_stop','timezone')").fetchall())
+                    if current.get("global_stop") == "1":
                         break
-                    provider = None
-                    try:
-                        provider = await self.provider_factory(slot)
-                        await Sender(db, provider, sleep=self.sleep).send_slot(slot["slot_id"], chat_id=int(slot["chat_id"]))
-                    except Exception:
-                        class ConnectionFailure:
-                            async def send_message(self, **kwargs):
-                                raise KnownPreSendFailure("connect_failed")
-                        await Sender(db, ConnectionFailure(), sleep=self.sleep).send_slot(slot["slot_id"], chat_id=int(slot["chat_id"]))
-                    finally:
-                        if provider is not None and hasattr(provider, "close"):
-                            try:
-                                await provider.close()
-                            except Exception:
-                                pass
+                    provider = _RetriedConnectionProvider(
+                        self.provider_factory,
+                        slot,
+                        lambda connected=None: DispatchPaused("app_stopping") if self._stopping.is_set() else _dispatch_block(
+                            db, slot, expected_proxy_id=getattr(connected, "proxy_id", None)
+                        ),
+                    )
+                    await Sender(db, provider, sleep=self.sleep).send_slot(slot["slot_id"], chat_id=int(slot["chat_id"]))
                     delay_min = max(5, int(setting.get("delay_min_sec", 5)))
                     delay_max = max(delay_min, int(setting.get("delay_max_sec", 15)))
                     await self.sleep(self.rng.randint(delay_min, delay_max))
@@ -171,3 +173,91 @@ def _inside_window(now: datetime, settings: dict[str, str]) -> bool:
         if start <= current < end:
             return True
     return False
+
+
+def _dispatch_block(
+    db: sqlite3.Connection,
+    slot: sqlite3.Row,
+    *,
+    expected_proxy_id: int | None = None,
+) -> DispatchPaused | None:
+    settings = dict(db.execute("SELECT key,value FROM settings WHERE key IN ('global_stop','timezone','send_windows_weekday','send_windows_weekend')").fetchall())
+    if settings.get("global_stop") == "1":
+        return DispatchPaused("run_stopped")
+    group = db.execute("SELECT active,chat_id FROM groups WHERE id=?", (slot["group_id"],)).fetchone()
+    account = db.execute(
+        "SELECT a.status,pa.proxy_id,p.enabled FROM accounts a LEFT JOIN proxy_assignments pa ON pa.account_id=a.id "
+        "LEFT JOIN proxies p ON p.id=pa.proxy_id WHERE a.id=?",
+        (slot["account_id"],),
+    ).fetchone()
+    current_slot = db.execute("SELECT status,scheduled_date FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],)).fetchone()
+    if group is None or not group["active"] or str(group["chat_id"] or "") != str(slot["chat_id"]):
+        return DispatchPaused("group_destination_changed")
+    if account is None or account["status"] != "active":
+        return DispatchPaused("account_not_active", blocked=True)
+    if account["enabled"] != 1:
+        return DispatchPaused("proxy_assignment_unavailable", blocked=True)
+    if expected_proxy_id is not None and int(account["proxy_id"] or 0) != int(expected_proxy_id):
+        return DispatchPaused("proxy_assignment_changed")
+    if current_slot is None or current_slot["status"] != "in_flight":
+        return DispatchPaused("slot_no_longer_queued")
+    now = datetime.now(ZoneInfo(settings.get("timezone", "Europe/Moscow")))
+    if current_slot["scheduled_date"] != now.date().isoformat() or not _inside_window(now, settings):
+        return DispatchPaused("outside_send_window")
+    return None
+
+
+class _RetriedConnectionProvider:
+    """Connect a fresh PyMax adapter for each proven pre-send retry."""
+
+    def __init__(self, factory, slot, dispatch_check):
+        self.factory = factory
+        self.slot = slot
+        self.dispatch_check = dispatch_check
+
+    async def send_message(self, *, chat_id: int, text: str):
+        blocked = self.dispatch_check()
+        if blocked is not None:
+            raise blocked
+        try:
+            provider = await self.factory(self.slot)
+        except asyncio.CancelledError:
+            raise
+        except DispatchPaused:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "scheduled_connect_failed group_id=%s account_id=%s error_class=%s",
+                self.slot["group_id"], self.slot["account_id"], type(exc).__name__,
+            )
+            raise KnownPreSendFailure("connect_failed") from exc
+        blocked = self.dispatch_check(provider)
+        if blocked is not None:
+            try:
+                await self._close(provider)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("scheduled_session_close_failed account_id=%s error_class=%s", self.slot["account_id"], type(exc).__name__)
+                raise DispatchPaused("session_save_failed", blocked=True) from exc
+            raise blocked
+        try:
+            result = await provider.send_message(chat_id=chat_id, text=text)
+        except BaseException:
+            try:
+                await self._close(provider)
+            except BaseException as close_error:
+                logger.error("scheduled_session_close_failed account_id=%s error_class=%s", self.slot["account_id"], type(close_error).__name__)
+            raise
+        await self._close(provider)
+        return result
+
+    async def _close(self, provider):
+        close = getattr(provider, "close", None)
+        if close is None:
+            return
+        try:
+            await close()
+        except BaseException as exc:
+            logger.error("scheduled_session_close_failed account_id=%s error_class=%s", self.slot["account_id"], type(exc).__name__)
+            raise

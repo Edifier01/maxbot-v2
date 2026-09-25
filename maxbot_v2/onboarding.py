@@ -16,22 +16,29 @@ logger = logging.getLogger(__name__)
 
 class WebCodeAuthFlow:
     """PyMax AuthFlow bridge to short-lived web OTP / 2FA queues."""
-    def __init__(self, update: Callable[[str, str], None], *, account_id: int | None = None, proxy_id: int | None = None):
+    def __init__(self, update: Callable[[str, str], None], *, account_id: int | None = None, proxy_id: int | None = None, session_id: str | None = None):
         self.update = update
         self.account_id = account_id
         self.proxy_id = proxy_id
+        self.session_id = session_id
+        self.waiting_for: str | None = None
+        self.current_stage: str | None = None
+        self.request_count_left: int | None = None
+        self.code_length: int | None = None
         self.codes: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
         self.passwords: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
 
     def _stage(self, stage: str, started: float, error: Exception | None = None) -> None:
-        fields = (self.account_id, self.proxy_id, stage, int((perf_counter() - started) * 1000))
+        self.current_stage = stage
+        fields = (self.session_id, self.account_id, self.proxy_id, stage, int((perf_counter() - started) * 1000))
         if error is None:
-            logger.info("onboarding_stage account_id=%s proxy_id=%s stage=%s duration_ms=%d", *fields)
+            logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", *fields)
         else:
-            logger.warning("onboarding_failed account_id=%s proxy_id=%s stage=%s duration_ms=%d error_class=%s", *fields, type(error).__name__)
+            logger.warning("onboarding_failed session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d error_class=%s", *fields, type(error).__name__)
 
     async def authenticate(self, app: Any):
         from pymax.auth.models import AuthResult
+        self.current_stage = "request_code"
         self.update("requesting_code", "")
         stage = "request_code"
         started = perf_counter()
@@ -41,10 +48,26 @@ class WebCodeAuthFlow:
             self._stage(stage, started, exc)
             raise
         self._stage(stage, started)
-        self.update("waiting_code", "MAX принял запрос кода. Ожидайте сообщение с кодом.")
-        code = await asyncio.wait_for(self.codes.get(), timeout=300)
+        self.code_length = getattr(start, "code_length", None)
+        self.request_count_left = getattr(start, "request_count_left", None)
+        logger.info(
+            "onboarding_code_request session_id=%s account_id=%s proxy_id=%s auth_token_present=%s code_length=%s request_count_left=%s request_timeout=%s",
+            self.session_id, self.account_id, self.proxy_id, bool(getattr(start, "token", None)),
+            self.code_length, self.request_count_left, getattr(start, "request_max_duration", None),
+        )
+        self.waiting_for = "code"
+        self.current_stage = "wait_code_input"
+        self.update("waiting_code", "MAX принял запрос. Это ещё не подтверждает доставку SMS; проверьте приложение MAX и номер.")
+        started = perf_counter()
+        try:
+            code = await asyncio.wait_for(self.codes.get(), timeout=300)
+        except asyncio.TimeoutError:
+            self._stage("wait_code_input", started, TimeoutError())
+            raise
+        self.waiting_for = None
         self.update("verifying_code", "")
         stage = "send_code"
+        self.current_stage = stage
         started = perf_counter()
         try:
             result = await app.api.auth.send_code(start.token, code)
@@ -56,14 +79,24 @@ class WebCodeAuthFlow:
         if result.password_challenge is not None:
             track_id = result.password_challenge.track_id
             for _ in range(5):
+                self.waiting_for = "password"
+                self.current_stage = "wait_password_input"
                 self.update("waiting_password", str(result.password_challenge.hint or ""))
-                password = await asyncio.wait_for(self.passwords.get(), timeout=300)
+                started = perf_counter()
+                try:
+                    password = await asyncio.wait_for(self.passwords.get(), timeout=300)
+                except asyncio.TimeoutError:
+                    self._stage("wait_password_input", started, TimeoutError())
+                    raise
+                self.waiting_for = None
                 stage = "check_password"
+                self.current_stage = stage
                 started = perf_counter()
                 try:
                     answer = await app.api.auth.check_password(track_id, password)
-                except Exception:
-                    answer = None
+                except Exception as exc:
+                    self._stage(stage, started, exc)
+                    raise
                 self._stage(stage, started)
                 if answer is not None and not answer.error and answer.login_token:
                     login_token = answer.login_token
@@ -97,7 +130,9 @@ def prepare_account(connection: sqlite3.Connection, *, group_id: int, phone: str
 
 
 def attach_group_on_first_account(connection: sqlite3.Connection, group_id: int, resolved_chat_id: str) -> None:
-    connection.execute("BEGIN IMMEDIATE")
+    owns_transaction = not connection.in_transaction
+    if owns_transaction:
+        connection.execute("BEGIN IMMEDIATE")
     try:
         row = connection.execute("SELECT chat_id FROM groups WHERE id=?", (group_id,)).fetchone()
         if row is None:
@@ -108,7 +143,9 @@ def attach_group_on_first_account(connection: sqlite3.Connection, group_id: int,
             current = connection.execute("SELECT chat_id FROM groups WHERE id=?", (group_id,)).fetchone()["chat_id"]
         if str(current) != str(resolved_chat_id):
             raise ValueError("group_destination_mismatch")
-        connection.commit()
+        if owns_transaction:
+            connection.commit()
     except BaseException:
-        connection.rollback()
+        if owns_transaction:
+            connection.rollback()
         raise
