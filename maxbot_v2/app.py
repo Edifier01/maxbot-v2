@@ -316,7 +316,10 @@ def create_app(
         response.headers["Vary"] = "Cookie"
         with db() as connection:
             row = connection.execute(
-                "SELECT token_ciphertext,expires_at,max_uses,uses_count,active FROM onboarding_invites WHERE group_id=?",
+                "SELECT i.id,i.token_hash,i.token_ciphertext,i.expires_at,i.max_uses,i.active,"
+                "(SELECT COUNT(*) FROM onboarding_sessions s WHERE s.invite_id=i.id AND s.token_hash=i.token_hash "
+                "AND s.state NOT IN ('failed','expired')) AS active_uses "
+                "FROM onboarding_invites i WHERE i.group_id=?",
                 (group_id,),
             ).fetchone()
             group = connection.execute("SELECT 1 FROM groups WHERE id=?", (group_id,)).fetchone()
@@ -329,7 +332,7 @@ def create_app(
             status = "revoked"
         elif row["expires_at"] <= now:
             status = "expired"
-        elif row["max_uses"] is not None and row["uses_count"] >= row["max_uses"]:
+        elif row["max_uses"] is not None and row["active_uses"] >= row["max_uses"]:
             status = "exhausted"
         else:
             status = "active"

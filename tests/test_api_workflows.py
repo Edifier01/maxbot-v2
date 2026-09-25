@@ -114,6 +114,29 @@ def test_group_link_read_hides_revoked_and_expired_urls(tmp_path, monkeypatch):
     assert revoked["status"] == "revoked"
 
 
+def test_owner_link_status_ignores_failed_attempts_in_stored_use_count(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    issued = client.post(f"/api/groups/{group_id}/onboarding-link?max_uses=1", headers=headers, json={}).json()
+    connection = connect(client.app.state.database)
+    try:
+        invite = connection.execute("SELECT id,token_hash FROM onboarding_invites WHERE group_id=?", (group_id,)).fetchone()
+        connection.execute("UPDATE onboarding_invites SET uses_count=1 WHERE id=?", (invite["id"],))
+        connection.execute(
+            "INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,state,expires_at,created_at,updated_at) "
+            "VALUES('failed-attempt',?,?,?,'failed','2099-01-01T00:00:00+00:00','2026-09-25','2026-09-25')",
+            (invite["id"], invite["token_hash"], "csrf-hash"),
+        )
+    finally:
+        connection.close()
+
+    response = client.get(f"/api/groups/{group_id}/onboarding-link")
+
+    assert response.json()["status"] == "active"
+    assert response.json()["url"] == issued["url"]
+
+
 def test_bulk_proxy_import_is_atomic_and_reports_line_numbers(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
