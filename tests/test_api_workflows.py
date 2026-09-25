@@ -287,6 +287,32 @@ def test_failed_first_onboarding_can_retry_same_phone_with_one_use_link(tmp_path
         connection.close()
 
 
+def test_unreadable_proxy_does_not_consume_onboarding_attempt(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"})
+    token = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={}).json()["url"].rsplit("/", 1)[1]
+
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("UPDATE proxies SET url_ciphertext='unreadable' WHERE group_id=?", (group_id,))
+    finally:
+        connection.close()
+
+    response = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
+    assert response.status_code == 503
+    assert response.json()["detail"] == "proxy_unavailable"
+
+    connection = connect(client.app.state.database)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM onboarding_sessions").fetchone()[0] == 0
+        assert connection.execute("SELECT uses_count FROM onboarding_invites WHERE group_id=?", (group_id,)).fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
 def test_unknown_operation_can_be_manually_resolved_without_duplicate_count(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     connection = connect(client.app.state.database)

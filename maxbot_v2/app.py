@@ -644,17 +644,18 @@ def create_app(
                         raise HTTPException(409, "proxy_assignment_required")
                     account_id, proxy_id = existing["id"], assignment["proxy_id"]
                     connection.execute("UPDATE accounts SET full_name=? WHERE id=?", (full_name, account_id))
+                proxy = connection.execute("SELECT url_ciphertext FROM proxies WHERE id=?", (proxy_id,)).fetchone()["url_ciphertext"]
+                try:
+                    proxy_url = SecretBox().decrypt(proxy)
+                except ValueError as exc:
+                    connection.rollback()
+                    raise HTTPException(503, "proxy_unavailable") from exc
                 connection.execute(
                     "INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,phone,full_name,state,account_id,proxy_id,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?, ?,?,?,?,?)",
                     (session_id, row["id"], digest_token(token), digest_token(new_token()), phone, full_name, "starting", account_id, proxy_id, (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(), now, now),
                 )
                 connection.execute("UPDATE onboarding_invites SET uses_count=? WHERE id=?", (active_uses + 1, row["id"]))
-                proxy = connection.execute("SELECT url_ciphertext FROM proxies WHERE id=?", (proxy_id,)).fetchone()["url_ciphertext"]
                 connection.commit()
-            try:
-                proxy_url = SecretBox().decrypt(proxy)
-            except ValueError as exc:
-                raise HTTPException(503, "proxy_unavailable") from exc
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "phone_already_exists") from exc
         flow = WebCodeAuthFlow(
