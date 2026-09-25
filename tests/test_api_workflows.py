@@ -48,6 +48,36 @@ def test_group_proxy_invite_and_message_pool_are_owner_scoped(tmp_path, monkeypa
     assert client.put("/api/messages", headers=headers, json={"texts": ["same", "same"]}).status_code == 422
 
 
+def test_reopening_onboarding_link_returns_the_existing_group_link(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+
+    first = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={})
+    assert first.status_code == 200
+    first_token = first.json()["url"].rsplit("/", 1)[1]
+    second = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={})
+
+    assert second.status_code == 200
+    assert second.json()["url"] == first.json()["url"]
+    assert client.get(f"/join-info/{first_token}").status_code == 200
+
+
+def test_explicit_link_rotation_invalidates_old_link(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+
+    first = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={})
+    first_token = first.json()["url"].rsplit("/", 1)[1]
+    second = client.post(f"/api/groups/{group_id}/onboarding-link?rotate=1", headers=headers, json={})
+
+    assert second.status_code == 200
+    assert second.json()["url"] != first.json()["url"]
+    assert client.get(f"/join-info/{first_token}").status_code == 404
+    assert client.get(f"/join-info/{second.json()['url'].rsplit('/', 1)[1]}").status_code == 200
+
+
 def test_proxy_url_only_accepts_schemes_supported_by_pinned_pymax(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
@@ -101,6 +131,48 @@ def test_guest_auth_start_is_not_blocked_by_local_authorization_file(tmp_path, m
     response = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
     assert response.status_code == 200
     assert response.json()["state"] == "starting"
+
+
+def test_failed_first_onboarding_can_retry_same_phone_with_one_use_link(tmp_path, monkeypatch):
+    async def no_worker_sync(_manager):
+        return None
+
+    real_create_task = asyncio.create_task
+
+    def skip_onboarding_network(coroutine, **kwargs):
+        if coroutine.cr_code.co_name == "run_onboarding_auth":
+            coroutine.close()
+            return None
+        return real_create_task(coroutine, **kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", skip_onboarding_network)
+    monkeypatch.setattr("maxbot_v2.workers.GroupWorkerManager._sync_group_workers", no_worker_sync)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"})
+    link = client.post(f"/api/groups/{group_id}/onboarding-link?max_uses=1", headers=headers, json={}).json()["url"]
+    token = link.rsplit("/", 1)[1]
+    first = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
+    assert first.status_code == 200
+
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("UPDATE onboarding_sessions SET state='failed',error_code='timeouterror' WHERE id=?", (first.json()["session_id"],))
+        first_account_id = connection.execute("SELECT account_id FROM onboarding_sessions WHERE id=?", (first.json()["session_id"],)).fetchone()[0]
+    finally:
+        connection.close()
+
+    retry = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
+    assert retry.status_code == 200
+    assert retry.json()["session_id"] != first.json()["session_id"]
+    connection = connect(client.app.state.database)
+    try:
+        retry_account_id = connection.execute("SELECT account_id FROM onboarding_sessions WHERE id=?", (retry.json()["session_id"],)).fetchone()[0]
+        assert retry_account_id == first_account_id
+        assert connection.execute("SELECT uses_count FROM onboarding_invites WHERE group_id=?", (group_id,)).fetchone()[0] == 1
+    finally:
+        connection.close()
 
 
 def test_unknown_operation_can_be_manually_resolved_without_duplicate_count(tmp_path, monkeypatch):
