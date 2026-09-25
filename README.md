@@ -16,13 +16,14 @@ PyMax закреплён на `maxapi-python==2.4.1` и изолирован в 
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
-.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pytest -q --ignore=tests/test_browser_workflows.py
+.\.venv\Scripts\python.exe -m pytest -q tests/test_browser_workflows.py
 node --check static/app.js
 node --check static/join.js
 node --test tests/test_join_start.cjs
 ```
 
-На Linux установите браузер вместе с системными пакетами командой `python -m playwright install --with-deps chromium`. CI выполняет те же Python, браузерные и JavaScript проверки на Windows и Linux, а также собирает Docker-образ. `requirements-dev.txt` содержит тестовые инструменты; производственный образ устанавливает только `requirements.txt`.
+На Linux установите браузер вместе с системными пакетами командой `python -m playwright install --with-deps chromium`. Запускайте обычные Python-тесты и Playwright отдельными командами: синхронный драйвер Playwright управляет циклом событий своего процесса. CI проверяет обе группы на Windows и Linux, JavaScript и сборку Docker на Linux. `requirements-dev.txt` содержит тестовые инструменты; производственный образ устанавливает только `requirements.txt`.
 
 Создайте локальный `.env` из `.env.example`. Задайте уникальные `APP_SECRET_KEY`, `DATA_ENCRYPTION_KEY` и `OWNER_PASSWORD_HASH`. Хеш начального пароля создаётся интерактивно:
 

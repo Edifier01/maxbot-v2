@@ -29,13 +29,14 @@ Windows PowerShell:
 ```powershell
 py -3.12 -m pip install -r requirements-dev.txt
 py -3.12 -m playwright install chromium
-py -3.12 -m pytest -q
+py -3.12 -m pytest -q --ignore=tests/test_browser_workflows.py
+py -3.12 -m pytest -q tests/test_browser_workflows.py
 node --check static/app.js
 node --check static/join.js
 node --test tests/test_join_start.cjs
 ```
 
-Linux устанавливает браузер командой `python -m playwright install --with-deps chromium`. CI проверяет Python и Chromium на Windows/Linux и собирает Docker на Linux. Автотесты должны работать на отдельной SQLite и фиктивном PyMax, без production-секретов, MAX-запросов и реальных сообщений.
+Linux устанавливает браузер командой `python -m playwright install --with-deps chromium`. Запускайте обычные Python-тесты и Playwright разными командами, чтобы синхронный драйвер браузера не разделял процесс с unit-тестами asyncio. CI проверяет обе группы и Chromium на Windows/Linux и собирает Docker на Linux. Автотесты должны работать на отдельной SQLite и фиктивном PyMax, без production-секретов, MAX-запросов и реальных сообщений.
 
 Если проверка не запускалась из-за отсутствующей среды или браузера, явно укажите это; не заменяйте её предположением об успехе. Учитывайте точку входа и реальные кнопки UI, проверяйте мобильные ширины 390, 768 и 1440 px и клавиатурное управление.
 
