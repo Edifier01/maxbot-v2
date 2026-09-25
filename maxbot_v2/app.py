@@ -25,12 +25,13 @@ from .message_pool import replace_message_pool
 from .onboarding import WebCodeAuthFlow, attach_group_on_first_account, member_proof, prepare_account
 from .max_adapter import PyMaxAdapter
 from .session_vault import EncryptedSessionFile
-from .workers import GroupWorkerManager
-from .sender import recover_in_flight
+from .workers import GroupWorkerManager, _inside_window
+from .sender import DispatchPaused, recover_in_flight
 from .session_lock import AccountSessionLocks
 
 
 logger = logging.getLogger(__name__)
+logging.getLogger("maxbot_v2").setLevel(os.getenv("APP_LOG_LEVEL", "INFO").upper())
 
 
 class LoginBody(BaseModel):
@@ -132,11 +133,13 @@ def create_app(
     runtime_dir = Path(os.getenv("SESSION_RUNTIME_DIR", "/run/maxbot-sessions"))
     sessions_dir = data / "sessions"
     account_session_locks = AccountSessionLocks()
+    terminal_onboarding_states = ("completed", "failed", "expired", "cancelled")
 
     class LockedAdapter:
-        def __init__(self, adapter, lock: asyncio.Lock):
+        def __init__(self, adapter, lock: asyncio.Lock, proxy_id: int):
             self._adapter = adapter
             self._lock = lock
+            self.proxy_id = proxy_id
             self._closed = False
 
         def __getattr__(self, name):
@@ -159,8 +162,11 @@ def create_app(
                 (slot["account_id"],),
             ).fetchone()
         if row is None:
-            raise RuntimeError("proxy_assignment_unavailable")
-        proxy = SecretBox().decrypt(row["url_ciphertext"])
+            raise DispatchPaused("proxy_assignment_unavailable", blocked=True)
+        try:
+            proxy = SecretBox().decrypt(row["url_ciphertext"])
+        except ValueError as exc:
+            raise DispatchPaused("proxy_unavailable", blocked=True) from exc
         vault = EncryptedSessionFile(slot["account_id"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
         lock = account_session_locks.for_account(slot["account_id"])
         await lock.acquire()
@@ -168,14 +174,16 @@ def create_app(
         try:
             adapter = PyMaxAdapter.create(phone=row["phone"], work_dir="", session_name="", proxy=proxy, session_vault=vault)
             await adapter.connect()
-            return LockedAdapter(adapter, lock)
+            return LockedAdapter(adapter, lock, int(row["proxy_id"]))
         except BaseException:
-            if adapter is not None:
-                try:
-                    await adapter.close()
-                except Exception as exc:
-                    logger.warning("session_close_failed account_id=%s proxy_id=%s error_class=%s", slot["account_id"], row["proxy_id"], type(exc).__name__)
-            lock.release()
+            try:
+                if adapter is not None:
+                    try:
+                        await adapter.close()
+                    except Exception as exc:
+                        logger.warning("session_close_failed account_id=%s proxy_id=%s error_class=%s", slot["account_id"], row["proxy_id"], type(exc).__name__)
+            finally:
+                lock.release()
             raise
 
     worker_manager = GroupWorkerManager(database, scheduled_provider)
@@ -184,12 +192,28 @@ def create_app(
     async def lifespan(_app: FastAPI):
         with db() as connection:
             recover_in_flight(connection)
-            connection.execute("UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=? WHERE state NOT IN ('completed','failed')", (datetime.now(timezone.utc).isoformat(),))
+            connection.execute("UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=? WHERE state NOT IN ('completed','failed','expired','cancelled')", (datetime.now(timezone.utc).isoformat(),))
+            settings = dict(connection.execute("SELECT key,value FROM settings WHERE key IN ('auto_run','global_stop')").fetchall())
+            if settings.get("auto_run") != "1":
+                connection.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
         await worker_manager.start()
         try:
             yield
         finally:
             await worker_manager.stop()
+            tasks = list(app.state.onboarding_tasks.items())
+            with db() as connection:
+                connection.execute(
+                    "UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=? "
+                    "WHERE state NOT IN ('completed','failed','expired','cancelled')",
+                    (datetime.now(timezone.utc).isoformat(),),
+                )
+            for _session_id, task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*(task for _session_id, task in tasks), return_exceptions=True)
+            app.state.onboarding_flows.clear()
 
     app = FastAPI(title="MAXBOT v2", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.database = database
@@ -200,8 +224,84 @@ def create_app(
     app.state.cookie_secure = cookie_secure
     app.state.db_context = db
     app.state.onboarding_flows = {}
+    app.state.onboarding_tasks = {}
     app.state.worker_manager = worker_manager
     app.state.account_session_locks = account_session_locks
+
+    def cancel_onboarding_tasks(session_ids: list[str]) -> None:
+        for session_id in session_ids:
+            task = app.state.onboarding_tasks.get(session_id)
+            if task is not None and not task.done():
+                task.get_loop().call_soon_threadsafe(task.cancel)
+
+    def cancel_group_onboarding(connection: sqlite3.Connection, group_id: int, reason: str) -> list[str]:
+        ids = [row[0] for row in connection.execute(
+            "SELECT s.id FROM onboarding_sessions s JOIN accounts a ON a.id=s.account_id "
+            "WHERE a.group_id=? AND s.state NOT IN ('completed','failed','expired','cancelled')",
+            (group_id,),
+        ).fetchall()]
+        if ids:
+            stamp = datetime.now(timezone.utc).isoformat()
+            connection.execute(
+                "UPDATE onboarding_sessions SET state='cancelled',error_code=?,updated_at=? "
+                "WHERE state NOT IN ('completed','failed','expired','cancelled') AND id IN (" + ",".join("?" for _ in ids) + ")",
+                (reason, stamp, *ids),
+            )
+        return ids
+
+    def guest_onboarding_session(token: str, session_id: str) -> dict[str, object]:
+        with db() as connection:
+            row = connection.execute(
+                "SELECT s.*,i.active AS invite_active,i.expires_at AS invite_expires_at,i.token_hash AS current_invite_hash "
+                "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id WHERE s.id=?",
+                (session_id,),
+            ).fetchone()
+            if row is None or row["token_hash"] != digest_token(token):
+                raise HTTPException(404, "onboarding_session_unavailable")
+            state = row["state"]
+            if state not in terminal_onboarding_states:
+                now = datetime.now(timezone.utc).isoformat()
+                if row["expires_at"] <= now:
+                    state, error = "expired", "onboarding_attempt_expired"
+                elif (not row["invite_active"] or row["current_invite_hash"] != row["token_hash"] or row["invite_expires_at"] <= now):
+                    state, error = "cancelled", "invite_unavailable"
+                else:
+                    error = None
+                if error:
+                    connection.execute(
+                        "UPDATE onboarding_sessions SET state=?,error_code=?,updated_at=? WHERE id=?",
+                        (state, error, now, session_id),
+                    )
+            else:
+                error = row["error_code"]
+            result = dict(row)
+            result["state"] = state
+            result["error_code"] = error
+            active_invite = bool(row["invite_active"] and row["current_invite_hash"] == row["token_hash"] and row["invite_expires_at"] > datetime.now(timezone.utc).isoformat())
+        if state in {"expired", "cancelled"}:
+            cancel_onboarding_tasks([session_id])
+            app.state.onboarding_flows.pop(session_id, None)
+        with db() as connection:
+            capacity = connection.execute(
+                "SELECT i.max_uses,(SELECT COUNT(*) FROM onboarding_sessions other WHERE other.invite_id=i.id "
+                "AND other.token_hash=i.token_hash AND other.state NOT IN ('failed','expired','cancelled')) AS uses_count "
+                "FROM onboarding_invites i WHERE i.id=?",
+                (row["invite_id"],),
+            ).fetchone()
+        has_capacity = bool(capacity and (capacity["max_uses"] is None or capacity["uses_count"] < capacity["max_uses"]))
+        result["retryable"] = bool(state in {"failed", "expired", "cancelled"} and active_invite and has_capacity)
+        return result
+
+    def cancel_onboarding(session_id: str, state: str, reason: str) -> None:
+        stamp = datetime.now(timezone.utc).isoformat()
+        with db() as connection:
+            connection.execute(
+                "UPDATE onboarding_sessions SET state=?,error_code=?,updated_at=? WHERE id=? "
+                "AND state NOT IN ('completed','failed','expired','cancelled')",
+                (state, reason, stamp, session_id),
+            )
+        cancel_onboarding_tasks([session_id])
+        app.state.onboarding_flows.pop(session_id, None)
 
     def current_session(request: Request) -> sqlite3.Row:
         raw = request.cookies.get("owner_session", "")
@@ -244,7 +344,7 @@ def create_app(
 
     @app.get("/health")
     def health() -> dict[str, str]:
-        return {"status": "ok"}
+        return {"status": "ok", "revision": os.getenv("BUILD_REVISION", os.getenv("GIT_SHA", "unknown"))}
 
     @app.post("/api/auth/login")
     def login(body: LoginBody, request: Request, response: Response) -> dict[str, str]:
@@ -294,8 +394,30 @@ def create_app(
                 table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 for table in ("groups", "accounts", "weekly_slots")
             }
-            settings = dict(connection.execute("SELECT key,value FROM settings WHERE key IN ('auto_run','global_stop')").fetchall())
-        return {"counts": counts, "auto_run": settings.get("auto_run") == "1", "stopped": settings.get("global_stop") == "1"}
+            settings = dict(connection.execute("SELECT key,value FROM settings").fetchall())
+            active_groups = connection.execute("SELECT COUNT(*) FROM groups WHERE active=1").fetchone()[0]
+            ready_accounts = connection.execute(
+                "SELECT COUNT(*) FROM accounts a JOIN groups g ON g.id=a.group_id "
+                "JOIN proxy_assignments pa ON pa.account_id=a.id JOIN proxies p ON p.id=pa.proxy_id "
+                "WHERE a.status='active' AND g.active=1 AND g.chat_id IS NOT NULL AND p.enabled=1"
+            ).fetchone()[0]
+        stopped = settings.get("global_stop") == "1"
+        if stopped:
+            wait_reason = "Работа сейчас остановлена. Запустите её кнопкой вверху панели."
+        elif not active_groups:
+            wait_reason = "Нет включённых групп. Запуск не отправит сообщения, пока группу не включат."
+        elif not ready_accounts:
+            wait_reason = "Нет подключённых аккаунтов с проверенной группой и доступным прокси."
+        else:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo(settings.get("timezone", "Europe/Moscow")))
+            wait_reason = "Ожидание разрешённого окна отправки." if not _inside_window(now, settings) else "Работа включена; сообщения ждут назначенного дня и окна."
+        return {
+            "counts": counts,
+            "auto_run": settings.get("auto_run") == "1",
+            "stopped": stopped,
+            "run_wait_reason": wait_reason,
+        }
 
     @app.get("/api/groups")
     def groups(_session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
@@ -303,6 +425,9 @@ def create_app(
             rows = connection.execute(
                 "SELECT g.id,g.name,g.invite_link,g.chat_id,g.active,COUNT(DISTINCT a.id) account_count,"
                 "COUNT(DISTINCT CASE WHEN a.status='active' THEN a.id END) connected_account_count,"
+                "COUNT(DISTINCT CASE WHEN a.status IN ('active','needs_membership') AND EXISTS ("
+                "SELECT 1 FROM proxy_assignments pa JOIN proxies assigned_proxy ON assigned_proxy.id=pa.proxy_id "
+                "WHERE pa.account_id=a.id AND assigned_proxy.enabled=1) THEN a.id END) verifiable_account_count,"
                 "COUNT(DISTINCT p.id) proxy_count,COUNT(DISTINCT CASE WHEN p.enabled=1 THEN p.id END) available_proxy_count FROM groups g "
                 "LEFT JOIN accounts a ON a.group_id=g.id LEFT JOIN proxies p ON p.group_id=g.id "
                 "GROUP BY g.id ORDER BY g.id"
@@ -318,7 +443,7 @@ def create_app(
             row = connection.execute(
                 "SELECT i.id,i.token_hash,i.token_ciphertext,i.expires_at,i.max_uses,i.active,"
                 "(SELECT COUNT(*) FROM onboarding_sessions s WHERE s.invite_id=i.id AND s.token_hash=i.token_hash "
-                "AND s.state NOT IN ('failed','expired')) AS active_uses "
+                "AND s.state NOT IN ('failed','expired','cancelled')) AS active_uses "
                 "FROM onboarding_invites i WHERE i.group_id=?",
                 (group_id,),
             ).fetchone()
@@ -354,6 +479,7 @@ def create_app(
             raise HTTPException(422, "invalid_invite_limits")
         now = datetime.now(timezone.utc)
         box = SecretBox()
+        cancelled_sessions: list[str] = []
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             group = connection.execute("SELECT id FROM groups WHERE id=?", (group_id,)).fetchone()
@@ -368,6 +494,7 @@ def create_app(
                 expires_at = current["expires_at"]
                 max_uses = current["max_uses"]
             else:
+                cancelled_sessions = cancel_group_onboarding(connection, group_id, "invite_unavailable")
                 token = new_token(32)
                 expires_at = (now + timedelta(days=lifetime_days)).isoformat()
                 connection.execute(
@@ -378,6 +505,7 @@ def create_app(
                     (group_id, digest_token(token), box.encrypt(token), now.isoformat(), expires_at, max_uses),
                 )
             connection.commit()
+        cancel_onboarding_tasks(cancelled_sessions)
         base = str(request.base_url).rstrip("/")
         return {"url": f"{base}/join/{token}", "expires_at": expires_at, "max_uses": max_uses}
 
@@ -385,12 +513,18 @@ def create_app(
     def revoke_onboarding_link(group_id: int, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
         with db() as connection:
             connection.execute("UPDATE onboarding_invites SET active=0 WHERE group_id=?", (group_id,))
+            cancelled_sessions = cancel_group_onboarding(connection, group_id, "invite_unavailable")
+        cancel_onboarding_tasks(cancelled_sessions)
         return {"revoked": True}
 
     @app.get("/api/groups/{group_id}/proxies")
     def list_proxies(group_id: int, _session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
         with db() as connection:
-            rows = connection.execute("SELECT id,label,position,enabled FROM proxies WHERE group_id=? ORDER BY position,id", (group_id,)).fetchall()
+            rows = connection.execute(
+                "SELECT p.id,p.label,p.position,p.enabled,COUNT(pa.account_id) AS assigned_count FROM proxies p "
+                "LEFT JOIN proxy_assignments pa ON pa.proxy_id=p.id WHERE p.group_id=? GROUP BY p.id ORDER BY p.position,p.id",
+                (group_id,),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     @app.post("/api/groups/{group_id}/proxies", status_code=201)
@@ -468,9 +602,14 @@ def create_app(
     @app.delete("/api/groups/{group_id}/proxies/{proxy_id}")
     def remove_proxy(group_id: int, proxy_id: int, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
         with db() as connection:
-            assigned = connection.execute("SELECT 1 FROM proxy_assignments WHERE proxy_id=? LIMIT 1", (proxy_id,)).fetchone()
+            assigned = connection.execute("SELECT account_id FROM proxy_assignments WHERE proxy_id=?", (proxy_id,)).fetchall()
             if assigned:
                 connection.execute("UPDATE proxies SET enabled=0 WHERE group_id=? AND id=?", (group_id, proxy_id))
+                connection.executemany(
+                    "UPDATE weekly_slots SET status='blocked',error_code='proxy_assignment_unavailable',updated_at=? "
+                    "WHERE account_id=? AND status='queued'",
+                    [(datetime.now(timezone.utc).isoformat(), row["account_id"]) for row in assigned],
+                )
             else:
                 connection.execute("DELETE FROM proxies WHERE group_id=? AND id=?", (group_id, proxy_id))
         return {"disabled": bool(assigned)}
@@ -571,22 +710,24 @@ def create_app(
             raise HTTPException(404, "invite_unavailable")
         return FileResponse(static_dir / "join.html")
 
-    def invite_row(connection, token: str):
+    def invite_row(connection, token: str, *, require_capacity: bool = True):
         with db() as connection:
             row = connection.execute(
                 "SELECT i.id,i.group_id,i.expires_at,i.max_uses,"
                 "(SELECT COUNT(*) FROM onboarding_sessions s WHERE s.invite_id=i.id AND s.token_hash=i.token_hash "
-                "AND s.state NOT IN ('failed','expired')) AS uses_count,g.name,g.invite_link,g.chat_id "
+                "AND s.state NOT IN ('failed','expired','cancelled')) AS uses_count,g.name,g.invite_link,g.chat_id "
                 "FROM onboarding_invites i JOIN groups g ON g.id=i.group_id WHERE i.token_hash=? AND i.active=1",
                 (digest_token(token),),
             ).fetchone()
-        if row is None or row["expires_at"] <= datetime.now(timezone.utc).isoformat() or (row["max_uses"] is not None and row["uses_count"] >= row["max_uses"]):
+        if row is None or row["expires_at"] <= datetime.now(timezone.utc).isoformat() or (
+            require_capacity and row["max_uses"] is not None and row["uses_count"] >= row["max_uses"]
+        ):
             raise HTTPException(404, "invite_unavailable")
         return row
 
     @app.get("/join-info/{token}")
     def join_info(token: str) -> dict[str, str]:
-        row = invite_row(None, token)
+        row = invite_row(None, token, require_capacity=False)
         return {"group": row["name"], "invite_link": row["invite_link"]}
 
     @app.post("/api/public/onboarding/{token}/start")
@@ -609,15 +750,23 @@ def create_app(
         try:
             with db() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                current_invite = connection.execute(
+                    "SELECT active,token_hash,expires_at,max_uses FROM onboarding_invites WHERE id=?",
+                    (row["id"],),
+                ).fetchone()
+                if (current_invite is None or not current_invite["active"]
+                        or current_invite["token_hash"] != digest_token(token) or current_invite["expires_at"] <= now):
+                    connection.rollback()
+                    raise HTTPException(404, "invite_unavailable")
                 if connection.execute("SELECT 1 FROM proxies WHERE group_id=? AND enabled=1 LIMIT 1", (row["group_id"],)).fetchone() is None:
                     connection.rollback()
                     raise HTTPException(409, "proxy_assignment_required")
                 active_uses = connection.execute(
                     "SELECT COUNT(*) FROM onboarding_sessions WHERE invite_id=? AND token_hash=? "
-                    "AND state NOT IN ('failed','expired')",
+                    "AND state NOT IN ('failed','expired','cancelled')",
                     (row["id"], digest_token(token)),
                 ).fetchone()[0]
-                if row["max_uses"] is not None and active_uses >= row["max_uses"]:
+                if current_invite["max_uses"] is not None and active_uses >= current_invite["max_uses"]:
                     connection.rollback()
                     raise HTTPException(404, "invite_unavailable")
                 existing = connection.execute("SELECT id,group_id,status FROM accounts WHERE phone=?", (phone,)).fetchone()
@@ -628,7 +777,7 @@ def create_app(
                         connection.rollback()
                         raise HTTPException(409, "phone_already_exists")
                     in_progress = connection.execute(
-                        "SELECT 1 FROM onboarding_sessions WHERE account_id=? AND state NOT IN ('failed','completed','expired') LIMIT 1",
+                        "SELECT 1 FROM onboarding_sessions WHERE account_id=? AND state NOT IN ('failed','completed','expired','cancelled') LIMIT 1",
                         (existing["id"],),
                     ).fetchone()
                     if in_progress is not None:
@@ -644,31 +793,45 @@ def create_app(
                         raise HTTPException(409, "proxy_assignment_required")
                     account_id, proxy_id = existing["id"], assignment["proxy_id"]
                     connection.execute("UPDATE accounts SET full_name=? WHERE id=?", (full_name, account_id))
+                proxy_row = connection.execute(
+                    "SELECT url_ciphertext FROM proxies WHERE id=? AND enabled=1", (proxy_id,)
+                ).fetchone()
+                if proxy_row is None:
+                    connection.rollback()
+                    raise HTTPException(409, "proxy_assignment_required")
+                try:
+                    proxy_url = SecretBox().decrypt(proxy_row["url_ciphertext"])
+                except ValueError as exc:
+                    connection.rollback()
+                    raise HTTPException(503, "proxy_unavailable") from exc
                 connection.execute(
                     "INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,phone,full_name,state,account_id,proxy_id,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?, ?,?,?,?,?)",
                     (session_id, row["id"], digest_token(token), digest_token(new_token()), phone, full_name, "starting", account_id, proxy_id, (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(), now, now),
                 )
                 connection.execute("UPDATE onboarding_invites SET uses_count=? WHERE id=?", (active_uses + 1, row["id"]))
-                proxy = connection.execute("SELECT url_ciphertext FROM proxies WHERE id=?", (proxy_id,)).fetchone()["url_ciphertext"]
                 connection.commit()
-            try:
-                proxy_url = SecretBox().decrypt(proxy)
-            except ValueError as exc:
-                raise HTTPException(503, "proxy_unavailable") from exc
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "phone_already_exists") from exc
         flow = WebCodeAuthFlow(
             lambda state, hint: (set_onboarding_state(session_id, state, hint), setattr(flow, "hint", hint)),
             account_id=account_id,
             proxy_id=proxy_id,
+            session_id=session_id,
         )
         app.state.onboarding_flows[session_id] = {"flow": flow, "account_id": account_id, "proxy_id": proxy_id, "group_id": row["group_id"], "phone": phone, "proxy": proxy_url}
-        asyncio.create_task(run_onboarding_auth(session_id, row["invite_link"]))
+        task = asyncio.create_task(run_onboarding_auth(session_id, row["invite_link"]))
+        if task is not None:
+            app.state.onboarding_tasks[session_id] = task
+            task.add_done_callback(lambda done, sid=session_id: app.state.onboarding_tasks.pop(sid, None))
         return {"session_id": session_id, "state": "starting", "group": row["name"]}
 
     def set_onboarding_state(session_id: str, state: str, hint: str = "") -> None:
         with db() as connection:
-            connection.execute("UPDATE onboarding_sessions SET state=?,error_code=?,updated_at=? WHERE id=?", (state, hint[:120], datetime.now(timezone.utc).isoformat(), session_id))
+            connection.execute(
+                "UPDATE onboarding_sessions SET state=?,error_code=?,updated_at=? WHERE id=? "
+                "AND state NOT IN ('completed','failed','expired','cancelled')",
+                (state, hint[:120], datetime.now(timezone.utc).isoformat(), session_id),
+            )
 
     async def run_onboarding_auth(session_id: str, invite_link: str) -> None:
         runtime = app.state.onboarding_flows.get(session_id)
@@ -679,15 +842,17 @@ def create_app(
         lock = account_session_locks.for_account(runtime["account_id"])
         stage = "session_open"
         stage_started = perf_counter()
-        await lock.acquire()
+        lock_acquired = False
         try:
-            logger.info("onboarding_stage account_id=%s proxy_id=%s stage=%s", runtime["account_id"], runtime["proxy_id"], stage)
+            await lock.acquire()
+            lock_acquired = True
+            logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s", session_id, runtime["account_id"], runtime["proxy_id"], stage)
             adapter = PyMaxAdapter.create(phone=runtime["phone"], work_dir="", session_name="", proxy=runtime["proxy"], auth_flow=runtime["flow"], session_vault=vault)
-            logger.info("onboarding_stage account_id=%s proxy_id=%s stage=%s duration_ms=%d", runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
+            logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
             stage = "connect"
             stage_started = perf_counter()
             await adapter.connect()
-            logger.info("onboarding_stage account_id=%s proxy_id=%s stage=%s duration_ms=%d", runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
+            logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
             stage = "resolve_group"
             stage_started = perf_counter()
             profile = getattr(adapter.client, "me", None)
@@ -696,30 +861,68 @@ def create_app(
             if not max_user_id:
                 raise RuntimeError("max_user_id_missing")
             resolved = await adapter.resolve_group_by_link(invite_link)
-            logger.info("onboarding_stage account_id=%s proxy_id=%s stage=%s duration_ms=%d", runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
+            logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
             chat_id = str(getattr(resolved, "id", "") or getattr(resolved, "chat_id", ""))
             if not chat_id:
                 raise RuntimeError("group_resolution_failed")
             with db() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    "SELECT s.state,s.expires_at,s.token_hash AS session_token_hash,i.active,i.expires_at AS invite_expires_at,"
+                    "i.token_hash AS invite_token_hash,a.status AS account_status,pa.proxy_id AS assigned_proxy_id,"
+                    "p.enabled AS assigned_proxy_enabled "
+                    "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id "
+                    "JOIN accounts a ON a.id=s.account_id LEFT JOIN proxy_assignments pa ON pa.account_id=a.id "
+                    "LEFT JOIN proxies p ON p.id=pa.proxy_id WHERE s.id=?",
+                    (session_id,),
+                ).fetchone()
+                now = datetime.now(timezone.utc).isoformat()
+                if (current is None or current["state"] in terminal_onboarding_states or current["expires_at"] <= now
+                        or not current["active"] or current["session_token_hash"] != current["invite_token_hash"]
+                        or current["invite_expires_at"] <= now or current["account_status"] != "pending"
+                        or current["assigned_proxy_id"] != runtime["proxy_id"] or current["assigned_proxy_enabled"] != 1):
+                    connection.rollback()
+                    if current is not None and (current["assigned_proxy_id"] != runtime["proxy_id"] or current["assigned_proxy_enabled"] != 1):
+                        raise RuntimeError("proxy_assignment_changed")
+                    raise RuntimeError("invite_unavailable")
                 attach_group_on_first_account(connection, runtime["group_id"], chat_id)
                 connection.execute("UPDATE accounts SET max_user_id=? WHERE id=?", (max_user_id, runtime["account_id"]))
-                connection.execute("UPDATE onboarding_sessions SET state='waiting_membership',max_user_id=?,updated_at=? WHERE id=?", (max_user_id, datetime.now(timezone.utc).isoformat(), session_id))
+                connection.execute("UPDATE onboarding_sessions SET state='waiting_membership',max_user_id=?,updated_at=? WHERE id=?", (max_user_id, now, session_id))
+                connection.commit()
         except Exception as exc:
-            safe = str(exc) if str(exc) in {"group_destination_mismatch", "max_user_id_missing", "group_resolution_failed", "account_registration_required", "cloud_password_rejected"} else type(exc).__name__.lower()
-            logger.warning("onboarding_failed account_id=%s proxy_id=%s stage=%s duration_ms=%d error_class=%s", runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000), type(exc).__name__)
+            waiting_for = getattr(runtime["flow"], "waiting_for", None)
+            auth_stage = getattr(runtime["flow"], "current_stage", None)
+            if stage == "connect" and auth_stage:
+                stage = auth_stage
+            if isinstance(exc, TimeoutError):
+                safe = f"{waiting_for}_entry_timeout" if waiting_for else "network_timeout"
+            elif type(exc).__name__ == "ApiError" and auth_stage == "send_code":
+                safe = "code_rejected"
+            elif type(exc).__name__ == "ApiError" and auth_stage == "check_password":
+                safe = "password_rejected"
+            elif type(exc).__name__ == "ApiError" and auth_stage == "request_code":
+                safe = "max_auth_request_failed"
+            elif str(exc) in {"group_destination_mismatch", "max_user_id_missing", "group_resolution_failed", "account_registration_required", "cloud_password_rejected", "invite_unavailable", "proxy_assignment_changed"}:
+                safe = str(exc)
+            else:
+                safe = type(exc).__name__.lower()
+            logger.warning("onboarding_failed session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d error_class=%s", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000), type(exc).__name__)
             set_onboarding_state(session_id, "failed", safe)
         finally:
-            if adapter is not None:
-                try:
-                    stage = "session_close_seal"
-                    stage_started = perf_counter()
-                    await adapter.close()
-                    logger.info("onboarding_stage account_id=%s proxy_id=%s stage=%s duration_ms=%d", runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
-                except Exception:
-                    logger.warning("onboarding_failed account_id=%s proxy_id=%s stage=session_close_seal error_class=SessionSaveError", runtime["account_id"], runtime["proxy_id"])
-                    set_onboarding_state(session_id, "failed", "session_save_failed")
-            lock.release()
-            app.state.onboarding_flows.pop(session_id, None)
+            try:
+                if adapter is not None:
+                    try:
+                        stage = "session_close_seal"
+                        stage_started = perf_counter()
+                        await adapter.close()
+                        logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
+                    except Exception:
+                        logger.warning("onboarding_failed session_id=%s account_id=%s proxy_id=%s stage=session_close_seal error_class=SessionSaveError", session_id, runtime["account_id"], runtime["proxy_id"])
+                        set_onboarding_state(session_id, "failed", "session_save_failed")
+            finally:
+                if lock_acquired:
+                    lock.release()
+                app.state.onboarding_flows.pop(session_id, None)
 
     @app.post("/api/public/onboarding/{token}/{session_id}/code")
     async def onboarding_code(token: str, session_id: str, request: Request) -> dict[str, str]:
@@ -729,11 +932,12 @@ def create_app(
             raise HTTPException(429, "code_rate_limited")
         payload = await request.json()
         code = str(payload.get("code", "")).strip()
+        attempt = guest_onboarding_session(token, session_id)
         runtime = app.state.onboarding_flows.get(session_id)
-        with db() as connection:
-            row = connection.execute("SELECT token_hash,state FROM onboarding_sessions WHERE id=?", (session_id,)).fetchone()
-        if row is None or row["token_hash"] != digest_token(token) or runtime is None or row["state"] != "waiting_code":
-            raise HTTPException(404, "onboarding_session_unavailable")
+        if attempt["state"] in {"expired", "cancelled"}:
+            raise HTTPException(410, str(attempt["error_code"] or "onboarding_session_unavailable"))
+        if runtime is None or attempt["state"] != "waiting_code":
+            raise HTTPException(409, "onboarding_session_not_waiting_for_code")
         if not code.isdigit() or not 4 <= len(code) <= 8:
             raise HTTPException(422, "invalid_code")
         if runtime["flow"].codes.full():
@@ -749,11 +953,12 @@ def create_app(
             raise HTTPException(429, "password_rate_limited")
         payload = await request.json()
         password = str(payload.get("password", ""))
+        attempt = guest_onboarding_session(token, session_id)
         runtime = app.state.onboarding_flows.get(session_id)
-        with db() as connection:
-            row = connection.execute("SELECT token_hash,state FROM onboarding_sessions WHERE id=?", (session_id,)).fetchone()
-        if row is None or row["token_hash"] != digest_token(token) or runtime is None or row["state"] != "waiting_password":
-            raise HTTPException(404, "onboarding_session_unavailable")
+        if attempt["state"] in {"expired", "cancelled"}:
+            raise HTTPException(410, str(attempt["error_code"] or "onboarding_session_unavailable"))
+        if runtime is None or attempt["state"] != "waiting_password":
+            raise HTTPException(409, "onboarding_session_not_waiting_for_password")
         if not password or len(password) > 256:
             raise HTTPException(422, "invalid_password")
         if runtime["flow"].passwords.full():
@@ -762,13 +967,29 @@ def create_app(
         return {"state": "verifying_password"}
 
     @app.get("/api/public/onboarding/{token}/{session_id}")
-    def onboarding_status(token: str, session_id: str) -> dict[str, str]:
-        with db() as connection:
-            row = connection.execute("SELECT token_hash,state,error_code FROM onboarding_sessions WHERE id=?", (session_id,)).fetchone()
-        if row is None or row["token_hash"] != digest_token(token):
-            raise HTTPException(404, "onboarding_session_unavailable")
+    def onboarding_status(token: str, session_id: str) -> dict[str, object]:
+        row = guest_onboarding_session(token, session_id)
         flow = app.state.onboarding_flows.get(session_id, {}).get("flow")
-        return {"state": row["state"], "hint": flow_hint(flow) or (row["error_code"] or ""), "error": row["error_code"] or ""}
+        return {
+            "state": row["state"],
+            "hint": flow_hint(flow),
+            "error": row["error_code"] or "",
+            "expires_at": row["expires_at"],
+            "retryable": row["retryable"],
+            "retry_after_seconds": None,
+            "request_count_left": getattr(flow, "request_count_left", None),
+            "code_length": getattr(flow, "code_length", None),
+        }
+
+    @app.post("/api/public/onboarding/{token}/{session_id}/cancel")
+    async def onboarding_cancel(token: str, session_id: str, request: Request) -> dict[str, str]:
+        _require_same_origin(request)
+        attempt = guest_onboarding_session(token, session_id)
+        if attempt["state"] == "completed":
+            raise HTTPException(409, "onboarding_already_completed")
+        if attempt["state"] not in terminal_onboarding_states:
+            cancel_onboarding(session_id, "cancelled", "cancelled_by_guest")
+        return {"state": "cancelled"}
 
     def flow_hint(flow) -> str:
         return str(getattr(flow, "hint", "") or "")
@@ -779,11 +1000,14 @@ def create_app(
         remote = request.client.host if request.client else "unknown"
         if rate_limited(f"guest-membership:{digest_token(remote)}:{digest_token(session_id)}", 12, 900):
             raise HTTPException(429, "membership_check_rate_limited")
+        attempt = guest_onboarding_session(token, session_id)
+        if attempt["state"] in {"expired", "cancelled"}:
+            raise HTTPException(410, str(attempt["error_code"] or "onboarding_session_unavailable"))
         with db() as connection:
             row = connection.execute(
                 "SELECT s.*,a.group_id,a.phone,g.chat_id,pa.proxy_id,p.url_ciphertext FROM onboarding_sessions s "
                 "JOIN accounts a ON a.id=s.account_id JOIN groups g ON g.id=a.group_id "
-                "JOIN proxy_assignments pa ON pa.account_id=a.id JOIN proxies p ON p.id=pa.proxy_id WHERE s.id=?",
+                "JOIN proxy_assignments pa ON pa.account_id=a.id JOIN proxies p ON p.id=pa.proxy_id AND p.enabled=1 WHERE s.id=?",
                 (session_id,),
             ).fetchone()
         if row is None or row["token_hash"] != digest_token(token) or row["state"] != "waiting_membership" or not row["chat_id"]:
@@ -798,19 +1022,50 @@ def create_app(
             await adapter.connect()
             chat = await adapter.get_chat(int(row["chat_id"]))
             joined = member_proof(chat, str(row["chat_id"]))
-        except Exception:
-            raise HTTPException(503, "membership_check_unavailable")
+        except Exception as exc:
+            raise HTTPException(503, "membership_check_unavailable") from exc
         finally:
-            if adapter is not None:
-                try:
-                    await adapter.close()
-                except Exception:
-                    pass
-            lock.release()
-        if joined:
-            with db() as connection:
+            try:
+                if adapter is not None:
+                    try:
+                        await adapter.close()
+                    except Exception as exc:
+                        logger.error(
+                            "membership_check_session_close_failed account_id=%s error_class=%s",
+                            row["account_id"], type(exc).__name__,
+                        )
+                        raise HTTPException(503, "session_save_failed") from exc
+            finally:
+                lock.release()
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT s.state,s.expires_at,s.token_hash AS session_token_hash,i.active,"
+                "i.expires_at AS invite_expires_at,i.token_hash AS invite_token_hash,a.group_id,a.status AS account_status,"
+                "g.chat_id,pa.proxy_id AS assigned_proxy_id,p.enabled AS assigned_proxy_enabled "
+                "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id "
+                "JOIN accounts a ON a.id=s.account_id JOIN groups g ON g.id=a.group_id "
+                "LEFT JOIN proxy_assignments pa ON pa.account_id=a.id LEFT JOIN proxies p ON p.id=pa.proxy_id "
+                "WHERE s.id=?",
+                (session_id,),
+            ).fetchone()
+            now = datetime.now(timezone.utc).isoformat()
+            if (current is None or current["state"] != "waiting_membership" or current["expires_at"] <= now
+                    or not current["active"] or current["session_token_hash"] != current["invite_token_hash"]
+                    or current["invite_expires_at"] <= now):
+                connection.rollback()
+                raise HTTPException(410, "onboarding_session_unavailable")
+            if (int(current["group_id"]) != int(row["group_id"]) or str(current["chat_id"] or "") != str(row["chat_id"])
+                    or current["account_status"] != "pending"):
+                connection.rollback()
+                raise HTTPException(409, "group_invite_changed_during_verification")
+            if current["assigned_proxy_id"] != row["proxy_id"] or current["assigned_proxy_enabled"] != 1:
+                connection.rollback()
+                raise HTTPException(409, "account_assignment_changed_during_verification")
+            if joined:
                 connection.execute("UPDATE accounts SET status='active' WHERE id=?", (row["account_id"],))
-                connection.execute("UPDATE onboarding_sessions SET state='completed',updated_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(), session_id))
+                connection.execute("UPDATE onboarding_sessions SET state='completed',updated_at=? WHERE id=?", (now, session_id))
+            connection.commit()
         return {"joined": joined, "completed": joined}
 
     @app.post("/api/groups", status_code=201)
@@ -828,6 +1083,7 @@ def create_app(
     async def update_group(group_id: int, body: GroupUpdateBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
         if not _valid_max_invite_link(body.invite_link):
             raise HTTPException(422, "invalid_max_invite_link")
+        cancelled_sessions: list[str] = []
         with db() as connection:
             old = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
             if old is None:
@@ -836,10 +1092,12 @@ def create_app(
             connection.execute("UPDATE groups SET name=?,invite_link=?,chat_id=CASE WHEN ? THEN NULL ELSE chat_id END WHERE id=?", (body.name.strip(), body.invite_link.strip(), int(changed), group_id))
             if changed:
                 connection.execute("UPDATE onboarding_invites SET active=0 WHERE group_id=?", (group_id,))
+                cancelled_sessions = cancel_group_onboarding(connection, group_id, "invite_unavailable")
                 connection.execute("UPDATE accounts SET status='needs_membership' WHERE group_id=? AND status='active'", (group_id,))
                 connection.execute("UPDATE weekly_slots SET status='blocked',error_code='destination_unverified',updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND status='queued'", (group_id,))
             connection.execute("INSERT INTO audit_log(created_at,kind,group_id,detail) VALUES(CURRENT_TIMESTAMP,?,?,?)", ("group_destination_changed" if changed else "group_updated", group_id, "{}"))
             row = connection.execute("SELECT id,name,chat_id,active FROM groups WHERE id=?", (group_id,)).fetchone()
+        cancel_onboarding_tasks(cancelled_sessions)
         await worker_manager._sync_group_workers()
         return dict(row)
 
@@ -862,7 +1120,10 @@ def create_app(
             week_start = monday_of(datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date()).isoformat()
             rows = connection.execute(
                 "SELECT a.id,a.full_name,a.phone,a.status,a.send_weekday,pa.proxy_id,p.label AS proxy_label,p.enabled AS proxy_enabled,"
-                "s.scheduled_date,s.status AS slot_status,s.error_code FROM accounts a "
+                "s.scheduled_date,s.status AS slot_status,s.error_code,"
+                "(SELECT os.state FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_state,"
+                "(SELECT os.error_code FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_error "
+                "FROM accounts a "
                 "LEFT JOIN proxy_assignments pa ON pa.account_id=a.id LEFT JOIN proxies p ON p.id=pa.proxy_id "
                 "LEFT JOIN weekly_slots s ON s.account_id=a.id AND s.week_start=? "
                 "WHERE a.group_id=? ORDER BY a.id",
@@ -872,11 +1133,12 @@ def create_app(
 
     @app.post("/api/groups/{group_id}/verify-destination")
     async def verify_destination(group_id: int, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
+        used_proxy_ids: dict[int, int] = {}
         with db() as connection:
             group = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
             accounts = connection.execute(
-                "SELECT a.id,a.phone,p.url_ciphertext FROM accounts a JOIN proxy_assignments pa ON pa.account_id=a.id "
-                "JOIN proxies p ON p.id=pa.proxy_id WHERE a.group_id=? AND a.status='active' AND p.enabled=1 ORDER BY a.id",
+                "SELECT a.id,a.phone,p.id AS proxy_id,p.url_ciphertext FROM accounts a JOIN proxy_assignments pa ON pa.account_id=a.id "
+                "JOIN proxies p ON p.id=pa.proxy_id WHERE a.group_id=? AND a.status IN ('active','needs_membership') AND p.enabled=1 ORDER BY a.id",
                 (group_id,),
             ).fetchall()
         if group is None:
@@ -887,6 +1149,10 @@ def create_app(
         states: dict[int, bool] = {}
         for index, account in enumerate(accounts):
             adapter = None
+            close_failed = False
+            failure_code = None
+            failure = None
+            stage = "resolve_group" if index == 0 else "check_membership"
             lock = account_session_locks.for_account(account["id"])
             await lock.acquire()
             try:
@@ -899,24 +1165,40 @@ def create_app(
                     chat_id = str(getattr(resolved, "id", "") or getattr(resolved, "chat_id", ""))
                     if not chat_id:
                         raise RuntimeError("group_resolution_failed")
+                    stage = "check_membership"
                 states[int(account["id"])] = member_proof(await adapter.get_chat(int(chat_id)), chat_id)
             except Exception as exc:
-                if index == 0:
-                    raise HTTPException(503, "group_resolution_failed") from exc
-                states[int(account["id"])] = False
+                failure_code = "group_resolution_failed" if stage == "resolve_group" else "membership_check_unavailable"
+                failure = exc
             finally:
                 if adapter is not None:
                     try:
                         await adapter.close()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        close_failed = True
+                        logger.error("destination_verification_session_close_failed account_id=%s error_class=%s", account["id"], type(exc).__name__)
                 lock.release()
+            if close_failed:
+                raise HTTPException(503, "session_save_failed")
+            if failure_code:
+                raise HTTPException(503, failure_code) from failure
+            used_proxy_ids[int(account["id"])] = int(account["proxy_id"])
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
             if current is None or current["invite_link"] != group["invite_link"]:
                 connection.rollback()
                 raise HTTPException(409, "group_invite_changed_during_verification")
+            for account_id in states:
+                assignment = connection.execute(
+                    "SELECT a.status,pa.proxy_id,p.enabled FROM accounts a JOIN proxy_assignments pa ON pa.account_id=a.id "
+                    "JOIN proxies p ON p.id=pa.proxy_id WHERE a.id=? AND a.group_id=?",
+                    (account_id, group_id),
+                ).fetchone()
+                if (assignment is None or assignment["status"] not in {"active", "needs_membership"}
+                        or not assignment["enabled"] or int(assignment["proxy_id"]) != used_proxy_ids[account_id]):
+                    connection.rollback()
+                    raise HTTPException(409, "account_assignment_changed_during_verification")
             connection.execute("UPDATE groups SET chat_id=? WHERE id=?", (chat_id, group_id))
             for account_id, joined in states.items():
                 connection.execute("UPDATE accounts SET status=? WHERE id=?", ("active" if joined else "needs_membership", account_id))
@@ -947,6 +1229,14 @@ def create_app(
                 connection.rollback()
                 raise HTTPException(422, "proxy_group_mismatch_or_disabled")
             connection.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?) ON CONFLICT(account_id) DO UPDATE SET proxy_id=excluded.proxy_id,assigned_at=CURRENT_TIMESTAMP", (account_id, body.proxy_id))
+            timezone_row = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
+            from zoneinfo import ZoneInfo
+            today = datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date().isoformat()
+            connection.execute(
+                "UPDATE weekly_slots SET status=CASE WHEN scheduled_date>=? THEN 'queued' ELSE 'missed' END,"
+                "error_code=NULL,updated_at=? WHERE account_id=? AND status='blocked' AND error_code='proxy_assignment_unavailable'",
+                (today, datetime.now(timezone.utc).isoformat(), account_id),
+            )
             connection.execute("INSERT INTO audit_log(created_at,kind,group_id,account_id,detail) VALUES(CURRENT_TIMESTAMP,'proxy_reassigned',?,?,?)", (account["group_id"], account_id, "{}"))
             connection.commit()
         return {"proxy_id": proxy["id"], "proxy_label": proxy["label"]}

@@ -21,6 +21,15 @@ class KnownPreSendFailure(Exception):
     """The adapter can prove that MAX did not receive the message."""
 
 
+class DispatchPaused(Exception):
+    """A current run, schedule, or assignment check prevents a new send."""
+
+    def __init__(self, code: str, *, blocked: bool = False):
+        super().__init__(code)
+        self.code = code
+        self.blocked = blocked
+
+
 class Sender:
     def __init__(self, connection: sqlite3.Connection, provider: Provider, *, delays=(5, 15), sleep=asyncio.sleep):
         self.db = connection
@@ -63,45 +72,60 @@ class Sender:
         self.db.execute("UPDATE weekly_slots SET status='in_flight',updated_at=? WHERE slot_id=?", (stamp, slot_id))
         self.db.commit()
 
-        for attempt in range(3):
-            try:
-                result = await self.provider.send_message(chat_id=chat_id, text=slot["text"])
-                message_id = str(getattr(result, "message_id", "") or getattr(result, "id", "") or "").strip()
-                if not message_id:
-                    raise RuntimeError("provider_ack_missing")
-                accepted_at = datetime.now(timezone.utc).isoformat()
-                self.db.execute("BEGIN IMMEDIATE")
-                self.db.execute(
-                    "UPDATE operations SET status='accepted',finished_at=?,provider_message_id=? WHERE operation_id=?",
-                    (accepted_at, message_id, operation_id),
-                )
-                self.db.execute("UPDATE weekly_slots SET status='accepted',error_code=NULL,updated_at=? WHERE slot_id=?", (accepted_at, slot_id))
-                self.db.execute(
-                    "INSERT INTO send_log(account_id,group_id,slot_id,sent_at,provider_message_id,text) VALUES(?,?,?,?,?,?)",
-                    (slot["account_id"], slot["group_id"], slot_id, accepted_at, message_id, slot["text"]),
-                )
-                self.db.commit()
-                return "accepted"
-            except KnownPreSendFailure as exc:
-                code = _safe_code(exc)
-                if attempt < 2:
-                    self.db.execute("UPDATE weekly_slots SET retry_count=?,error_code=?,updated_at=? WHERE slot_id=?", (attempt + 1, code, stamp, slot_id))
-                    await self.sleep(self.delays[attempt])
-                    continue
-                self.db.execute("BEGIN IMMEDIATE")
-                self.db.execute("UPDATE operations SET status='rejected',finished_at=?,error_code=? WHERE operation_id=?", (datetime.now(timezone.utc).isoformat(), code, operation_id))
-                self.db.execute("UPDATE weekly_slots SET status='failed',retry_count=3,error_code=?,updated_at=? WHERE slot_id=?", (code, stamp, slot_id))
-                self.db.commit()
-                return "failed"
-            except Exception as exc:
-                # Once the request may have reached MAX, never repeat it automatically.
-                code = _safe_code(exc)
-                finished = datetime.now(timezone.utc).isoformat()
-                self.db.execute("BEGIN IMMEDIATE")
-                self.db.execute("UPDATE operations SET status='unknown',finished_at=?,error_code=? WHERE operation_id=?", (finished, code, operation_id))
-                self.db.execute("UPDATE weekly_slots SET status='unknown',error_code=?,updated_at=? WHERE slot_id=?", (code, finished, slot_id))
-                self.db.commit()
-                return "unknown"
+        safe_before_next_attempt = False
+        try:
+            for attempt in range(3):
+                safe_before_next_attempt = False
+                try:
+                    result = await self.provider.send_message(chat_id=chat_id, text=slot["text"])
+                    message_id = str(getattr(result, "message_id", "") or getattr(result, "id", "") or "").strip()
+                    if not message_id:
+                        raise RuntimeError("provider_ack_missing")
+                    accepted_at = datetime.now(timezone.utc).isoformat()
+                    self.db.execute("BEGIN IMMEDIATE")
+                    self.db.execute(
+                        "UPDATE operations SET status='accepted',finished_at=?,provider_message_id=? WHERE operation_id=?",
+                        (accepted_at, message_id, operation_id),
+                    )
+                    self.db.execute("UPDATE weekly_slots SET status='accepted',error_code=NULL,updated_at=? WHERE slot_id=?", (accepted_at, slot_id))
+                    self.db.execute(
+                        "INSERT INTO send_log(account_id,group_id,slot_id,sent_at,provider_message_id,text) VALUES(?,?,?,?,?,?)",
+                        (slot["account_id"], slot["group_id"], slot_id, accepted_at, message_id, slot["text"]),
+                    )
+                    self.db.commit()
+                    return "accepted"
+                except DispatchPaused as exc:
+                    code = _safe_code(exc)
+                    finished = datetime.now(timezone.utc).isoformat()
+                    self.db.execute("BEGIN IMMEDIATE")
+                    self.db.execute("UPDATE operations SET status='rejected',finished_at=?,error_code=? WHERE operation_id=?", (finished, code, operation_id))
+                    status = "blocked" if exc.blocked else "queued"
+                    self.db.execute("UPDATE weekly_slots SET status=?,error_code=?,updated_at=? WHERE slot_id=? AND status='in_flight'", (status, code, finished, slot_id))
+                    self.db.commit()
+                    return "paused"
+                except KnownPreSendFailure as exc:
+                    code = _safe_code(exc)
+                    if attempt < 2:
+                        safe_before_next_attempt = True
+                        self.db.execute("UPDATE weekly_slots SET retry_count=?,error_code=?,updated_at=? WHERE slot_id=?", (attempt + 1, code, stamp, slot_id))
+                        await self.sleep(self.delays[attempt])
+                        continue
+                    self.db.execute("BEGIN IMMEDIATE")
+                    self.db.execute("UPDATE operations SET status='rejected',finished_at=?,error_code=? WHERE operation_id=?", (datetime.now(timezone.utc).isoformat(), code, operation_id))
+                    self.db.execute("UPDATE weekly_slots SET status='failed',retry_count=3,error_code=?,updated_at=? WHERE slot_id=?", (code, stamp, slot_id))
+                    self.db.commit()
+                    return "failed"
+                except Exception as exc:
+                    # Once the request may have reached MAX, never repeat it automatically.
+                    _mark_unknown(self.db, operation_id, slot_id, _safe_code(exc))
+                    return "unknown"
+        except asyncio.CancelledError:
+            if safe_before_next_attempt:
+                _mark_retry_cancelled(self.db, operation_id, slot_id)
+            else:
+                # Cancellation cannot establish whether the request reached MAX.
+                _mark_unknown(self.db, operation_id, slot_id, "send_cancelled")
+            raise
         return "failed"
 
 
@@ -116,5 +140,38 @@ def recover_in_flight(connection: sqlite3.Connection) -> int:
 
 def _safe_code(error: BaseException) -> str:
     # Provider exception text can contain phones, proxy credentials, or tokens.
+    if isinstance(error, DispatchPaused) and error.code.isidentifier():
+        return error.code[:64]
+    if isinstance(error, KnownPreSendFailure):
+        safe = str(error)
+        return safe[:64] if safe.isidentifier() else "pre_send_failure"
     name = type(error).__name__.lower()
     return name[:64] if name.isidentifier() else "provider_error"
+
+
+def _mark_unknown(connection: sqlite3.Connection, operation_id: str, slot_id: str, code: str) -> None:
+    finished = datetime.now(timezone.utc).isoformat()
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute(
+        "UPDATE operations SET status='unknown',finished_at=?,error_code=? WHERE operation_id=? AND status='in_flight'",
+        (finished, code, operation_id),
+    )
+    connection.execute(
+        "UPDATE weekly_slots SET status='unknown',error_code=?,updated_at=? WHERE slot_id=? AND status='in_flight'",
+        (code, finished, slot_id),
+    )
+    connection.commit()
+
+
+def _mark_retry_cancelled(connection: sqlite3.Connection, operation_id: str, slot_id: str) -> None:
+    finished = datetime.now(timezone.utc).isoformat()
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute(
+        "UPDATE operations SET status='rejected',finished_at=?,error_code='retry_cancelled' WHERE operation_id=? AND status='in_flight'",
+        (finished, operation_id),
+    )
+    connection.execute(
+        "UPDATE weekly_slots SET status='queued',error_code='retry_cancelled',updated_at=? WHERE slot_id=? AND status='in_flight'",
+        (finished, slot_id),
+    )
+    connection.commit()
