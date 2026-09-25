@@ -6,7 +6,7 @@ services:
       - path: .env
         required: false
     expose: ["8000"]
-    # MAX calls use the configured account and group proxy directly.
+    # Only Caddy can reach this un-published app port. Caddy sanitizes incoming forwarded headers before proxying.
     volumes:
       - maxbot_data:/data
     tmpfs:

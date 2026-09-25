@@ -1,39 +1,70 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any, Callable
 
 from .max_adapter import PyMaxAdapter
 from .scheduling import assign_proxy
 
 
+logger = logging.getLogger(__name__)
+
+
 class WebCodeAuthFlow:
     """PyMax AuthFlow bridge to short-lived web OTP / 2FA queues."""
-    def __init__(self, update: Callable[[str, str], None]):
+    def __init__(self, update: Callable[[str, str], None], *, account_id: int | None = None, proxy_id: int | None = None):
         self.update = update
+        self.account_id = account_id
+        self.proxy_id = proxy_id
         self.codes: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
         self.passwords: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+
+    def _stage(self, stage: str, started: float, error: Exception | None = None) -> None:
+        fields = (self.account_id, self.proxy_id, stage, int((perf_counter() - started) * 1000))
+        if error is None:
+            logger.info("onboarding_stage account_id=%s proxy_id=%s stage=%s duration_ms=%d", *fields)
+        else:
+            logger.warning("onboarding_failed account_id=%s proxy_id=%s stage=%s duration_ms=%d error_class=%s", *fields, type(error).__name__)
 
     async def authenticate(self, app: Any):
         from pymax.auth.models import AuthResult
         self.update("requesting_code", "")
-        start = await app.api.auth.request_code(str(app.config.phone))
-        self.update("waiting_code", "")
+        stage = "request_code"
+        started = perf_counter()
+        try:
+            start = await app.api.auth.request_code(str(app.config.phone))
+        except Exception as exc:
+            self._stage(stage, started, exc)
+            raise
+        self._stage(stage, started)
+        self.update("waiting_code", "MAX принял запрос кода. Ожидайте сообщение с кодом.")
         code = await asyncio.wait_for(self.codes.get(), timeout=300)
         self.update("verifying_code", "")
-        result = await app.api.auth.send_code(start.token, code)
+        stage = "send_code"
+        started = perf_counter()
+        try:
+            result = await app.api.auth.send_code(start.token, code)
+        except Exception as exc:
+            self._stage(stage, started, exc)
+            raise
+        self._stage(stage, started)
         login_token = result.login_token
         if result.password_challenge is not None:
             track_id = result.password_challenge.track_id
             for _ in range(5):
                 self.update("waiting_password", str(result.password_challenge.hint or ""))
                 password = await asyncio.wait_for(self.passwords.get(), timeout=300)
+                stage = "check_password"
+                started = perf_counter()
                 try:
                     answer = await app.api.auth.check_password(track_id, password)
                 except Exception:
                     answer = None
+                self._stage(stage, started)
                 if answer is not None and not answer.error and answer.login_token:
                     login_token = answer.login_token
                     break

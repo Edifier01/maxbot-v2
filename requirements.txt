@@ -4,3 +4,4 @@ maxapi-python==2.4.1
 cryptography==46.0.3
 bcrypt==5.0.0
 python-multipart==0.0.20
+tzdata==2026.4
