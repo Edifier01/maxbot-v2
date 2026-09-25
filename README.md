@@ -10,15 +10,30 @@
 
 ## Разработка и запуск
 
-Нужны Docker Compose и домен, указывающий на VPS. Скопируйте `.env.example` в `.env`, задайте уникальные `APP_SECRET_KEY` и `DATA_ENCRYPTION_KEY`, а хеш начального пароля владельца получите интерактивно:
+Для выпуска нужны Docker Compose и домен, указывающий на VPS. Для локальной разработки установите Python 3.12 с [python.org](https://www.python.org/downloads/release/python-31210/). Windows-тестовое окружение создаётся так:
 
 ```powershell
-python -m pip install -r requirements.txt
-python scripts/hash_password.py
+py -3.12 --version
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-В `.env` внесите полученный `OWNER_PASSWORD_HASH`, домен и случайные ключи. Сам пароль не записывайте в файлы проекта. Сгенерировать ключ шифрования можно через `python -c "from maxbot_v2.crypto import SecretBox; print(SecretBox.generate_key())"`.
-Секрет приложения можно создать через `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
+`requirements-dev.txt` устанавливает закреплённые runtime- и тестовые пакеты только в `.venv`; Docker-образ устанавливает только `requirements.txt`. Скрипты интерфейса можно проверить встроенной проверкой Node.js:
+
+```powershell
+node --check static/app.js
+node --check static/join.js
+```
+
+Скопируйте `.env.example` в `.env`, задайте уникальные `APP_SECRET_KEY` и `DATA_ENCRYPTION_KEY`, а хеш начального пароля владельца получите интерактивно:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/hash_password.py
+```
+
+В `.env` внесите полученный `OWNER_PASSWORD_HASH`, домен и случайные ключи. Сам пароль не записывайте в файлы проекта. Сгенерировать ключ шифрования можно через `\.venv\Scripts\python.exe -c "from maxbot_v2.crypto import SecretBox; print(SecretBox.generate_key())"`.
+Секрет приложения можно создать через `\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))"`.
 
 Затем запустите `docker compose up -d --build`. Caddy получает TLS-сертификат автоматически; приложение слушает только внутреннюю сеть Compose. Вызовы PyMax выполняются через закреплённый прокси подключённого аккаунта; отдельный файл локального разрешения не требуется.
 
