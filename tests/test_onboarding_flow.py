@@ -129,6 +129,7 @@ def test_rejected_code_records_its_pymax_stage_without_logging_remote_text(monke
 
 def test_password_challenge_uses_proxy_after_direct_code_request(monkeypatch):
     calls = []
+    updates = []
 
     class AuthResult:
         def __init__(self, token):
@@ -147,7 +148,7 @@ def test_password_challenge_uses_proxy_after_direct_code_request(monkeypatch):
             calls.append(("proxy_send_code", token, code))
             return SimpleNamespace(
                 login_token=None,
-                password_challenge=SimpleNamespace(track_id="track-1", hint=None),
+                password_challenge=SimpleNamespace(track_id="track-1", hint="synthetic-private-hint"),
                 register_token=None,
             )
 
@@ -157,7 +158,7 @@ def test_password_challenge_uses_proxy_after_direct_code_request(monkeypatch):
 
     app = SimpleNamespace(api=SimpleNamespace(auth=ProxyAuthApi()), config=SimpleNamespace(phone="+79990000000"))
     flow = WebCodeAuthFlow(
-        lambda _state, _hint: None,
+        lambda state, hint: updates.append((state, hint)),
         request_code=direct_request_code,
         validate_proxy=lambda: calls.append(("validate_proxy",)),
     )
@@ -176,6 +177,7 @@ def test_password_challenge_uses_proxy_after_direct_code_request(monkeypatch):
         ("validate_proxy",),
     ]
     assert result.token == "login-token"
+    assert "synthetic-private-hint" not in str(updates)
 
 
 def test_stale_proxy_assignment_blocks_direct_code_request():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sqlite3
 from datetime import datetime, timezone
 from time import perf_counter
@@ -12,6 +13,22 @@ from .scheduling import assign_proxy
 
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_russian_phone(value: str) -> str:
+    raw = value.strip()
+    if not re.fullmatch(r"\+?[0-9\s().-]+", raw):
+        raise ValueError("invalid_russian_phone")
+    digits = re.sub(r"[\s().-]", "", raw)
+    if digits.startswith("+"):
+        if not digits.startswith("+7"):
+            raise ValueError("invalid_russian_phone")
+        digits = digits[1:]
+    if len(digits) == 11 and digits[0] in "78":
+        digits = digits[1:]
+    if len(digits) != 10 or not digits.isascii():
+        raise ValueError("invalid_russian_phone")
+    return "+7" + digits
 
 
 class WebCodeAuthFlow:
@@ -85,7 +102,7 @@ class WebCodeAuthFlow:
             for _ in range(5):
                 self.waiting_for = "password"
                 self.current_stage = "wait_password_input"
-                self.update("waiting_password", str(result.password_challenge.hint or ""))
+                self.update("waiting_password", "Введите облачный пароль MAX.")
                 started = perf_counter()
                 try:
                     password = await asyncio.wait_for(self.passwords.get(), timeout=300)
@@ -126,6 +143,51 @@ def member_proof(chat: Any, expected_chat_id: str) -> bool:
         return actual_id == str(expected_chat_id) and status in {"member", "active", "joined", "in"} and joined > 0
     except (TypeError, ValueError):
         return False
+
+
+async def join_group_and_confirm_membership(
+    adapter: Any,
+    invite_link: str,
+    chat_id: str,
+    *,
+    before_action: Callable[[], None] | None = None,
+) -> tuple[bool, str | None]:
+    def check() -> None:
+        if before_action is not None:
+            before_action()
+
+    check()
+    try:
+        existing = await adapter.get_chat(int(chat_id))
+    except Exception as exc:
+        if type(exc).__name__ != "PyMaxError":
+            raise
+    else:
+        if member_proof(existing, chat_id):
+            return True, None
+
+    check()
+    join_error = None
+    try:
+        joined = await adapter.join_group(invite_link)
+        returned_id = str(getattr(joined, "id", "") or getattr(joined, "chat_id", ""))
+        if returned_id and returned_id != str(chat_id):
+            raise ValueError("group_destination_mismatch")
+    except ValueError as exc:
+        if str(exc) == "group_destination_mismatch":
+            raise
+        join_error = "auto_join_failed"
+    except Exception:
+        join_error = "auto_join_failed"
+
+    check()
+    try:
+        actual = await adapter.get_chat(int(chat_id))
+    except Exception:
+        return False, "membership_check_unavailable"
+    if member_proof(actual, chat_id):
+        return True, None
+    return False, join_error or "membership_not_confirmed"
 
 
 def prepare_account(connection: sqlite3.Connection, *, group_id: int, phone: str, full_name: str) -> tuple[int, int]:

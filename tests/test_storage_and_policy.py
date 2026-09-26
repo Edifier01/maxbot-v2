@@ -1,12 +1,13 @@
 import sqlite3
 import asyncio
+import logging
 from types import SimpleNamespace
 
 from maxbot_v2.crypto import SecretBox
-from maxbot_v2.db import initialize
+from maxbot_v2.db import connect, initialize
 from maxbot_v2.session_vault import EncryptedSessionFile
 from maxbot_v2.max_adapter import PyMaxAdapter
-from maxbot_v2.onboarding import member_proof
+from maxbot_v2.onboarding import join_group_and_confirm_membership, member_proof, normalize_russian_phone
 from scripts.backup import create_backup
 from scripts.restore import restore_backup
 
@@ -32,6 +33,31 @@ def test_pymax_adapter_calls_provider_without_local_authorization_file():
     assert len(client.calls) == 2
 
 
+def test_pymax_adapter_joins_and_refreshes_membership_from_provider():
+    class Chats:
+        def __init__(self):
+            self.cached = True
+
+        def _remove_cached_chat(self, _chat_id):
+            self.cached = False
+
+    class Client:
+        def __init__(self):
+            self.chats_api = Chats()
+            self._app = SimpleNamespace(api=SimpleNamespace(chats=self.chats_api))
+
+        async def join_group(self, link):
+            assert link == "https://max.ru/join/test"
+            return SimpleNamespace(id=7001)
+
+        async def get_chat(self, _chat_id):
+            return SimpleNamespace(id=7001, status="none" if self.chats_api.cached else "member", join_time=0 if self.chats_api.cached else 1)
+
+    adapter = PyMaxAdapter(Client())
+    assert asyncio.run(adapter.join_group("https://max.ru/join/test")).id == 7001
+    assert member_proof(asyncio.run(adapter.get_chat(7001)), "7001")
+
+
 def test_pinned_pymax_client_constructs_with_proxy_and_encrypted_session_vault(tmp_path):
     from importlib.metadata import version
     assert version("maxapi-python") == "2.4.1"
@@ -42,11 +68,101 @@ def test_pinned_pymax_client_constructs_with_proxy_and_encrypted_session_vault(t
     assert not (tmp_path / "encrypted" / "account-10.session.enc").exists()
 
 
+def test_failed_pymax_constructor_removes_decrypted_session(tmp_path, monkeypatch):
+    import pymax
+
+    vault = EncryptedSessionFile(10, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
+    vault.open()
+    connection = sqlite3.connect(vault.work_path)
+    connection.execute("CREATE TABLE proof (value INTEGER)")
+    connection.close()
+    vault.seal()
+
+    def fail_constructor(**_kwargs):
+        raise RuntimeError("synthetic constructor failure")
+
+    monkeypatch.setattr(pymax, "Client", fail_constructor)
+    try:
+        PyMaxAdapter.create(phone="+79990000000", work_dir="", session_name="", proxy="socks5://127.0.0.1:1080", session_vault=vault)
+    except Exception:
+        pass
+    else:
+        raise AssertionError("PyMax construction should fail")
+    assert vault.encrypted_path.exists()
+    assert not vault.work_path.exists()
+
+
+def test_pymax_error_text_is_not_emitted_to_ordinary_logs(tmp_path, caplog):
+    vault = EncryptedSessionFile(10, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
+    PyMaxAdapter.create(phone="+79990000000", work_dir="", session_name="", proxy="socks5://127.0.0.1:1080", session_vault=vault)
+    with caplog.at_level(logging.ERROR, logger="pymax.audit"):
+        logging.getLogger("pymax.audit").error("synthetic-private-provider-response")
+    assert "synthetic-private-provider-response" not in caplog.text
+
+
 def test_membership_proof_rejects_wrong_group_and_missing_join_time():
     member = SimpleNamespace(id=12, status=SimpleNamespace(value="member"), join_time=123)
     assert member_proof(member, "12")
     assert not member_proof(member, "13")
     assert not member_proof(SimpleNamespace(id=12, status="member", join_time=0), "12")
+
+
+def test_russian_phone_normalization_and_rejection():
+    for raw in ("89991234567", "79991234567", "+79991234567", "9991234567", "8 (999) 123-45-67"):
+        assert normalize_russian_phone(raw) == "+79991234567"
+    for raw in ("+89991234567", "+19991234567", "89abc123456", "899912345"):
+        try:
+            normalize_russian_phone(raw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted invalid phone form: {raw!r}")
+
+
+def test_auto_join_skips_join_when_already_a_member():
+    class Adapter:
+        async def get_chat(self, _chat_id):
+            return SimpleNamespace(id=7001, status="member", join_time=1)
+
+        async def join_group(self, _link):
+            raise AssertionError("already a member")
+
+    assert asyncio.run(join_group_and_confirm_membership(Adapter(), "https://max.ru/join/test", "7001")) == (True, None)
+
+
+def test_auto_join_checks_membership_after_unknown_result_without_retry():
+    class Adapter:
+        def __init__(self):
+            self.checks = 0
+            self.joins = 0
+
+        async def get_chat(self, _chat_id):
+            self.checks += 1
+            return SimpleNamespace(id=7001, status="member" if self.checks > 1 else "none", join_time=1 if self.checks > 1 else 0)
+
+        async def join_group(self, _link):
+            self.joins += 1
+            raise TimeoutError("uncertain response")
+
+    adapter = Adapter()
+    assert asyncio.run(join_group_and_confirm_membership(adapter, "https://max.ru/join/test", "7001")) == (True, None)
+    assert adapter.joins == 1
+
+
+def test_auto_join_refuses_a_different_chat():
+    class Adapter:
+        async def get_chat(self, _chat_id):
+            return SimpleNamespace(id=7001, status="none", join_time=0)
+
+        async def join_group(self, _link):
+            return SimpleNamespace(id=7002, status="member", join_time=1)
+
+    try:
+        asyncio.run(join_group_and_confirm_membership(Adapter(), "https://max.ru/join/test", "7001"))
+    except ValueError as exc:
+        assert str(exc) == "group_destination_mismatch"
+    else:
+        raise AssertionError("joined a different chat")
 
 
 def test_session_snapshot_is_encrypted_and_restorable(tmp_path):
@@ -61,6 +177,26 @@ def test_session_snapshot_is_encrypted_and_restorable(tmp_path):
     assert not session.exists()
     vault.open()
     assert session.read_bytes() == b"session token secret"
+
+
+def test_existing_session_generation_schema_and_file_survive_restart(tmp_path):
+    connection = connect(tmp_path / "existing.sqlite3")
+    initialize(connection)
+    group_id = connection.execute("INSERT INTO groups(name,invite_link) VALUES('group','https://max.ru/join/test')").lastrowid
+    account_id = connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,'+79990000000','test','active')", (group_id,)).lastrowid
+    connection.execute("UPDATE accounts SET session_generation=2 WHERE id=?", (account_id,))
+    initialize(connection)
+    assert connection.execute("SELECT session_generation FROM accounts WHERE id=?", (account_id,)).fetchone()[0] == 2
+    connection.close()
+    box = SecretBox(SecretBox.generate_key())
+    old = EncryptedSessionFile(account_id, generation=2, durable_dir=tmp_path / "sessions", runtime_dir=tmp_path / "runtime", box=box)
+    _, filename = old.open()
+    (old.work_dir / filename).write_bytes(b"encrypted MAX session")
+    old.seal()
+    assert old.encrypted_path.name == f"account-{account_id}-generation-2.session.enc"
+    restored = EncryptedSessionFile(account_id, generation=2, durable_dir=tmp_path / "sessions", runtime_dir=tmp_path / "runtime", box=box)
+    restored.open()
+    assert restored.work_path.read_bytes() == b"encrypted MAX session"
 
 
 def test_backup_and_restore_verify_database_and_encrypted_sessions(tmp_path):

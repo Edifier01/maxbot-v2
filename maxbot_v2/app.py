@@ -14,7 +14,8 @@ from typing import Iterator
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
-from fastapi.responses import FileResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -22,7 +23,7 @@ from .db import connect, initialize
 from .security import digest_token as _digest_token, new_token, password_matches
 from .crypto import SecretBox
 from .message_pool import replace_message_pool
-from .onboarding import WebCodeAuthFlow, attach_group_on_first_account, member_proof, prepare_account
+from .onboarding import WebCodeAuthFlow, attach_group_on_first_account, join_group_and_confirm_membership, member_proof, normalize_russian_phone, prepare_account
 from .max_adapter import PyMaxAdapter
 from .session_vault import EncryptedSessionFile
 from .workers import GroupWorkerManager, _inside_window
@@ -135,11 +136,19 @@ def create_app(
     account_session_locks = AccountSessionLocks()
     terminal_onboarding_states = ("completed", "failed", "expired", "cancelled")
 
+    def session_vault_for(account_id: int) -> EncryptedSessionFile:
+        with db() as connection:
+            row = connection.execute("SELECT session_generation FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if row is None:
+            raise ValueError("account_not_found")
+        return EncryptedSessionFile(account_id, generation=row["session_generation"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
+
     class LockedAdapter:
-        def __init__(self, adapter, lock: asyncio.Lock, proxy_id: int):
+        def __init__(self, adapter, lock: asyncio.Lock, proxy_id: int, proxy_ciphertext: str):
             self._adapter = adapter
             self._lock = lock
             self.proxy_id = proxy_id
+            self.proxy_ciphertext = proxy_ciphertext
             self._closed = False
 
         def __getattr__(self, name):
@@ -167,14 +176,27 @@ def create_app(
             proxy = SecretBox().decrypt(row["url_ciphertext"])
         except ValueError as exc:
             raise DispatchPaused("proxy_unavailable", blocked=True) from exc
-        vault = EncryptedSessionFile(slot["account_id"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
+        vault = session_vault_for(slot["account_id"])
         lock = account_session_locks.for_account(slot["account_id"])
         await lock.acquire()
         adapter = None
         try:
+            def require_same_proxy() -> None:
+                with db() as connection:
+                    current = connection.execute(
+                        "SELECT pa.proxy_id,p.enabled,p.url_ciphertext FROM proxy_assignments pa "
+                        "JOIN proxies p ON p.id=pa.proxy_id WHERE pa.account_id=?",
+                        (slot["account_id"],),
+                    ).fetchone()
+                if (current is None or not current["enabled"] or int(current["proxy_id"]) != int(row["proxy_id"])
+                        or current["url_ciphertext"] != row["url_ciphertext"]):
+                    raise DispatchPaused("proxy_assignment_changed")
+
+            require_same_proxy()
             adapter = PyMaxAdapter.create(phone=row["phone"], work_dir="", session_name="", proxy=proxy, session_vault=vault)
             await adapter.connect()
-            return LockedAdapter(adapter, lock, int(row["proxy_id"]))
+            require_same_proxy()
+            return LockedAdapter(adapter, lock, int(row["proxy_id"]), row["url_ciphertext"])
         except BaseException:
             try:
                 if adapter is not None:
@@ -216,6 +238,10 @@ def create_app(
             app.state.onboarding_flows.clear()
 
     app = FastAPI(title="MAXBOT v2", docs_url=None, redoc_url=None, lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def safe_validation_error(_request: Request, _error: RequestValidationError) -> JSONResponse:
+        return JSONResponse(status_code=422, content={"detail": "invalid_request"})
     app.state.database = database
     app.state.data_dir = data
     app.state.owner_username = owner_username
@@ -602,6 +628,8 @@ def create_app(
     @app.delete("/api/groups/{group_id}/proxies/{proxy_id}")
     def remove_proxy(group_id: int, proxy_id: int, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
         with db() as connection:
+            if connection.execute("SELECT 1 FROM proxies WHERE group_id=? AND id=?", (group_id, proxy_id)).fetchone() is None:
+                raise HTTPException(404, "proxy_not_found")
             assigned = connection.execute("SELECT account_id FROM proxy_assignments WHERE proxy_id=?", (proxy_id,)).fetchall()
             if assigned:
                 connection.execute("UPDATE proxies SET enabled=0 WHERE group_id=? AND id=?", (group_id, proxy_id))
@@ -738,15 +766,16 @@ def create_app(
             raise HTTPException(429, "onboarding_rate_limited")
         payload = await request.json()
         full_name = str(payload.get("full_name", "")).strip()[:120]
-        phone = str(payload.get("phone", "")).strip()
-        import re
-        digits = re.sub(r"\D", "", phone)
-        if not full_name or not 7 <= len(digits) <= 15:
+        if not full_name:
             raise HTTPException(422, "invalid_name_or_phone")
-        phone = "+" + digits
+        try:
+            phone = normalize_russian_phone(str(payload.get("phone", "")))
+        except ValueError as exc:
+            raise HTTPException(422, "invalid_russian_phone") from exc
         row = invite_row(None, token)
         session_id = new_token(16)
         now = datetime.now(timezone.utc).isoformat()
+        expired_session_ids: list[str] = []
         try:
             with db() as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -761,6 +790,15 @@ def create_app(
                 if connection.execute("SELECT 1 FROM proxies WHERE group_id=? AND enabled=1 LIMIT 1", (row["group_id"],)).fetchone() is None:
                     connection.rollback()
                     raise HTTPException(409, "proxy_assignment_required")
+                expired_session_ids = [old[0] for old in connection.execute(
+                    "SELECT id FROM onboarding_sessions WHERE state NOT IN ('completed','failed','expired','cancelled') AND expires_at<=?",
+                    (now,),
+                ).fetchall()]
+                connection.execute(
+                    "UPDATE onboarding_sessions SET state='expired',error_code='onboarding_attempt_expired',updated_at=? "
+                    "WHERE state NOT IN ('completed','failed','expired','cancelled') AND expires_at<=?",
+                    (now, now),
+                )
                 active_uses = connection.execute(
                     "SELECT COUNT(*) FROM onboarding_sessions WHERE invite_id=? AND token_hash=? "
                     "AND state NOT IN ('failed','expired','cancelled')",
@@ -769,7 +807,19 @@ def create_app(
                 if current_invite["max_uses"] is not None and active_uses >= current_invite["max_uses"]:
                     connection.rollback()
                     raise HTTPException(404, "invite_unavailable")
-                existing = connection.execute("SELECT id,group_id,status FROM accounts WHERE phone=?", (phone,)).fetchone()
+                matches = []
+                for candidate in connection.execute("SELECT id,group_id,status,phone FROM accounts"):
+                    old_phone = str(candidate["phone"] or "")
+                    try:
+                        canonical = normalize_russian_phone(old_phone.removeprefix("+8") if old_phone.startswith("+8") else old_phone)
+                    except ValueError:
+                        continue
+                    if canonical == phone:
+                        matches.append(candidate)
+                if len(matches) > 1:
+                    connection.rollback()
+                    raise HTTPException(409, "phone_already_exists")
+                existing = matches[0] if matches else None
                 if existing is None:
                     account_id, proxy_id = prepare_account(connection, group_id=row["group_id"], phone=phone, full_name=full_name)
                 else:
@@ -792,7 +842,7 @@ def create_app(
                         connection.rollback()
                         raise HTTPException(409, "proxy_assignment_required")
                     account_id, proxy_id = existing["id"], assignment["proxy_id"]
-                    connection.execute("UPDATE accounts SET full_name=? WHERE id=?", (full_name, account_id))
+                    connection.execute("UPDATE accounts SET full_name=?,phone=? WHERE id=?", (full_name, phone, account_id))
                 proxy_row = connection.execute(
                     "SELECT url_ciphertext FROM proxies WHERE id=? AND enabled=1", (proxy_id,)
                 ).fetchone()
@@ -812,6 +862,7 @@ def create_app(
                 connection.commit()
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "phone_already_exists") from exc
+        cancel_onboarding_tasks(expired_session_ids)
 
         def validate_onboarding_proxy() -> None:
             with db() as connection:
@@ -861,21 +912,43 @@ def create_app(
         runtime = app.state.onboarding_flows.get(session_id)
         if runtime is None:
             return
-        vault = EncryptedSessionFile(runtime["account_id"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
+        vault = session_vault_for(runtime["account_id"])
         adapter = None
         lock = account_session_locks.for_account(runtime["account_id"])
         stage = "session_open"
         stage_started = perf_counter()
         lock_acquired = False
+
+        def validate_target(expected_chat_id: str | None = None) -> None:
+            runtime["flow"].validate_proxy()
+            with db() as connection:
+                current = connection.execute(
+                    "SELECT s.state,s.expires_at,s.token_hash AS session_token_hash,i.active,i.expires_at AS invite_expires_at,"
+                    "i.token_hash AS invite_token_hash,a.status AS account_status,g.invite_link,g.chat_id "
+                    "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id "
+                    "JOIN accounts a ON a.id=s.account_id JOIN groups g ON g.id=a.group_id WHERE s.id=?",
+                    (session_id,),
+                ).fetchone()
+            now = datetime.now(timezone.utc).isoformat()
+            if (current is None or current["state"] in terminal_onboarding_states or current["expires_at"] <= now
+                    or not current["active"] or current["session_token_hash"] != current["invite_token_hash"]
+                    or current["invite_expires_at"] <= now or current["account_status"] != "pending"
+                    or current["invite_link"] != invite_link):
+                raise RuntimeError("invite_unavailable")
+            if current["chat_id"] and expected_chat_id and str(current["chat_id"]) != str(expected_chat_id):
+                raise ValueError("group_destination_mismatch")
+
         try:
             await lock.acquire()
             lock_acquired = True
+            validate_target()
             logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s", session_id, runtime["account_id"], runtime["proxy_id"], stage)
             adapter = PyMaxAdapter.create(phone=runtime["phone"], work_dir="", session_name="", proxy=runtime["proxy"], auth_flow=runtime["flow"], session_vault=vault)
             logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
             stage = "connect"
             stage_started = perf_counter()
             await adapter.connect()
+            validate_target()
             logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
             stage = "resolve_group"
             stage_started = perf_counter()
@@ -884,19 +957,41 @@ def create_app(
             max_user_id = str(getattr(contact, "id", "") or getattr(profile, "id", ""))
             if not max_user_id:
                 raise RuntimeError("max_user_id_missing")
-            resolved = await adapter.resolve_group_by_link(invite_link)
-            logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
-            chat_id = str(getattr(resolved, "id", "") or getattr(resolved, "chat_id", ""))
-            if not chat_id:
-                raise RuntimeError("group_resolution_failed")
+            validate_target()
+            try:
+                resolved = await adapter.resolve_group_by_link(invite_link)
+                chat_id = str(getattr(resolved, "id", "") or getattr(resolved, "chat_id", ""))
+            except Exception:
+                chat_id = ""
+            logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d resolved=%s", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000), bool(chat_id))
+            if chat_id:
+                validate_target(chat_id)
+                set_onboarding_state(session_id, "joining_group")
+                stage = "join_group"
+                stage_started = perf_counter()
+                joined, join_error = await join_group_and_confirm_membership(
+                    adapter, invite_link, chat_id, before_action=lambda: validate_target(chat_id),
+                )
+            else:
+                joined, join_error = False, "group_resolution_failed"
+            logger.info(
+                "onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d membership_confirmed=%s",
+                session_id, runtime["account_id"], runtime["proxy_id"], stage,
+                int((perf_counter() - stage_started) * 1000), joined,
+            )
+            validate_target(chat_id)
+            stage = "session_close_seal"
+            await adapter.close()
+            adapter = None
             with db() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 current = connection.execute(
                     "SELECT s.state,s.expires_at,s.token_hash AS session_token_hash,i.active,i.expires_at AS invite_expires_at,"
-                    "i.token_hash AS invite_token_hash,a.status AS account_status,pa.proxy_id AS assigned_proxy_id,"
-                    "p.enabled AS assigned_proxy_enabled "
+                    "i.token_hash AS invite_token_hash,a.status AS account_status,g.invite_link,g.chat_id,"
+                    "pa.proxy_id AS assigned_proxy_id,p.enabled AS assigned_proxy_enabled,p.url_ciphertext "
                     "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id "
-                    "JOIN accounts a ON a.id=s.account_id LEFT JOIN proxy_assignments pa ON pa.account_id=a.id "
+                    "JOIN accounts a ON a.id=s.account_id JOIN groups g ON g.id=a.group_id "
+                    "LEFT JOIN proxy_assignments pa ON pa.account_id=a.id "
                     "LEFT JOIN proxies p ON p.id=pa.proxy_id WHERE s.id=?",
                     (session_id,),
                 ).fetchone()
@@ -904,14 +999,30 @@ def create_app(
                 if (current is None or current["state"] in terminal_onboarding_states or current["expires_at"] <= now
                         or not current["active"] or current["session_token_hash"] != current["invite_token_hash"]
                         or current["invite_expires_at"] <= now or current["account_status"] != "pending"
+                        or current["invite_link"] != invite_link
                         or current["assigned_proxy_id"] != runtime["proxy_id"] or current["assigned_proxy_enabled"] != 1):
                     connection.rollback()
                     if current is not None and (current["assigned_proxy_id"] != runtime["proxy_id"] or current["assigned_proxy_enabled"] != 1):
                         raise RuntimeError("proxy_assignment_changed")
                     raise RuntimeError("invite_unavailable")
-                attach_group_on_first_account(connection, runtime["group_id"], chat_id)
-                connection.execute("UPDATE accounts SET max_user_id=? WHERE id=?", (max_user_id, runtime["account_id"]))
-                connection.execute("UPDATE onboarding_sessions SET state='waiting_membership',max_user_id=?,updated_at=? WHERE id=?", (max_user_id, now, session_id))
+                try:
+                    current_proxy = SecretBox().decrypt(current["url_ciphertext"])
+                except (TypeError, ValueError) as exc:
+                    connection.rollback()
+                    raise RuntimeError("proxy_assignment_changed") from exc
+                if current_proxy != runtime["proxy"]:
+                    connection.rollback()
+                    raise RuntimeError("proxy_assignment_changed")
+                if current["chat_id"] and chat_id and str(current["chat_id"]) != chat_id:
+                    connection.rollback()
+                    raise ValueError("group_destination_mismatch")
+                if chat_id:
+                    attach_group_on_first_account(connection, runtime["group_id"], chat_id)
+                connection.execute("UPDATE accounts SET max_user_id=?,status=? WHERE id=?", (max_user_id, "active" if joined else "needs_membership", runtime["account_id"]))
+                connection.execute(
+                    "UPDATE onboarding_sessions SET state=?,error_code=?,max_user_id=?,updated_at=? WHERE id=?",
+                    ("completed" if joined else "waiting_membership", join_error, max_user_id, now, session_id),
+                )
                 connection.commit()
         except Exception as exc:
             waiting_for = getattr(runtime["flow"], "waiting_for", None)
@@ -1034,18 +1145,44 @@ def create_app(
                 "JOIN proxy_assignments pa ON pa.account_id=a.id JOIN proxies p ON p.id=pa.proxy_id AND p.enabled=1 WHERE s.id=?",
                 (session_id,),
             ).fetchone()
-        if row is None or row["token_hash"] != digest_token(token) or row["state"] != "waiting_membership" or not row["chat_id"]:
+        if row is None or row["token_hash"] != digest_token(token) or row["state"] != "waiting_membership":
             raise HTTPException(404, "onboarding_session_unavailable")
+        if not row["chat_id"]:
+            raise HTTPException(503, "group_resolution_failed")
         lock = account_session_locks.for_account(row["account_id"])
         adapter = None
+
+        def current_membership_proxy_url() -> str:
+            with db() as connection:
+                assigned = connection.execute(
+                    "SELECT pa.proxy_id,p.group_id,p.enabled,p.url_ciphertext FROM proxy_assignments pa "
+                    "JOIN proxies p ON p.id=pa.proxy_id WHERE pa.account_id=?",
+                    (row["account_id"],),
+                ).fetchone()
+            if (assigned is None or assigned["proxy_id"] != row["proxy_id"]
+                    or assigned["group_id"] != row["group_id"] or assigned["enabled"] != 1):
+                raise HTTPException(409, "account_assignment_changed_during_verification")
+            try:
+                value = SecretBox().decrypt(assigned["url_ciphertext"])
+                previous = SecretBox().decrypt(row["url_ciphertext"])
+            except ValueError as exc:
+                raise HTTPException(409, "account_assignment_changed_during_verification") from exc
+            if value != previous:
+                raise HTTPException(409, "account_assignment_changed_during_verification")
+            return value
+
         await lock.acquire()
         try:
-            proxy_url = SecretBox().decrypt(row["url_ciphertext"])
-            vault = EncryptedSessionFile(row["account_id"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
+            proxy_url = current_membership_proxy_url()
+            vault = session_vault_for(row["account_id"])
             adapter = PyMaxAdapter.create(phone=row["phone"], work_dir="", session_name="", proxy=proxy_url, session_vault=vault)
             await adapter.connect()
+            current_membership_proxy_url()
             chat = await adapter.get_chat(int(row["chat_id"]))
+            current_membership_proxy_url()
             joined = member_proof(chat, str(row["chat_id"]))
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(503, "membership_check_unavailable") from exc
         finally:
@@ -1066,7 +1203,7 @@ def create_app(
             current = connection.execute(
                 "SELECT s.state,s.expires_at,s.token_hash AS session_token_hash,i.active,"
                 "i.expires_at AS invite_expires_at,i.token_hash AS invite_token_hash,a.group_id,a.status AS account_status,"
-                "g.chat_id,pa.proxy_id AS assigned_proxy_id,p.enabled AS assigned_proxy_enabled "
+                "g.chat_id,pa.proxy_id AS assigned_proxy_id,p.enabled AS assigned_proxy_enabled,p.url_ciphertext "
                 "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id "
                 "JOIN accounts a ON a.id=s.account_id JOIN groups g ON g.id=a.group_id "
                 "LEFT JOIN proxy_assignments pa ON pa.account_id=a.id LEFT JOIN proxies p ON p.id=pa.proxy_id "
@@ -1080,10 +1217,11 @@ def create_app(
                 connection.rollback()
                 raise HTTPException(410, "onboarding_session_unavailable")
             if (int(current["group_id"]) != int(row["group_id"]) or str(current["chat_id"] or "") != str(row["chat_id"])
-                    or current["account_status"] != "pending"):
+                    or current["account_status"] not in {"pending", "needs_membership"}):
                 connection.rollback()
                 raise HTTPException(409, "group_invite_changed_during_verification")
-            if current["assigned_proxy_id"] != row["proxy_id"] or current["assigned_proxy_enabled"] != 1:
+            if (current["assigned_proxy_id"] != row["proxy_id"] or current["assigned_proxy_enabled"] != 1
+                    or current["url_ciphertext"] != row["url_ciphertext"]):
                 connection.rollback()
                 raise HTTPException(409, "account_assignment_changed_during_verification")
             if joined:
@@ -1096,10 +1234,20 @@ def create_app(
     async def add_group(body: GroupBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
         if not _valid_max_invite_link(body.invite_link):
             raise HTTPException(422, "invalid_max_invite_link")
+        now = datetime.now(timezone.utc)
+        token = new_token(32)
+        encrypted_token = SecretBox().encrypt(token)
         with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute("INSERT INTO groups(name,invite_link) VALUES(?,?)", (body.name.strip(), body.invite_link.strip()))
+            connection.execute(
+                "INSERT INTO onboarding_invites(group_id,token_hash,token_ciphertext,created_at,expires_at,max_uses,uses_count,active) "
+                "VALUES(?,?,?,?,?,NULL,0,1)",
+                (cursor.lastrowid, digest_token(token), encrypted_token, now.isoformat(), (now + timedelta(days=7)).isoformat()),
+            )
             result = connection.execute("SELECT id,name,chat_id,active FROM groups WHERE id=?", (cursor.lastrowid,)).fetchone()
             connection.execute("INSERT INTO audit_log(created_at,kind,group_id,detail) VALUES(CURRENT_TIMESTAMP,'group_created',?,'{}')", (cursor.lastrowid,))
+            connection.commit()
         await worker_manager._sync_group_workers()
         return dict(result)
 
@@ -1143,7 +1291,7 @@ def create_app(
             timezone_row = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
             week_start = monday_of(datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date()).isoformat()
             rows = connection.execute(
-                "SELECT a.id,a.full_name,a.phone,a.status,a.send_weekday,pa.proxy_id,p.label AS proxy_label,p.enabled AS proxy_enabled,"
+                "SELECT a.id,a.full_name,a.status,a.send_weekday,pa.proxy_id,p.label AS proxy_label,p.enabled AS proxy_enabled,"
                 "s.scheduled_date,s.status AS slot_status,s.error_code,"
                 "(SELECT os.state FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_state,"
                 "(SELECT os.error_code FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_error "
@@ -1157,7 +1305,7 @@ def create_app(
 
     @app.post("/api/groups/{group_id}/verify-destination")
     async def verify_destination(group_id: int, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
-        used_proxy_ids: dict[int, int] = {}
+        used_proxies: dict[int, tuple[int, str]] = {}
         with db() as connection:
             group = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
             accounts = connection.execute(
@@ -1180,17 +1328,37 @@ def create_app(
             lock = account_session_locks.for_account(account["id"])
             await lock.acquire()
             try:
+                def require_current_assignment() -> None:
+                    with db() as connection:
+                        current = connection.execute(
+                            "SELECT a.status,pa.proxy_id,p.enabled,p.url_ciphertext FROM accounts a "
+                            "JOIN proxy_assignments pa ON pa.account_id=a.id JOIN proxies p ON p.id=pa.proxy_id "
+                            "WHERE a.id=? AND a.group_id=?",
+                            (account["id"], group_id),
+                        ).fetchone()
+                        current_group = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
+                    if current_group is None or current_group["invite_link"] != group["invite_link"]:
+                        raise HTTPException(409, "group_invite_changed_during_verification")
+                    if (current is None or current["status"] not in {"active", "needs_membership"}
+                            or not current["enabled"] or int(current["proxy_id"]) != int(account["proxy_id"])
+                            or current["url_ciphertext"] != account["url_ciphertext"]):
+                        raise HTTPException(409, "account_assignment_changed_during_verification")
+
+                require_current_assignment()
                 proxy = SecretBox().decrypt(account["url_ciphertext"])
-                vault = EncryptedSessionFile(account["id"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
+                vault = session_vault_for(account["id"])
                 adapter = PyMaxAdapter.create(phone=account["phone"], work_dir="", session_name="", proxy=proxy, session_vault=vault)
                 await adapter.connect()
+                require_current_assignment()
                 if index == 0:
                     resolved = await adapter.resolve_group_by_link(group["invite_link"])
+                    require_current_assignment()
                     chat_id = str(getattr(resolved, "id", "") or getattr(resolved, "chat_id", ""))
                     if not chat_id:
                         raise RuntimeError("group_resolution_failed")
                     stage = "check_membership"
                 states[int(account["id"])] = member_proof(await adapter.get_chat(int(chat_id)), chat_id)
+                require_current_assignment()
             except Exception as exc:
                 failure_code = "group_resolution_failed" if stage == "resolve_group" else "membership_check_unavailable"
                 failure = exc
@@ -1205,8 +1373,10 @@ def create_app(
             if close_failed:
                 raise HTTPException(503, "session_save_failed")
             if failure_code:
+                if isinstance(failure, HTTPException):
+                    raise failure
                 raise HTTPException(503, failure_code) from failure
-            used_proxy_ids[int(account["id"])] = int(account["proxy_id"])
+            used_proxies[int(account["id"])] = (int(account["proxy_id"]), account["url_ciphertext"])
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
@@ -1215,12 +1385,13 @@ def create_app(
                 raise HTTPException(409, "group_invite_changed_during_verification")
             for account_id in states:
                 assignment = connection.execute(
-                    "SELECT a.status,pa.proxy_id,p.enabled FROM accounts a JOIN proxy_assignments pa ON pa.account_id=a.id "
+                    "SELECT a.status,pa.proxy_id,p.enabled,p.url_ciphertext FROM accounts a JOIN proxy_assignments pa ON pa.account_id=a.id "
                     "JOIN proxies p ON p.id=pa.proxy_id WHERE a.id=? AND a.group_id=?",
                     (account_id, group_id),
                 ).fetchone()
                 if (assignment is None or assignment["status"] not in {"active", "needs_membership"}
-                        or not assignment["enabled"] or int(assignment["proxy_id"]) != used_proxy_ids[account_id]):
+                        or not assignment["enabled"] or int(assignment["proxy_id"]) != used_proxies[account_id][0]
+                        or assignment["url_ciphertext"] != used_proxies[account_id][1]):
                     connection.rollback()
                     raise HTTPException(409, "account_assignment_changed_during_verification")
             connection.execute("UPDATE groups SET chat_id=? WHERE id=?", (chat_id, group_id))

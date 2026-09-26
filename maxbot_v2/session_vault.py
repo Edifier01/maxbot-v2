@@ -9,13 +9,15 @@ from .crypto import SecretBox
 
 class EncryptedSessionFile:
     """Encrypted durable snapshot with a transient working copy on tmpfs."""
-    def __init__(self, account_id: int, *, durable_dir: str | Path, runtime_dir: str | Path, box: SecretBox | None = None):
+    def __init__(self, account_id: int, *, generation: int = 0, durable_dir: str | Path, runtime_dir: str | Path, box: SecretBox | None = None):
         self.account_id = int(account_id)
+        self.generation = max(0, int(generation))
         self.durable_dir = Path(durable_dir)
         self.runtime_dir = Path(runtime_dir)
         self.box = box or SecretBox()
-        self.encrypted_path = self.durable_dir / f"account-{self.account_id}.session.enc"
-        self.work_dir = self.runtime_dir / f"account-{self.account_id}"
+        suffix = f"-generation-{self.generation}" if self.generation else ""
+        self.encrypted_path = self.durable_dir / f"account-{self.account_id}{suffix}.session.enc"
+        self.work_dir = self.runtime_dir / f"account-{self.account_id}{suffix}"
         self.work_path = self.work_dir / "session.sqlite3"
 
     def open(self) -> tuple[str, str]:
@@ -57,3 +59,12 @@ class EncryptedSessionFile:
             self.work_dir.rmdir()
         except OSError:
             pass
+
+    def discard_working_copy(self) -> None:
+        """Remove plaintext after a failed client construction without replacing the durable snapshot."""
+        if not self.work_dir.exists():
+            return
+        for path in self.work_dir.iterdir():
+            if path.is_file():
+                path.unlink()
+        self.work_dir.rmdir()

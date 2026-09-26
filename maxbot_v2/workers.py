@@ -150,7 +150,8 @@ class GroupWorkerManager:
                         self.provider_factory,
                         slot,
                         lambda connected=None: DispatchPaused("app_stopping") if self._stopping.is_set() else _dispatch_block(
-                            db, slot, expected_proxy_id=getattr(connected, "proxy_id", None)
+                            db, slot, expected_proxy_id=getattr(connected, "proxy_id", None),
+                            expected_proxy_ciphertext=getattr(connected, "proxy_ciphertext", None),
                         ),
                     )
                     await Sender(db, provider, sleep=self.sleep).send_slot(slot["slot_id"], chat_id=int(slot["chat_id"]))
@@ -180,13 +181,14 @@ def _dispatch_block(
     slot: sqlite3.Row,
     *,
     expected_proxy_id: int | None = None,
+    expected_proxy_ciphertext: str | None = None,
 ) -> DispatchPaused | None:
     settings = dict(db.execute("SELECT key,value FROM settings WHERE key IN ('global_stop','timezone','send_windows_weekday','send_windows_weekend')").fetchall())
     if settings.get("global_stop") == "1":
         return DispatchPaused("run_stopped")
     group = db.execute("SELECT active,chat_id FROM groups WHERE id=?", (slot["group_id"],)).fetchone()
     account = db.execute(
-        "SELECT a.status,pa.proxy_id,p.enabled FROM accounts a LEFT JOIN proxy_assignments pa ON pa.account_id=a.id "
+        "SELECT a.status,pa.proxy_id,p.enabled,p.url_ciphertext FROM accounts a LEFT JOIN proxy_assignments pa ON pa.account_id=a.id "
         "LEFT JOIN proxies p ON p.id=pa.proxy_id WHERE a.id=?",
         (slot["account_id"],),
     ).fetchone()
@@ -198,6 +200,8 @@ def _dispatch_block(
     if account["enabled"] != 1:
         return DispatchPaused("proxy_assignment_unavailable", blocked=True)
     if expected_proxy_id is not None and int(account["proxy_id"] or 0) != int(expected_proxy_id):
+        return DispatchPaused("proxy_assignment_changed")
+    if expected_proxy_ciphertext is not None and account["url_ciphertext"] != expected_proxy_ciphertext:
         return DispatchPaused("proxy_assignment_changed")
     if current_slot is None or current_slot["status"] != "in_flight":
         return DispatchPaused("slot_no_longer_queued")

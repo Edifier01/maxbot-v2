@@ -203,5 +203,8 @@ def test_manual_run_check_does_not_depend_on_autostart_setting():
     changed = _dispatch_block(db, slot, expected_proxy_id=999)
     assert changed.code == "proxy_assignment_changed"
     assert changed.blocked is False
+    db.execute("UPDATE proxies SET url_ciphertext='rotated' WHERE id=1")
+    rotated = _dispatch_block(db, slot, expected_proxy_id=1, expected_proxy_ciphertext="ciphertext")
+    assert rotated.code == "proxy_assignment_changed"
     db.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
     assert _dispatch_block(db, slot).code == "run_stopped"
