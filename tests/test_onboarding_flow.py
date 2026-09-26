@@ -3,7 +3,9 @@ import logging
 import sys
 from types import ModuleType, SimpleNamespace
 
-from maxbot_v2.onboarding import WebCodeAuthFlow
+import pytest
+
+from maxbot_v2.onboarding import WebCodeAuthFlow, join_group_and_confirm_membership
 
 
 def test_auth_requests_code_directly_then_uses_proxy_auth_api_and_safe_logs(monkeypatch, caplog):
@@ -289,6 +291,64 @@ def test_proxy_is_revalidated_before_password_submission():
         "proxy_send_code",
         "validate_proxy",
     ]
+
+
+def test_join_group_confirms_membership_and_returns_safe_fallback_reason():
+    class Adapter:
+        def __init__(self, *, joined=None, chat=None, join_error=None):
+            self.joined = joined
+            self.chat = chat
+            self.join_error = join_error
+
+        async def join_group(self, _link):
+            if self.join_error:
+                raise self.join_error
+            return self.joined
+
+        async def get_chat(self, _chat_id):
+            return self.chat
+
+    confirmed, reason = asyncio.run(join_group_and_confirm_membership(
+        Adapter(joined=SimpleNamespace(id=123), chat=SimpleNamespace(id=123, status="member", join_time=10)),
+        "https://max.ru/join/test",
+        "123",
+    ))
+    assert (confirmed, reason) == (True, None)
+
+    confirmed, reason = asyncio.run(join_group_and_confirm_membership(
+        Adapter(join_error=RuntimeError("private remote error"), chat=SimpleNamespace(id=123, status="left", join_time=0)),
+        "https://max.ru/join/test",
+        "123",
+    ))
+    assert (confirmed, reason) == (False, "auto_join_failed")
+
+
+def test_join_group_revalidates_proxy_before_membership_lookup():
+    calls = []
+
+    def validate_proxy():
+        calls.append("validate")
+        if calls.count("validate") == 2:
+            raise RuntimeError("proxy_check_failed")
+
+    class Adapter:
+        async def join_group(self, _link):
+            calls.append("join")
+            return SimpleNamespace(id=123)
+
+        async def get_chat(self, _chat_id):
+            calls.append("get_chat")
+            return SimpleNamespace(id=123, status="member", join_time=10)
+
+    with pytest.raises(RuntimeError, match="proxy_check_failed"):
+        asyncio.run(join_group_and_confirm_membership(
+            Adapter(),
+            "https://max.ru/join/test",
+            "123",
+            before_action=validate_proxy,
+        ))
+
+    assert calls == ["validate", "join", "validate"]
 
 
 def test_proxy_is_revalidated_after_successful_code_verification():
