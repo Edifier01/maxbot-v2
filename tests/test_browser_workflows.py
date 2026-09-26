@@ -312,6 +312,8 @@ def test_admin_gets_actionable_removal_error_without_phone_in_account_ui(page: P
         f"**/api/groups/{group_id}/verify-destination",
         lambda route: route.fulfill(status=409, content_type="application/json", body=json.dumps({"detail": "proxy_disabled"})),
     )
+    page.reload()
+    page.get_by_role("button", name="Группы, номера и прокси").click()
     page.get_by_role("button", name="Проверить назначение").click()
     expect(page.locator("#notice")).to_have_text("Назначенный прокси отключён. Назначьте другой доступный прокси.")
 
