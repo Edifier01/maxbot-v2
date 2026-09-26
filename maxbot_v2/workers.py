@@ -186,7 +186,7 @@ def _dispatch_block(
         return DispatchPaused("run_stopped")
     group = db.execute("SELECT active,chat_id FROM groups WHERE id=?", (slot["group_id"],)).fetchone()
     account = db.execute(
-        "SELECT a.status,pa.proxy_id,p.enabled,p.check_status FROM accounts a LEFT JOIN proxy_assignments pa ON pa.account_id=a.id "
+        "SELECT a.status,pa.proxy_id,p.enabled FROM accounts a LEFT JOIN proxy_assignments pa ON pa.account_id=a.id "
         "LEFT JOIN proxies p ON p.id=pa.proxy_id WHERE a.id=?",
         (slot["account_id"],),
     ).fetchone()
@@ -197,8 +197,6 @@ def _dispatch_block(
         return DispatchPaused("account_not_active", blocked=True)
     if account["enabled"] != 1:
         return DispatchPaused("proxy_assignment_unavailable", blocked=True)
-    if account["check_status"] == "failed":
-        return DispatchPaused("proxy_check_failed", blocked=True)
     if expected_proxy_id is not None and int(account["proxy_id"] or 0) != int(expected_proxy_id):
         return DispatchPaused("proxy_assignment_changed")
     if current_slot is None or current_slot["status"] != "in_flight":

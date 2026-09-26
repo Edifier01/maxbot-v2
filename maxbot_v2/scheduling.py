@@ -33,20 +33,20 @@ def assign_weekday(connection: sqlite3.Connection, account_id: int) -> int:
 
 def assign_proxy(connection: sqlite3.Connection, account_id: int, group_id: int) -> int:
     current = connection.execute(
-        "SELECT a.proxy_id, p.group_id, p.enabled, p.check_status FROM proxy_assignments a "
+        "SELECT a.proxy_id, p.group_id, p.enabled FROM proxy_assignments a "
         "JOIN proxies p ON p.id=a.proxy_id WHERE a.account_id=?",
         (int(account_id),),
     ).fetchone()
     if current is not None:
         if int(current["group_id"]) != int(group_id):
             raise ValueError("proxy_assignment_group_mismatch")
-        if int(current["enabled"]) and current["check_status"] != "failed":
+        if int(current["enabled"]):
             return int(current["proxy_id"])
         raise ValueError("proxy_reassignment_required")
     candidates = connection.execute(
         "SELECT p.id, COUNT(a.account_id) AS load FROM proxies p "
         "LEFT JOIN proxy_assignments a ON a.proxy_id=p.id "
-        "WHERE p.group_id=? AND p.enabled=1 AND p.check_status='healthy' GROUP BY p.id ORDER BY load, p.position, p.id",
+        "WHERE p.group_id=? AND p.enabled=1 GROUP BY p.id ORDER BY load, p.position, p.id",
         (int(group_id),),
     ).fetchall()
     if not candidates:

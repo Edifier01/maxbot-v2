@@ -87,24 +87,6 @@ def test_process_interruption_marks_in_flight_unknown():
     assert db.execute("SELECT status FROM weekly_slots").fetchone()[0] == "unknown"
 
 
-def test_dispatch_stops_before_send_when_assigned_proxy_check_failed():
-    db = seeded_db()
-    db.execute("INSERT INTO proxies(id,group_id,url_ciphertext,label,position,check_status) VALUES(1,1,'cipher','proxy',0,'healthy')")
-    db.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(1,1)")
-    db.execute("UPDATE accounts SET send_weekday=0 WHERE id=1")
-    prepare_week(db, date(2026, 9, 21))
-    slot = db.execute("SELECT s.*,g.chat_id FROM weekly_slots s JOIN groups g ON g.id=s.group_id").fetchone()
-    db.execute("UPDATE weekly_slots SET status='in_flight',scheduled_date=?", (date.today().isoformat(),))
-    db.execute("UPDATE settings SET value='00:00-23:59' WHERE key IN ('send_windows_weekday','send_windows_weekend')")
-    db.execute("UPDATE proxies SET check_status='failed',check_error='proxy_tunnel_rejected' WHERE id=1")
-
-    blocked = _dispatch_block(db, slot, expected_proxy_id=1)
-
-    assert blocked is not None
-    assert blocked.code == "proxy_check_failed"
-    assert blocked.blocked
-
-
 def test_concurrent_group_workers_cannot_send_same_queued_slot_twice():
     db = seeded_db()
     db.execute("UPDATE accounts SET send_weekday=0 WHERE id=1")

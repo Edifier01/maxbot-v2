@@ -9,15 +9,13 @@ from .crypto import SecretBox
 
 class EncryptedSessionFile:
     """Encrypted durable snapshot with a transient working copy on tmpfs."""
-    def __init__(self, account_id: int, *, generation: int = 0, durable_dir: str | Path, runtime_dir: str | Path, box: SecretBox | None = None):
+    def __init__(self, account_id: int, *, durable_dir: str | Path, runtime_dir: str | Path, box: SecretBox | None = None):
         self.account_id = int(account_id)
-        self.generation = max(0, int(generation))
         self.durable_dir = Path(durable_dir)
         self.runtime_dir = Path(runtime_dir)
         self.box = box or SecretBox()
-        suffix = f"-generation-{self.generation}" if self.generation else ""
-        self.encrypted_path = self.durable_dir / f"account-{self.account_id}{suffix}.session.enc"
-        self.work_dir = self.runtime_dir / f"account-{self.account_id}{suffix}"
+        self.encrypted_path = self.durable_dir / f"account-{self.account_id}.session.enc"
+        self.work_dir = self.runtime_dir / f"account-{self.account_id}"
         self.work_path = self.work_dir / "session.sqlite3"
 
     def open(self) -> tuple[str, str]:
