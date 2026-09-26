@@ -812,12 +812,32 @@ def create_app(
                 connection.commit()
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "phone_already_exists") from exc
+
+        def validate_onboarding_proxy() -> None:
+            with db() as connection:
+                current_proxy = connection.execute(
+                    "SELECT pa.proxy_id,p.enabled,p.group_id,p.url_ciphertext "
+                    "FROM proxy_assignments pa JOIN proxies p ON p.id=pa.proxy_id "
+                    "WHERE pa.account_id=?",
+                    (account_id,),
+                ).fetchone()
+            if (current_proxy is None or int(current_proxy["proxy_id"]) != int(proxy_id)
+                    or int(current_proxy["enabled"]) != 1 or int(current_proxy["group_id"]) != int(row["group_id"])):
+                raise RuntimeError("proxy_assignment_changed")
+            try:
+                current_url = SecretBox().decrypt(current_proxy["url_ciphertext"])
+            except ValueError as exc:
+                raise RuntimeError("proxy_assignment_changed") from exc
+            if current_url != proxy_url:
+                raise RuntimeError("proxy_assignment_changed")
+
         flow = WebCodeAuthFlow(
             lambda state, hint: (set_onboarding_state(session_id, state, hint), setattr(flow, "hint", hint)),
             request_code=lambda requested_phone: PyMaxAdapter.request_code_direct(
                 phone=requested_phone,
                 assigned_proxy=proxy_url,
             ),
+            validate_proxy=validate_onboarding_proxy,
             account_id=account_id,
             proxy_id=proxy_id,
             session_id=session_id,

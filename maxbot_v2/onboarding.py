@@ -16,9 +16,10 @@ logger = logging.getLogger(__name__)
 
 class WebCodeAuthFlow:
     """PyMax AuthFlow bridge to short-lived web OTP / 2FA queues."""
-    def __init__(self, update: Callable[[str, str], None], *, request_code: Callable[[str], Awaitable[Any]], account_id: int | None = None, proxy_id: int | None = None, session_id: str | None = None):
+    def __init__(self, update: Callable[[str, str], None], *, request_code: Callable[[str], Awaitable[Any]], validate_proxy: Callable[[], None], account_id: int | None = None, proxy_id: int | None = None, session_id: str | None = None):
         self.update = update
         self.request_code = request_code
+        self.validate_proxy = validate_proxy
         self.account_id = account_id
         self.proxy_id = proxy_id
         self.session_id = session_id
@@ -44,6 +45,7 @@ class WebCodeAuthFlow:
         stage = "request_code"
         started = perf_counter()
         try:
+            self.validate_proxy()
             start = await self.request_code(str(app.config.phone))
         except Exception as exc:
             self._stage(stage, started, exc)
@@ -71,6 +73,7 @@ class WebCodeAuthFlow:
         self.current_stage = stage
         started = perf_counter()
         try:
+            self.validate_proxy()
             result = await app.api.auth.send_code(start.token, code)
         except Exception as exc:
             self._stage(stage, started, exc)
@@ -94,6 +97,7 @@ class WebCodeAuthFlow:
                 self.current_stage = stage
                 started = perf_counter()
                 try:
+                    self.validate_proxy()
                     answer = await app.api.auth.check_password(track_id, password)
                 except Exception as exc:
                     self._stage(stage, started, exc)
@@ -109,6 +113,7 @@ class WebCodeAuthFlow:
             raise RuntimeError("account_registration_required")
         if not login_token:
             raise RuntimeError("auth_token_missing")
+        self.validate_proxy()
         return AuthResult(token=login_token)
 
 

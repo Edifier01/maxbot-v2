@@ -32,6 +32,7 @@ def test_auth_requests_code_directly_then_uses_proxy_auth_api_and_safe_logs(monk
     flow = WebCodeAuthFlow(
         lambda state, hint: updates.append((state, hint)),
         request_code=direct_request_code,
+        validate_proxy=lambda: None,
         account_id=42,
         proxy_id=9,
         session_id="attempt-1",
@@ -64,6 +65,7 @@ def test_request_code_failure_logs_only_error_class(caplog):
     flow = WebCodeAuthFlow(
         lambda _state, _hint: None,
         request_code=direct_request_code,
+        validate_proxy=lambda: None,
         account_id=42,
         proxy_id=9,
     )
@@ -104,6 +106,7 @@ def test_rejected_code_records_its_pymax_stage_without_logging_remote_text(monke
     flow = WebCodeAuthFlow(
         lambda _state, _hint: None,
         request_code=direct_request_code,
+        validate_proxy=lambda: None,
         session_id="attempt-2",
     )
     flow.codes.put_nowait("123456")
@@ -153,15 +156,177 @@ def test_password_challenge_uses_proxy_after_direct_code_request(monkeypatch):
             return SimpleNamespace(error=None, login_token="login-token")
 
     app = SimpleNamespace(api=SimpleNamespace(auth=ProxyAuthApi()), config=SimpleNamespace(phone="+79990000000"))
-    flow = WebCodeAuthFlow(lambda _state, _hint: None, request_code=direct_request_code)
+    flow = WebCodeAuthFlow(
+        lambda _state, _hint: None,
+        request_code=direct_request_code,
+        validate_proxy=lambda: calls.append(("validate_proxy",)),
+    )
     flow.codes.put_nowait("123456")
     flow.passwords.put_nowait("secret-password")
 
     result = asyncio.run(flow.authenticate(app))
 
     assert calls == [
+        ("validate_proxy",),
         ("direct_request_code", "+79990000000"),
+        ("validate_proxy",),
         ("proxy_send_code", "challenge-token", "123456"),
+        ("validate_proxy",),
         ("proxy_check_password", "track-1", "secret-password"),
+        ("validate_proxy",),
     ]
     assert result.token == "login-token"
+
+
+def test_stale_proxy_assignment_blocks_direct_code_request():
+    calls = []
+
+    def validate_proxy():
+        calls.append("validate_proxy")
+        raise RuntimeError("proxy_assignment_changed")
+
+    async def direct_request_code(_phone):
+        calls.append("direct_request_code")
+        return SimpleNamespace(token="challenge-token", code_length=6)
+
+    app = SimpleNamespace(api=SimpleNamespace(auth=SimpleNamespace()), config=SimpleNamespace(phone="+79990000000"))
+    flow = WebCodeAuthFlow(
+        lambda _state, _hint: None,
+        request_code=direct_request_code,
+        validate_proxy=validate_proxy,
+    )
+
+    try:
+        asyncio.run(flow.authenticate(app))
+    except RuntimeError as exc:
+        assert str(exc) == "proxy_assignment_changed"
+    else:
+        raise AssertionError("expected stale proxy assignment to stop authentication")
+
+    assert calls == ["validate_proxy"]
+
+
+def test_proxy_is_revalidated_before_code_submission():
+    calls = []
+
+    def validate_proxy():
+        calls.append("validate_proxy")
+        if calls.count("validate_proxy") == 2:
+            raise RuntimeError("proxy_assignment_changed")
+
+    async def direct_request_code(_phone):
+        calls.append("direct_request_code")
+        return SimpleNamespace(token="challenge-token", code_length=6)
+
+    class ProxyAuthApi:
+        async def send_code(self, *_args):
+            calls.append("proxy_send_code")
+            return SimpleNamespace(login_token="login-token", password_challenge=None, register_token=None)
+
+    app = SimpleNamespace(api=SimpleNamespace(auth=ProxyAuthApi()), config=SimpleNamespace(phone="+79990000000"))
+    flow = WebCodeAuthFlow(
+        lambda _state, _hint: None,
+        request_code=direct_request_code,
+        validate_proxy=validate_proxy,
+    )
+    flow.codes.put_nowait("123456")
+
+    try:
+        asyncio.run(flow.authenticate(app))
+    except RuntimeError as exc:
+        assert str(exc) == "proxy_assignment_changed"
+    else:
+        raise AssertionError("expected stale proxy assignment to stop code submission")
+
+    assert calls == ["validate_proxy", "direct_request_code", "validate_proxy"]
+
+
+def test_proxy_is_revalidated_before_password_submission():
+    calls = []
+
+    def validate_proxy():
+        calls.append("validate_proxy")
+        if calls.count("validate_proxy") == 3:
+            raise RuntimeError("proxy_assignment_changed")
+
+    async def direct_request_code(_phone):
+        calls.append("direct_request_code")
+        return SimpleNamespace(token="challenge-token", code_length=6)
+
+    class ProxyAuthApi:
+        async def send_code(self, *_args):
+            calls.append("proxy_send_code")
+            return SimpleNamespace(
+                login_token=None,
+                password_challenge=SimpleNamespace(track_id="track-1", hint=None),
+                register_token=None,
+            )
+
+        async def check_password(self, *_args):
+            calls.append("proxy_check_password")
+            return SimpleNamespace(error=None, login_token="login-token")
+
+    app = SimpleNamespace(api=SimpleNamespace(auth=ProxyAuthApi()), config=SimpleNamespace(phone="+79990000000"))
+    flow = WebCodeAuthFlow(
+        lambda _state, _hint: None,
+        request_code=direct_request_code,
+        validate_proxy=validate_proxy,
+    )
+    flow.codes.put_nowait("123456")
+    flow.passwords.put_nowait("secret-password")
+
+    try:
+        asyncio.run(flow.authenticate(app))
+    except RuntimeError as exc:
+        assert str(exc) == "proxy_assignment_changed"
+    else:
+        raise AssertionError("expected stale proxy assignment to stop password submission")
+
+    assert calls == [
+        "validate_proxy",
+        "direct_request_code",
+        "validate_proxy",
+        "proxy_send_code",
+        "validate_proxy",
+    ]
+
+
+def test_proxy_is_revalidated_after_successful_code_verification():
+    calls = []
+
+    def validate_proxy():
+        calls.append("validate_proxy")
+        if calls.count("validate_proxy") == 3:
+            raise RuntimeError("proxy_assignment_changed")
+
+    async def direct_request_code(_phone):
+        calls.append("direct_request_code")
+        return SimpleNamespace(token="challenge-token", code_length=6)
+
+    class ProxyAuthApi:
+        async def send_code(self, *_args):
+            calls.append("proxy_send_code")
+            return SimpleNamespace(login_token="login-token", password_challenge=None, register_token=None)
+
+    app = SimpleNamespace(api=SimpleNamespace(auth=ProxyAuthApi()), config=SimpleNamespace(phone="+79990000000"))
+    flow = WebCodeAuthFlow(
+        lambda _state, _hint: None,
+        request_code=direct_request_code,
+        validate_proxy=validate_proxy,
+    )
+    flow.codes.put_nowait("123456")
+
+    try:
+        asyncio.run(flow.authenticate(app))
+    except RuntimeError as exc:
+        assert str(exc) == "proxy_assignment_changed"
+    else:
+        raise AssertionError("expected changed proxy assignment to stop session establishment")
+
+    assert calls == [
+        "validate_proxy",
+        "direct_request_code",
+        "validate_proxy",
+        "proxy_send_code",
+        "validate_proxy",
+    ]
