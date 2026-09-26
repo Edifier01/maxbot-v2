@@ -177,6 +177,9 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(accounts)")}
+    if "session_generation" not in columns:
+        connection.execute("ALTER TABLE accounts ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 0")
     connection.executemany(
         "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", DEFAULTS.items()
     )

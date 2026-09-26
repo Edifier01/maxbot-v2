@@ -21,6 +21,10 @@ from maxbot_v2.db import connect
 @pytest.fixture
 def fake_pymax(monkeypatch):
     direct_requests = []
+    joined_requests = []
+    memberships = set()
+    join_should_fail = set()
+    resolve_should_fail = set()
 
     class FakeAuth:
         async def send_code(self, token, code):
@@ -53,10 +57,20 @@ def fake_pymax(monkeypatch):
                     connection.close()
 
         async def resolve_group_by_link(self, _link):
+            if self.phone in resolve_should_fail:
+                raise RuntimeError("invalid invite")
+            return SimpleNamespace(id=7001)
+
+        async def join_group(self, link):
+            joined_requests.append((self.phone, link))
+            if self.phone in join_should_fail:
+                raise TimeoutError("uncertain join result")
+            memberships.add(self.phone)
             return SimpleNamespace(id=7001)
 
         async def get_chat(self, _chat_id):
-            return SimpleNamespace(id=7001, status="member", join_time=1)
+            joined = self.phone in memberships
+            return SimpleNamespace(id=7001, status="member" if joined else "none", join_time=1 if joined else 0)
 
         async def close(self):
             self.session_vault.seal()
@@ -73,7 +87,7 @@ def fake_pymax(monkeypatch):
         "maxbot_v2.app.PyMaxAdapter.request_code_direct",
         classmethod(fake_direct_code_request),
     )
-    return direct_requests
+    return SimpleNamespace(direct_requests=direct_requests, joined_requests=joined_requests, memberships=memberships, join_should_fail=join_should_fail, resolve_should_fail=resolve_should_fail)
 
 
 @pytest.fixture
@@ -116,7 +130,7 @@ def local_app(tmp_path, monkeypatch, fake_pymax):
         raise RuntimeError("test application did not start")
 
     try:
-        yield SimpleNamespace(app=app, url=f"http://127.0.0.1:{port}", password=password, direct_requests=fake_pymax)
+        yield SimpleNamespace(app=app, url=f"http://127.0.0.1:{port}", password=password, direct_requests=fake_pymax.direct_requests, joined_requests=fake_pymax.joined_requests, memberships=fake_pymax.memberships, join_should_fail=fake_pymax.join_should_fail, resolve_should_fail=fake_pymax.resolve_should_fail)
     finally:
         server.should_exit = True
         thread.join(timeout=5)
@@ -185,7 +199,6 @@ def test_guest_connect_survives_reload_and_verifies_membership(page: Page, brows
     expect(page.get_by_role("button", name="Проверить назначение")).to_be_disabled()
     page.locator(".bulk-proxy-form textarea").fill("socks5://127.0.0.1:1080")
     page.get_by_role("button", name="Добавить прокси из списка").click()
-    page.get_by_role("button", name="Создать новую ссылку").click()
     invite = page.locator(".invite-link a")
     expect(invite).to_be_visible()
 
@@ -208,11 +221,11 @@ def test_guest_connect_survives_reload_and_verifies_membership(page: Page, brows
     assert page_has_no_overflow(guest)
     stored = guest.evaluate("Object.values(sessionStorage).join(' ')")
     assert "123456" not in stored
-    guest.get_by_role("button", name="Проверить вступление").click()
     expect(guest.locator("#flow")).to_contain_text("Номер подключён", timeout=5000)
     assert local_app.direct_requests == [
         ("+79990000000", "socks5://127.0.0.1:1080")
     ]
+    assert local_app.joined_requests == [("+79990000000", "https://max.ru/join/browser-test")]
 
     connection = connect(local_app.app.state.database)
     try:
@@ -232,7 +245,6 @@ def test_guest_can_cancel_an_authorization_attempt(page: Page, browser, local_ap
     page.get_by_role("button", name="Добавить", exact=True).click()
     page.locator(".bulk-proxy-form textarea").fill("socks5://127.0.0.1:1080")
     page.get_by_role("button", name="Добавить прокси из списка").click()
-    page.get_by_role("button", name="Создать новую ссылку").click()
 
     guest = browser.new_page()
     guest.goto(page.locator(".invite-link a").get_attribute("href"))
@@ -247,6 +259,91 @@ def test_guest_can_cancel_an_authorization_attempt(page: Page, browser, local_ap
     try:
         assert connection.execute("SELECT state FROM onboarding_sessions").fetchone()[0] == "cancelled"
         assert guest.evaluate("sessionStorage.length") == 0
+    finally:
+        connection.close()
+
+
+def test_expired_attempt_releases_account_lock_for_new_start(page: Page, browser, local_app):
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и прокси").click()
+    page.get_by_label("Название", exact=True).fill("Тестовая группа")
+    page.get_by_label("Ссылка MAX").fill("https://max.ru/join/expiry-test")
+    page.get_by_role("button", name="Добавить", exact=True).click()
+    page.locator(".bulk-proxy-form textarea").fill("socks5://127.0.0.1:1080")
+    page.get_by_role("button", name="Добавить прокси из списка").click()
+    guest = browser.new_page()
+    guest.goto(page.locator(".invite-link a").get_attribute("href"))
+    guest.get_by_label("ФИО").fill("Тестовый пользователь")
+    guest.get_by_label("Телефон").fill("89990000000")
+    guest.get_by_role("button", name="Начать подключение").click()
+    expect(guest.get_by_role("heading", name="Введите код MAX")).to_be_visible()
+    guest.close()
+    connection = connect(local_app.app.state.database)
+    connection.execute("UPDATE onboarding_sessions SET expires_at='2000-01-01T00:00:00+00:00' WHERE state='waiting_code'")
+    connection.close()
+    second = browser.new_page()
+    second.goto(page.locator(".invite-link a").get_attribute("href"))
+    second.get_by_label("ФИО").fill("Тестовый пользователь")
+    second.get_by_label("Телефон").fill("+79990000000")
+    second.get_by_role("button", name="Начать подключение").click()
+    expect(second.get_by_role("heading", name="Введите код MAX")).to_be_visible(timeout=5000)
+    assert len(local_app.direct_requests) == 2
+
+
+def test_failed_auto_join_keeps_session_for_manual_membership_check(page: Page, browser, local_app):
+    phone = "+79990000000"
+    local_app.join_should_fail.add(phone)
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и прокси").click()
+    page.get_by_label("Название", exact=True).fill("Тестовая группа")
+    page.get_by_label("Ссылка MAX").fill("https://max.ru/join/manual-test")
+    page.get_by_role("button", name="Добавить", exact=True).click()
+    page.locator(".bulk-proxy-form textarea").fill("socks5://127.0.0.1:1080")
+    page.get_by_role("button", name="Добавить прокси из списка").click()
+    guest = browser.new_page(viewport={"width": 390, "height": 844})
+    guest.goto(page.locator(".invite-link a").get_attribute("href"))
+    guest.get_by_label("ФИО").fill("Тестовый пользователь")
+    guest.get_by_label("Телефон").fill("89990000000")
+    guest.get_by_role("button", name="Начать подключение").click()
+    expect(guest.get_by_role("heading", name="Введите код MAX")).to_be_visible()
+    guest.get_by_label("Код").fill("123456")
+    guest.get_by_role("button", name="Проверить код").click()
+    expect(guest.get_by_role("button", name="Проверить вступление")).to_be_visible()
+    expect(guest.get_by_role("button", name="Отменить подключение")).to_have_count(0)
+    connection = connect(local_app.app.state.database)
+    try:
+        assert connection.execute("SELECT status FROM accounts WHERE phone=?", (phone,)).fetchone()[0] == "needs_membership"
+    finally:
+        connection.close()
+    local_app.memberships.add(phone)
+    guest.get_by_role("button", name="Проверить вступление").click()
+    expect(guest.locator("#flow")).to_contain_text("Номер подключён")
+
+
+def test_invalid_group_link_preserves_login_for_owner_repair(page: Page, browser, local_app):
+    phone = "+79990000000"
+    local_app.resolve_should_fail.add(phone)
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и прокси").click()
+    page.get_by_label("Название", exact=True).fill("Тестовая группа")
+    page.get_by_label("Ссылка MAX").fill("https://max.ru/join/invalid-test")
+    page.get_by_role("button", name="Добавить", exact=True).click()
+    page.locator(".bulk-proxy-form textarea").fill("socks5://127.0.0.1:1080")
+    page.get_by_role("button", name="Добавить прокси из списка").click()
+    guest = browser.new_page()
+    guest.goto(page.locator(".invite-link a").get_attribute("href"))
+    guest.get_by_label("ФИО").fill("Тестовый пользователь")
+    guest.get_by_label("Телефон").fill("89990000000")
+    guest.get_by_role("button", name="Начать подключение").click()
+    expect(guest.get_by_role("heading", name="Введите код MAX")).to_be_visible()
+    guest.get_by_label("Код").fill("123456")
+    guest.get_by_role("button", name="Проверить код").click()
+    expect(guest.get_by_role("button", name="Проверить вступление")).to_be_visible()
+    connection = connect(local_app.app.state.database)
+    try:
+        account = connection.execute("SELECT id,status FROM accounts WHERE phone=?", (phone,)).fetchone()
+        assert account["status"] == "needs_membership"
+        assert (local_app.app.state.data_dir / "sessions" / f"account-{account['id']}.session.enc").exists()
     finally:
         connection.close()
 

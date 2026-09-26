@@ -35,7 +35,12 @@ const errors = {
   code_entry_timeout: 'Время ожидания кода истекло. Запустите подключение ещё раз.',
   password_entry_timeout: 'Время ожидания пароля истекло. Запустите подключение ещё раз.',
   session_save_failed: 'MAX не удалось сохранить сессию. Попросите владельца проверить подключение.',
-  group_resolution_failed: 'Не удалось проверить ссылку MAX. Проверьте ссылку и попробуйте позже.',
+  invalid_russian_phone: 'Введите российский номер: +7, 7, 8 или 10 цифр без кода страны.',
+  auto_join_failed: 'Не удалось подтвердить автоматическое вступление. Откройте приглашение группы и проверьте вступление.',
+  membership_not_confirmed: 'MAX пока не подтвердил членство. Откройте приглашение группы и повторите проверку.',
+  membership_check_unavailable: 'Не удалось проверить членство через назначенный прокси. Повторите проверку позже.',
+  group_resolution_failed: 'Вход сохранён, но ссылка MAX недоступна. Попросите владельца проверить ссылку группы и затем повторить проверку членства.',
+  invalid_request: 'Проверьте заполнение полей и повторите действие.',
   group_destination_mismatch: 'Ссылка ведёт в другую группу. Сообщите владельцу группы.',
   account_registration_required: 'Для этого номера MAX требует завершить регистрацию в приложении.',
   cloud_password_rejected: 'Облачный пароль MAX не подошёл. Запустите подключение ещё раз.',
@@ -128,7 +133,7 @@ function addCancelButton(form) {
 async function init() {
   try {
     const invite = await api(`/join-info/${token}`);
-    root.innerHTML = `<h1>${esc(invite.group)}</h1><p>Укажите имя и номер MAX. Затем введите код и, если потребуется, облачный пароль.</p><form id="start"><label>ФИО<input name="full_name" required maxlength="120" autocomplete="name"></label><label>Телефон<input name="phone" type="tel" required placeholder="+7…" autocomplete="tel"></label><button>Начать подключение</button><p class="error" id="start-error" role="alert"></p></form><p class="muted">После авторизации вступите в группу MAX по приглашению и нажмите «Проверить вступление».</p><p><a target="_blank" rel="noreferrer" href="${esc(invite.invite_link)}">Открыть приглашение группы MAX</a></p><div id="flow" aria-live="polite"></div>`;
+    root.innerHTML = `<h1>${esc(invite.group)}</h1><p>Укажите имя и российский номер MAX. Затем введите код и, если потребуется, облачный пароль.</p><form id="start"><label>ФИО<input name="full_name" required maxlength="120" autocomplete="name"></label><label>Телефон<input name="phone" type="tel" required placeholder="+7…" autocomplete="tel"></label><button>Начать подключение</button><p class="error" id="start-error" role="alert"></p></form><p class="muted">После авторизации попробуем вступить в группу автоматически. Если MAX потребует ваше действие, откройте приглашение и проверьте членство.</p><p><a target="_blank" rel="noreferrer" href="${esc(invite.invite_link)}">Открыть приглашение группы MAX</a></p><div id="flow" aria-live="polite"></div>`;
     document.querySelector('#start').onsubmit = async event => {
       event.preventDefault();
       const form = event.currentTarget;
@@ -190,9 +195,9 @@ function ensurePasswordForm(hint) {
   if (hintElement) hintElement.textContent = `${hint || 'Введите облачный пароль MAX.'}${remainingTime()}`;
 }
 
-function ensureMembership() {
+function ensureMembership(reason) {
   if (document.querySelector('#check')) return;
-  document.querySelector('#flow').innerHTML = '<div class="panel"><p>Авторизация прошла. Вступите в группу по ссылке выше, затем проверьте членство.</p><button id="check">Проверить вступление</button><button type="button" class="secondary" id="cancel">Отменить подключение</button><p id="check-result" role="status"></p></div>';
+  document.querySelector('#flow').innerHTML = `<div class="panel"><p>${esc(errors[reason] || 'Авторизация прошла. Откройте приглашение группы выше, затем проверьте членство.')}</p><button id="check">Проверить вступление</button><p id="check-result" role="status"></p></div>`;
   document.querySelector('#check').onclick = async event => {
     const button = event.currentTarget;
     button.disabled = true;
@@ -206,7 +211,6 @@ function ensureMembership() {
       button.disabled = false;
     }
   };
-  document.querySelector('#cancel').addEventListener('click', cancelAttempt);
 }
 
 async function cancelAttempt() {
@@ -230,7 +234,7 @@ async function poll() {
     expiresAt = data.expires_at || '';
     if (data.state === 'waiting_code') ensureCodeForm(data.hint, data.request_count_left, data.code_length);
     else if (data.state === 'waiting_password') ensurePasswordForm(data.hint);
-    else if (data.state === 'waiting_membership') ensureMembership();
+    else if (data.state === 'waiting_membership') ensureMembership(data.error);
     else if (data.state === 'completed') {
       clearSession();
       terminalMessage('Номер подключён. Можно закрыть страницу.');

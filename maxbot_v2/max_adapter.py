@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
+import logging
 import tempfile
 from typing import Any
 
@@ -42,6 +43,14 @@ class _DirectCodeRequestFlow:
 
 class PyMaxAdapter:
     """The single boundary for PyMax calls."""
+
+    @staticmethod
+    def _silence_pymax_logs() -> None:
+        # PyMax ERROR/WARNING messages can contain remote text and proxy URLs.
+        provider_logger = logging.getLogger("pymax")
+        provider_logger.handlers[:] = [logging.NullHandler()]
+        provider_logger.propagate = False
+
     def __init__(self, client: Any):
         self.client = client
 
@@ -84,6 +93,7 @@ class PyMaxAdapter:
                     extra_config=extra,
                     auth_flow=auth_flow,
                 )
+                cls._silence_pymax_logs()
                 try:
                     await client.connect()
                 except _DirectCodeRequestDone:
@@ -103,6 +113,7 @@ class PyMaxAdapter:
 
     @classmethod
     def create(cls, *, phone: str, work_dir: str, session_name: str, proxy: str | None, auth_flow: Any = None, session_vault: EncryptedSessionFile | None = None):
+        runtime_opened = False
         try:
             if not proxy:
                 raise AdapterUnavailable("proxy_assignment_required")
@@ -113,11 +124,18 @@ class PyMaxAdapter:
                 raise AdapterUnavailable("pymax_version_mismatch")
             from pymax import Client, ExtraConfig
             extra = ExtraConfig(proxy=proxy, reconnect=False, relogin=False, persist_session=True, telemetry=False, log_level="WARNING")
+            runtime_opened = True
             work_dir, session_name = session_vault.open()
             client = Client(phone=phone, work_dir=work_dir, session_name=session_name, extra_config=extra, auth_flow=auth_flow or NoInteractiveAuthFlow())
+            cls._silence_pymax_logs()
         except AdapterUnavailable:
             raise
         except Exception as exc:
+            if runtime_opened:
+                try:
+                    session_vault.discard_working_copy()
+                except OSError as cleanup_error:
+                    raise AdapterUnavailable("session_cleanup_failed") from cleanup_error
             raise AdapterUnavailable("pymax_unavailable") from exc
         result = cls(client)
         result._session_vault = session_vault
@@ -129,7 +147,12 @@ class PyMaxAdapter:
     async def resolve_group_by_link(self, link: str):
         return await self.client.resolve_group_by_link(link)
 
+    async def join_group(self, link: str):
+        return await self.client.join_group(link)
+
     async def get_chat(self, chat_id: int):
+        # PyMax 2.4.1 otherwise returns the chat cached during login.
+        self.client._app.api.chats._remove_cached_chat(chat_id)
         return await self.client.get_chat(chat_id)
 
     async def send_message(self, *, chat_id: int, text: str) -> AcceptedMessage:
