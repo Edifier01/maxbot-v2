@@ -14,12 +14,13 @@ PyMax вызывается только через единственный ад
 
 ```sh
 docker compose stop app
-docker compose run --rm --no-deps app python scripts/backup.py /data/backups/maxbot-$(date -u +%F).zip
+install -d -o 10001 -g 10001 -m 700 /root/maxbot-backups
+docker compose run --rm --no-deps -v /root/maxbot-backups:/backup app python scripts/backup.py /backup/maxbot-$(date -u +%F-%H%M%S).zip
 ```
 
-Архив содержит SQLite snapshot и только зашифрованные файлы сессий. Храните `DATA_ENCRYPTION_KEY`, `APP_SECRET_KEY` и пароль владельца в отдельном секретном хранилище, отдельно от архива и Git.
+Архив содержит SQLite snapshot и только зашифрованные файлы сессий. Каталог на хосте должен быть доступен UID `10001`, под которым работает приложение: иначе `backup.py` не сможет создать временный SQLite-файл и архив. Проверьте ZIP и выгрузите его за пределы VDS, чтобы потеря сервера не уничтожила единственную копию. Храните `DATA_ENCRYPTION_KEY`, `APP_SECRET_KEY` и пароль владельца в отдельном секретном хранилище, отдельно от архива и Git.
 
-До переключения трафика восстановите копию в пустую отдельную директорию и проверьте `PRAGMA integrity_check`. Не подключайте восстановленный каталог к production. Проверьте чтение аккаунтов и сессий при том же `DATA_ENCRYPTION_KEY`, затем удалите тестовую среду после фиксации результата.
+До переключения трафика восстановите копию в пустую отдельную директорию, доступную UID `10001`, и проверьте `PRAGMA integrity_check`. Не подключайте восстановленный каталог к production. Проверьте чтение аккаунтов и сессий при том же `DATA_ENCRYPTION_KEY`, затем удалите тестовую среду с расшифрованными сессиями после фиксации результата.
 
 При сборке передайте полный SHA в аргумент `BUILD_REVISION`, например `BUILD_REVISION=<main-SHA> docker compose build app`. `/health` возвращает установленный `revision`. Сверьте его с GitHub SHA и локальным checkout. Проверьте HTTPS, Caddy, заголовки клиентского IP и то, что порт приложения не опубликован напрямую. Не меняйте Caddy до успешной проверки восстановления.
 
