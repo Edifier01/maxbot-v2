@@ -138,8 +138,16 @@ def member_proof(chat: Any, expected_chat_id: str) -> bool:
         return False
 
 
-async def join_group_and_confirm_membership(adapter: Any, invite_link: str, chat_id: str) -> tuple[bool, str | None]:
+async def join_group_and_confirm_membership(
+    adapter: Any,
+    invite_link: str,
+    chat_id: str,
+    *,
+    before_action: Callable[[], None] | None = None,
+) -> tuple[bool, str | None]:
     join_error = None
+    if before_action is not None:
+        before_action()
     try:
         joined = await adapter.join_group(invite_link)
         joined_id = str(getattr(joined, "id", "") or getattr(joined, "chat_id", ""))
@@ -147,6 +155,8 @@ async def join_group_and_confirm_membership(adapter: Any, invite_link: str, chat
             return False, "group_destination_mismatch"
     except Exception:
         join_error = "auto_join_failed"
+    if before_action is not None:
+        before_action()
     try:
         chat = await adapter.get_chat(int(chat_id))
     except Exception:

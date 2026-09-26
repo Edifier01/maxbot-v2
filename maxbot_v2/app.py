@@ -998,6 +998,7 @@ def create_app(
             stage_started = perf_counter()
             await adapter.connect()
             logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
+            runtime["flow"].validate_proxy()
             stage = "resolve_group"
             stage_started = perf_counter()
             profile = getattr(adapter.client, "me", None)
@@ -1005,6 +1006,7 @@ def create_app(
             max_user_id = str(getattr(contact, "id", "") or getattr(profile, "id", ""))
             if not max_user_id:
                 raise RuntimeError("max_user_id_missing")
+            runtime["flow"].validate_proxy()
             resolved = await adapter.resolve_group_by_link(invite_link)
             logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
             chat_id = str(getattr(resolved, "id", "") or getattr(resolved, "chat_id", ""))
@@ -1012,7 +1014,12 @@ def create_app(
                 raise RuntimeError("group_resolution_failed")
             stage = "auto_join"
             stage_started = perf_counter()
-            joined, join_error = await join_group_and_confirm_membership(adapter, invite_link, chat_id)
+            joined, join_error = await join_group_and_confirm_membership(
+                adapter,
+                invite_link,
+                chat_id,
+                before_action=runtime["flow"].validate_proxy,
+            )
             logger.info(
                 "onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d joined=%s error_code=%s",
                 session_id, runtime["account_id"], runtime["proxy_id"], stage,
@@ -1225,7 +1232,7 @@ def create_app(
             current = connection.execute(
                 "SELECT s.state,s.expires_at,s.token_hash AS session_token_hash,i.active,"
                 "i.expires_at AS invite_expires_at,i.token_hash AS invite_token_hash,a.group_id,a.status AS account_status,"
-                "g.chat_id,pa.proxy_id AS assigned_proxy_id,p.enabled AS assigned_proxy_enabled "
+                "g.chat_id,pa.proxy_id AS assigned_proxy_id,p.enabled AS assigned_proxy_enabled,p.check_status AS assigned_proxy_check_status "
                 "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id "
                 "JOIN accounts a ON a.id=s.account_id JOIN groups g ON g.id=a.group_id "
                 "LEFT JOIN proxy_assignments pa ON pa.account_id=a.id LEFT JOIN proxies p ON p.id=pa.proxy_id "
@@ -1245,6 +1252,12 @@ def create_app(
             if current["assigned_proxy_id"] != row["proxy_id"] or current["assigned_proxy_enabled"] != 1:
                 connection.rollback()
                 raise HTTPException(409, "account_assignment_changed_during_verification")
+            if current["assigned_proxy_check_status"] != "healthy":
+                connection.rollback()
+                raise HTTPException(
+                    409,
+                    "proxy_check_failed" if current["assigned_proxy_check_status"] == "failed" else "proxy_not_healthy",
+                )
             if joined:
                 connection.execute("UPDATE accounts SET status='active' WHERE id=?", (row["account_id"],))
                 connection.execute("UPDATE onboarding_sessions SET state='completed',updated_at=? WHERE id=?", (now, session_id))
