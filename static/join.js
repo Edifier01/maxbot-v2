@@ -22,6 +22,11 @@ const errors = {
   onboarding_rate_limited: 'Слишком много попыток. Подождите и попробуйте позже.',
   code_rate_limited: 'Слишком много попыток ввода кода. Подождите и попробуйте позже.',
   password_rate_limited: 'Слишком много попыток ввода пароля. Подождите и попробуйте позже.',
+  invalid_russian_phone: '\u0412\u0432\u0435\u0434\u0438\u0442\u0435 10 \u0446\u0438\u0444\u0440 \u0440\u043e\u0441\u0441\u0438\u0439\u0441\u043a\u043e\u0433\u043e \u043d\u043e\u043c\u0435\u0440\u0430; \u043c\u043e\u0436\u043d\u043e \u0443\u043a\u0430\u0437\u0430\u0442\u044c \u043a\u043e\u0434 7 \u0438\u043b\u0438 8.',
+  proxy_check_failed: '\u041d\u0430\u0437\u043d\u0430\u0447\u0435\u043d\u043d\u044b\u0439 \u043f\u0440\u043e\u043a\u0441\u0438 \u043d\u0435 \u043f\u0440\u043e\u0448\u0451\u043b \u043f\u0440\u043e\u0432\u0435\u0440\u043a\u0443. \u0412\u043b\u0430\u0434\u0435\u043b\u0435\u0446 \u0433\u0440\u0443\u043f\u043f\u044b \u043c\u043e\u0436\u0435\u0442 \u043f\u0435\u0440\u0435\u043f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u0435\u0433\u043e \u0438\u043b\u0438 \u043d\u0430\u0437\u043d\u0430\u0447\u0438\u0442\u044c \u0434\u0440\u0443\u0433\u043e\u0439.',
+  auto_join_failed: '\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0432\u0441\u0442\u0443\u043f\u0438\u0442\u044c \u0432 \u0433\u0440\u0443\u043f\u043f\u0443 \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438. \u041e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 \u043f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435 \u0433\u0440\u0443\u043f\u043f\u044b \u0432\u044b\u0448\u0435 \u0438 \u0432\u0441\u0442\u0443\u043f\u0438\u0442\u0435 \u0432\u0440\u0443\u0447\u043d\u0443\u044e.',
+  membership_check_unavailable: '\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u0447\u043b\u0435\u043d\u0441\u0442\u0432\u043e. \u041f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u043f\u043e\u0437\u0436\u0435.',
+  membership_not_confirmed: '\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u044c \u0432\u0441\u0442\u0443\u043f\u043b\u0435\u043d\u0438\u0435. \u041f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u0435 \u0435\u0433\u043e \u043a\u043d\u043e\u043f\u043a\u043e\u0439 \u043d\u0438\u0436\u0435.',
   invalid_code: 'Введите код MAX из 4–8 цифр.',
   invalid_password: 'Введите облачный пароль MAX.',
   network_timeout: 'Не удалось получить ответ от MAX. Проверьте сеть и назначенный прокси.',
@@ -128,7 +133,7 @@ function addCancelButton(form) {
 async function init() {
   try {
     const invite = await api(`/join-info/${token}`);
-    root.innerHTML = `<h1>${esc(invite.group)}</h1><p>Укажите имя и номер MAX. Затем введите код и, если потребуется, облачный пароль.</p><form id="start"><label>ФИО<input name="full_name" required maxlength="120" autocomplete="name"></label><label>Телефон<input name="phone" type="tel" required placeholder="+7…" autocomplete="tel"></label><button>Начать подключение</button><p class="error" id="start-error" role="alert"></p></form><p class="muted">После авторизации вступите в группу MAX по приглашению и нажмите «Проверить вступление».</p><p><a target="_blank" rel="noreferrer" href="${esc(invite.invite_link)}">Открыть приглашение группы MAX</a></p><div id="flow" aria-live="polite"></div>`;
+    root.innerHTML = `<h1>${esc(invite.group)}</h1><p>Укажите имя и номер MAX. Затем введите код и, если потребуется, облачный пароль.</p><form id="start"><label>ФИО<input name="full_name" required maxlength="120" autocomplete="name"></label><label>Телефон<input name="phone" type="tel" required placeholder="+7…" autocomplete="tel"></label><button>Начать подключение</button><p class="error" id="start-error" role="alert"></p></form><p class="muted">После авторизации программа сама попробует вступить в группу. Если не получится, откройте приглашение выше и вступите вручную.</p><p><a target="_blank" rel="noreferrer" href="${esc(invite.invite_link)}">Открыть приглашение группы MAX</a></p><div id="flow" aria-live="polite"></div>`;
     document.querySelector('#start').onsubmit = async event => {
       event.preventDefault();
       const form = event.currentTarget;
@@ -190,16 +195,17 @@ function ensurePasswordForm(hint) {
   if (hintElement) hintElement.textContent = `${hint || 'Введите облачный пароль MAX.'}${remainingTime()}`;
 }
 
-function ensureMembership() {
+function ensureMembership(errorCode = '') {
   if (document.querySelector('#check')) return;
-  document.querySelector('#flow').innerHTML = '<div class="panel"><p>Авторизация прошла. Вступите в группу по ссылке выше, затем проверьте членство.</p><button id="check">Проверить вступление</button><button type="button" class="secondary" id="cancel">Отменить подключение</button><p id="check-result" role="status"></p></div>';
+  const reason = errorCode ? friendly(errorCode) : '\u041f\u0440\u043e\u0433\u0440\u0430\u043c\u043c\u0430 \u043f\u043e\u043f\u044b\u0442\u0430\u0435\u0442\u0441\u044f \u0432\u0441\u0442\u0443\u043f\u0438\u0442\u044c \u0432 \u0433\u0440\u0443\u043f\u043f\u0443. \u0415\u0441\u043b\u0438 \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u043e\u0435 \u0432\u0441\u0442\u0443\u043f\u043b\u0435\u043d\u0438\u0435 \u043d\u0435 \u0441\u0440\u0430\u0431\u043e\u0442\u0430\u0435\u0442, \u043e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 \u043f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435 \u0432\u044b\u0448\u0435.';
+  document.querySelector('#flow').innerHTML = `<div class="panel"><p class="error" role="status">${esc(reason)}</p><p>\u041f\u043e\u0441\u043b\u0435 \u0432\u0441\u0442\u0443\u043f\u043b\u0435\u043d\u0438\u044f \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u043a\u043d\u043e\u043f\u043a\u0443 \u043d\u0438\u0436\u0435, \u0447\u0442\u043e\u0431\u044b \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0434\u0438\u0442\u044c \u0447\u043b\u0435\u043d\u0441\u0442\u0432\u043e.</p><button id="check">\u041f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u0432\u0441\u0442\u0443\u043f\u043b\u0435\u043d\u0438\u0435</button><button type="button" class="secondary" id="cancel">\u041e\u0442\u043c\u0435\u043d\u0438\u0442\u044c \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435</button><p id="check-result" role="status"></p></div>`;
   document.querySelector('#check').onclick = async event => {
     const button = event.currentTarget;
     button.disabled = true;
     try {
       const result = await api(`/api/public/onboarding/${token}/${session}/check-membership`, {});
-      document.querySelector('#check-result').textContent = result.completed ? 'Номер подключён. Можно закрыть страницу.' : 'Пока не видим вступление. Проверьте группу MAX и повторите.';
-      if (result.completed) terminalMessage('Номер подключён. Можно закрыть страницу.');
+      document.querySelector('#check-result').textContent = result.completed ? '\u041d\u043e\u043c\u0435\u0440 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d. \u041c\u043e\u0436\u043d\u043e \u0437\u0430\u043a\u0440\u044b\u0442\u044c \u0441\u0442\u0440\u0430\u043d\u0438\u0446\u0443.' : '\u041f\u043e\u043a\u0430 \u043d\u0435 \u0432\u0438\u0434\u0438\u043c \u0432\u0441\u0442\u0443\u043f\u043b\u0435\u043d\u0438\u0435. \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u0433\u0440\u0443\u043f\u043f\u0443 MAX \u0438 \u043f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u0435.';
+      if (result.completed) terminalMessage('\u041d\u043e\u043c\u0435\u0440 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d. \u041c\u043e\u0436\u043d\u043e \u0437\u0430\u043a\u0440\u044b\u0442\u044c \u0441\u0442\u0440\u0430\u043d\u0438\u0446\u0443.');
     } catch (error) {
       document.querySelector('#check-result').textContent = friendly(error);
     } finally {
@@ -230,7 +236,7 @@ async function poll() {
     expiresAt = data.expires_at || '';
     if (data.state === 'waiting_code') ensureCodeForm(data.hint, data.request_count_left, data.code_length);
     else if (data.state === 'waiting_password') ensurePasswordForm(data.hint);
-    else if (data.state === 'waiting_membership') ensureMembership();
+    else if (data.state === 'waiting_membership') ensureMembership(data.error_code || data.error || '');
     else if (data.state === 'completed') {
       clearSession();
       terminalMessage('Номер подключён. Можно закрыть страницу.');

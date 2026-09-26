@@ -21,6 +21,7 @@ from maxbot_v2.db import connect
 @pytest.fixture
 def fake_pymax(monkeypatch):
     direct_requests = []
+    created_phones = []
 
     class FakeAuth:
         async def send_code(self, token, code):
@@ -34,6 +35,7 @@ def fake_pymax(monkeypatch):
             self.session_vault = session_vault
             self.client = SimpleNamespace(me=SimpleNamespace(contact=SimpleNamespace(id=314159)))
             self.phone = phone
+            created_phones.append(phone)
             session_vault.open()
 
         async def connect(self):
@@ -55,6 +57,9 @@ def fake_pymax(monkeypatch):
         async def resolve_group_by_link(self, _link):
             return SimpleNamespace(id=7001)
 
+        async def join_group(self, _link):
+            return SimpleNamespace(id=7001)
+
         async def get_chat(self, _chat_id):
             return SimpleNamespace(id=7001, status="member", join_time=1)
 
@@ -73,13 +78,18 @@ def fake_pymax(monkeypatch):
         "maxbot_v2.app.PyMaxAdapter.request_code_direct",
         classmethod(fake_direct_code_request),
     )
-    return direct_requests
+    return SimpleNamespace(direct_requests=direct_requests, created_phones=created_phones)
 
 
 @pytest.fixture
 def local_app(tmp_path, monkeypatch, fake_pymax):
     monkeypatch.setenv("DATA_ENCRYPTION_KEY", SecretBox.generate_key())
     monkeypatch.setenv("SESSION_RUNTIME_DIR", str(tmp_path / "runtime"))
+
+    async def healthy_proxy(_proxy_url, **_kwargs):
+        return None
+
+    monkeypatch.setattr("maxbot_v2.app.probe_proxy", healthy_proxy)
     password = "Browser-test-password-42"
     app = create_app(
         db_path=tmp_path / "browser.sqlite3",
@@ -90,6 +100,7 @@ def local_app(tmp_path, monkeypatch, fake_pymax):
         secure_cookies=False,
     )
     app.state.worker_manager.poll_seconds = 0.05
+    app.state.fake_pymax_phones = fake_pymax.created_phones
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
@@ -116,7 +127,7 @@ def local_app(tmp_path, monkeypatch, fake_pymax):
         raise RuntimeError("test application did not start")
 
     try:
-        yield SimpleNamespace(app=app, url=f"http://127.0.0.1:{port}", password=password, direct_requests=fake_pymax)
+        yield SimpleNamespace(app=app, url=f"http://127.0.0.1:{port}", password=password, direct_requests=fake_pymax.direct_requests)
     finally:
         server.should_exit = True
         thread.join(timeout=5)
@@ -192,7 +203,7 @@ def test_guest_connect_survives_reload_and_verifies_membership(page: Page, brows
     guest = browser.new_page(viewport={"width": 390, "height": 844})
     guest.goto(invite.get_attribute("href"))
     guest.get_by_label("ФИО").fill("Тестовый пользователь")
-    guest.get_by_label("Телефон").fill("+79990000000")
+    guest.get_by_label("Телефон").fill("89380021575")
     guest.get_by_role("button", name="Начать подключение").click()
     expect(guest.get_by_role("heading", name="Введите код MAX")).to_be_visible()
     expect(guest.locator("#code-hint")).to_contain_text("не подтверждает доставку SMS")
@@ -208,20 +219,21 @@ def test_guest_connect_survives_reload_and_verifies_membership(page: Page, brows
     assert page_has_no_overflow(guest)
     stored = guest.evaluate("Object.values(sessionStorage).join(' ')")
     assert "123456" not in stored
-    guest.get_by_role("button", name="Проверить вступление").click()
     expect(guest.locator("#flow")).to_contain_text("Номер подключён", timeout=5000)
     assert local_app.direct_requests == [
-        ("+79990000000", "socks5://127.0.0.1:1080")
+        ("+79380021575", "socks5://127.0.0.1:1080")
     ]
+    expect(guest.get_by_role("button", name="Проверить вступление")).to_have_count(0)
 
     connection = connect(local_app.app.state.database)
     try:
-        assert connection.execute("SELECT status FROM accounts WHERE phone='+79990000000'").fetchone()[0] == "active"
+        assert connection.execute("SELECT status FROM accounts WHERE phone='+79380021575'").fetchone()[0] == "active"
         assert connection.execute("SELECT state FROM onboarding_sessions").fetchone()[0] == "completed"
-        account_id = connection.execute("SELECT id FROM accounts WHERE phone='+79990000000'").fetchone()[0]
+        account_id = connection.execute("SELECT id FROM accounts WHERE phone='+79380021575'").fetchone()[0]
         assert (local_app.app.state.data_dir / "sessions" / f"account-{account_id}.session.enc").exists()
     finally:
         connection.close()
+    assert local_app.app.state.fake_pymax_phones == ["+79380021575"]
 
 
 def test_guest_can_cancel_an_authorization_attempt(page: Page, browser, local_app):

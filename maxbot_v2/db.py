@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS proxies (
     label TEXT NOT NULL,
     position INTEGER NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
+    check_status TEXT NOT NULL DEFAULT 'untested',
+    checked_at TEXT,
+    check_error TEXT,
     UNIQUE(group_id, position)
 );
 CREATE TABLE IF NOT EXISTS accounts (
@@ -34,6 +37,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     max_user_id TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     send_weekday INTEGER CHECK(send_weekday BETWEEN 0 AND 6),
+    session_generation INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS proxy_assignments (
@@ -177,6 +181,19 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    migrations = {
+        "proxies": {
+            "check_status": "TEXT NOT NULL DEFAULT 'untested'",
+            "checked_at": "TEXT",
+            "check_error": "TEXT",
+        },
+        "accounts": {"session_generation": "INTEGER NOT NULL DEFAULT 0"},
+    }
+    for table, columns in migrations.items():
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
     connection.executemany(
         "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", DEFAULTS.items()
     )
