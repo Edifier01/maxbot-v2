@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from .max_adapter import PyMaxAdapter
 from .scheduling import assign_proxy
@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 
 class WebCodeAuthFlow:
     """PyMax AuthFlow bridge to short-lived web OTP / 2FA queues."""
-    def __init__(self, update: Callable[[str, str], None], *, account_id: int | None = None, proxy_id: int | None = None, session_id: str | None = None):
+    def __init__(self, update: Callable[[str, str], None], *, request_code: Callable[[str], Awaitable[Any]], account_id: int | None = None, proxy_id: int | None = None, session_id: str | None = None):
         self.update = update
+        self.request_code = request_code
         self.account_id = account_id
         self.proxy_id = proxy_id
         self.session_id = session_id
@@ -43,7 +44,7 @@ class WebCodeAuthFlow:
         stage = "request_code"
         started = perf_counter()
         try:
-            start = await app.api.auth.request_code(str(app.config.phone))
+            start = await self.request_code(str(app.config.phone))
         except Exception as exc:
             self._stage(stage, started, exc)
             raise
@@ -51,7 +52,7 @@ class WebCodeAuthFlow:
         self.code_length = getattr(start, "code_length", None)
         self.request_count_left = getattr(start, "request_count_left", None)
         logger.info(
-            "onboarding_code_request session_id=%s account_id=%s proxy_id=%s auth_token_present=%s code_length=%s request_count_left=%s request_timeout=%s",
+            "onboarding_code_request session_id=%s account_id=%s proxy_id=%s route=direct auth_token_present=%s code_length=%s request_count_left=%s request_timeout=%s",
             self.session_id, self.account_id, self.proxy_id, bool(getattr(start, "token", None)),
             self.code_length, self.request_count_left, getattr(start, "request_max_duration", None),
         )

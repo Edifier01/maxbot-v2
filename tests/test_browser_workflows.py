@@ -20,10 +20,9 @@ from maxbot_v2.db import connect
 
 @pytest.fixture
 def fake_pymax(monkeypatch):
-    class FakeAuth:
-        async def request_code(self, _phone):
-            return SimpleNamespace(token="fixture-auth-token", code_length=6, request_count_left=3, request_max_duration=300)
+    direct_requests = []
 
+    class FakeAuth:
         async def send_code(self, token, code):
             assert token == "fixture-auth-token"
             assert code == "123456"
@@ -62,10 +61,19 @@ def fake_pymax(monkeypatch):
         async def close(self):
             self.session_vault.seal()
 
+    async def fake_direct_code_request(_cls, *, phone, assigned_proxy):
+        direct_requests.append((phone, assigned_proxy))
+        return SimpleNamespace(token="fixture-auth-token", code_length=6, request_count_left=3, request_max_duration=300)
+
     monkeypatch.setattr(
         "maxbot_v2.app.PyMaxAdapter.create",
         classmethod(lambda _cls, *, phone, auth_flow=None, session_vault, **_kwargs: FakeAdapter(phone, auth_flow, session_vault)),
     )
+    monkeypatch.setattr(
+        "maxbot_v2.app.PyMaxAdapter.request_code_direct",
+        classmethod(fake_direct_code_request),
+    )
+    return direct_requests
 
 
 @pytest.fixture
@@ -108,7 +116,7 @@ def local_app(tmp_path, monkeypatch, fake_pymax):
         raise RuntimeError("test application did not start")
 
     try:
-        yield SimpleNamespace(app=app, url=f"http://127.0.0.1:{port}", password=password)
+        yield SimpleNamespace(app=app, url=f"http://127.0.0.1:{port}", password=password, direct_requests=fake_pymax)
     finally:
         server.should_exit = True
         thread.join(timeout=5)
@@ -202,6 +210,9 @@ def test_guest_connect_survives_reload_and_verifies_membership(page: Page, brows
     assert "123456" not in stored
     guest.get_by_role("button", name="Проверить вступление").click()
     expect(guest.locator("#flow")).to_contain_text("Номер подключён", timeout=5000)
+    assert local_app.direct_requests == [
+        ("+79990000000", "socks5://127.0.0.1:1080")
+    ]
 
     connection = connect(local_app.app.state.database)
     try:

@@ -814,6 +814,10 @@ def create_app(
             raise HTTPException(409, "phone_already_exists") from exc
         flow = WebCodeAuthFlow(
             lambda state, hint: (set_onboarding_state(session_id, state, hint), setattr(flow, "hint", hint)),
+            request_code=lambda requested_phone: PyMaxAdapter.request_code_direct(
+                phone=requested_phone,
+                assigned_proxy=proxy_url,
+            ),
             account_id=account_id,
             proxy_id=proxy_id,
             session_id=session_id,
