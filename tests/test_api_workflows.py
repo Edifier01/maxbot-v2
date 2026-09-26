@@ -1,5 +1,8 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+import threading
+from types import SimpleNamespace
 
 import bcrypt
 import pytest
@@ -144,6 +147,192 @@ def test_admin_cannot_reassign_account_to_untested_proxy(tmp_path, monkeypatch):
         assert connection.execute("SELECT 1 FROM proxy_assignments WHERE account_id=?", (account_id,)).fetchone() is None
     finally:
         connection.close()
+
+
+def test_admin_account_list_does_not_expose_phone_number(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'active')", (group_id, "+79380021575", "Иван"))
+    finally:
+        connection.close()
+
+    response = client.get(f"/api/groups/{group_id}/accounts")
+
+    assert response.status_code == 200
+    assert "+79380021575" not in response.text
+    assert "phone" not in response.json()[0]
+
+
+def test_onboarding_rechecks_proxy_health_before_direct_code_request(tmp_path, monkeypatch):
+    pending_auth = []
+    direct_requests = []
+    real_create_task = asyncio.create_task
+
+    def defer_auth(coroutine, **kwargs):
+        if coroutine.cr_code.co_name == "run_onboarding_auth":
+            pending_auth.append(coroutine)
+            return None
+        return real_create_task(coroutine, **kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", defer_auth)
+    monkeypatch.setattr("maxbot_v2.workers.GroupWorkerManager._sync_group_workers", no_worker_sync)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    proxy = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"}).json()
+    link = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={}).json()["url"]
+    token = link.rsplit("/", 1)[1]
+    started = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "89380021575"})
+    assert started.status_code == 200
+    assert len(pending_auth) == 1
+
+    class FakeAdapter:
+        def __init__(self, auth_flow):
+            self.auth_flow = auth_flow
+
+        async def connect(self):
+            app = SimpleNamespace(
+                api=SimpleNamespace(auth=SimpleNamespace()),
+                config=SimpleNamespace(phone="+79380021575"),
+            )
+            await self.auth_flow.authenticate(app)
+
+        async def close(self):
+            return None
+
+    def fail_proxy_after_dispatch_validation(_cls, *, auth_flow, **_kwargs):
+        connection = connect(client.app.state.database)
+        try:
+            connection.execute("UPDATE proxies SET check_status='failed' WHERE id=?", (proxy["id"],))
+        finally:
+            connection.close()
+        return FakeAdapter(auth_flow)
+
+    async def request_code(_cls, *, phone, assigned_proxy):
+        direct_requests.append((phone, assigned_proxy))
+        raise RuntimeError("test_stop_after_unvalidated_request")
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(fail_proxy_after_dispatch_validation))
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.request_code_direct", classmethod(request_code))
+
+    asyncio.run(pending_auth.pop())
+
+    assert direct_requests == []
+    connection = connect(client.app.state.database)
+    try:
+        attempt = connection.execute("SELECT state,error_code FROM onboarding_sessions").fetchone()
+        assert tuple(attempt) == ("failed", "proxy_check_failed")
+    finally:
+        connection.close()
+
+
+def test_guest_membership_check_rechecks_proxy_health_after_lock_acquire(tmp_path, monkeypatch):
+    real_create_task = asyncio.create_task
+
+    def skip_onboarding_network(coroutine, **kwargs):
+        if coroutine.cr_code.co_name == "run_onboarding_auth":
+            coroutine.close()
+            return None
+        return real_create_task(coroutine, **kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", skip_onboarding_network)
+    monkeypatch.setattr("maxbot_v2.workers.GroupWorkerManager._sync_group_workers", no_worker_sync)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"})
+    link = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={}).json()["url"]
+    token = link.rsplit("/", 1)[1]
+    started = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "89380021575"})
+    assert started.status_code == 200
+    session_id = started.json()["session_id"]
+    connection = connect(client.app.state.database)
+    try:
+        account_id = connection.execute("SELECT account_id FROM onboarding_sessions WHERE id=?", (session_id,)).fetchone()[0]
+        connection.execute("UPDATE groups SET chat_id='7001' WHERE id=?", (group_id,))
+        connection.execute("UPDATE onboarding_sessions SET state='waiting_membership' WHERE id=?", (session_id,))
+    finally:
+        connection.close()
+
+    lock = client.app.state.account_session_locks.for_account(account_id)
+    real_acquire = lock.acquire
+
+    async def fail_proxy_after_lock():
+        await real_acquire()
+        connection = connect(client.app.state.database)
+        try:
+            connection.execute("UPDATE proxies SET check_status='failed' WHERE group_id=?", (group_id,))
+        finally:
+            connection.close()
+
+    monkeypatch.setattr(lock, "acquire", fail_proxy_after_lock)
+    adapter_creations = []
+
+    def create_adapter(_cls, **_kwargs):
+        adapter_creations.append(True)
+        raise RuntimeError("test_stop_before_network")
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(create_adapter))
+
+    checked = client.post(f"/api/public/onboarding/{token}/{session_id}/check-membership")
+
+    assert checked.status_code == 409
+    assert checked.json()["detail"] == "proxy_check_failed"
+    assert adapter_creations == []
+
+
+def test_onboarding_rejects_new_attempt_while_account_removal_waits_for_lock(tmp_path, monkeypatch):
+    removal_waiting = threading.Event()
+    allow_removal = threading.Event()
+
+    class PausedLock:
+        async def acquire(self):
+            removal_waiting.set()
+            await asyncio.to_thread(allow_removal.wait, 5)
+
+        def release(self):
+            return None
+
+    real_create_task = asyncio.create_task
+
+    def defer_auth(coroutine, **kwargs):
+        if coroutine.cr_code.co_name == "run_onboarding_auth":
+            coroutine.close()
+            return None
+        return real_create_task(coroutine, **kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", defer_auth)
+    monkeypatch.setattr("maxbot_v2.workers.GroupWorkerManager._sync_group_workers", no_worker_sync)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"})
+    link = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={}).json()["url"]
+    token = link.rsplit("/", 1)[1]
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'pending')", (group_id, "+79380021575", "Иван"))
+        account_id = connection.execute("SELECT id FROM accounts WHERE phone='+79380021575'").fetchone()[0]
+        connection.execute("INSERT INTO proxy_assignments(account_id,proxy_id) SELECT ?,id FROM proxies WHERE group_id=?", (account_id, group_id))
+    finally:
+        connection.close()
+    lock = PausedLock()
+    monkeypatch.setattr(client.app.state.account_session_locks, "for_account", lambda _account_id: lock)
+    guest_client = TestClient(client.app, base_url="https://test.local")
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        removal = executor.submit(client.delete, f"/api/accounts/{account_id}", headers=headers)
+        assert removal_waiting.wait(5)
+        restarted = guest_client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "89380021575"})
+        allow_removal.set()
+        removed = removal.result(timeout=5)
+
+    assert restarted.status_code == 409
+    assert restarted.json()["detail"] == "account_removal_in_progress"
+    assert removed.status_code == 200
 
 def test_admin_removes_number_without_erasing_history_and_readds_in_another_group(tmp_path, monkeypatch):
     real_create_task = asyncio.create_task
@@ -684,6 +873,46 @@ def test_destination_verification_button_requires_an_assigned_enabled_proxy(tmp_
     finally:
         connection.close()
     assert client.get("/api/groups").json()[0]["verifiable_account_count"] == 0
+
+
+def test_destination_verification_rechecks_proxy_health_after_account_lock(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    proxy = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"}).json()
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'needs_membership')", (group_id, "+79990000000", "Иван"))
+        account_id = connection.execute("SELECT id FROM accounts WHERE phone='+79990000000'").fetchone()[0]
+        connection.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy["id"]))
+    finally:
+        connection.close()
+
+    lock = client.app.state.account_session_locks.for_account(account_id)
+    real_acquire = lock.acquire
+
+    async def fail_proxy_after_lock():
+        await real_acquire()
+        connection = connect(client.app.state.database)
+        try:
+            connection.execute("UPDATE proxies SET check_status='failed' WHERE id=?", (proxy["id"],))
+        finally:
+            connection.close()
+
+    monkeypatch.setattr(lock, "acquire", fail_proxy_after_lock)
+    adapter_creations = []
+
+    def create_adapter(_cls, **_kwargs):
+        adapter_creations.append(True)
+        raise RuntimeError("test_stop_before_network")
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(create_adapter))
+
+    response = client.post(f"/api/groups/{group_id}/verify-destination", headers=headers, json={})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "proxy_check_failed"
+    assert adapter_creations == []
 
 
 def test_manual_run_control_is_independent_from_restart_autostart(tmp_path, monkeypatch):

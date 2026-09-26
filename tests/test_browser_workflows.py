@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket
 import sqlite3
 import threading
@@ -261,6 +262,58 @@ def test_guest_can_cancel_an_authorization_attempt(page: Page, browser, local_ap
         assert guest.evaluate("sessionStorage.length") == 0
     finally:
         connection.close()
+
+
+def test_admin_gets_actionable_removal_error_without_phone_in_account_ui(page: Page, local_app):
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и прокси").click()
+    page.get_by_label("Название", exact=True).fill("Проверка ошибок")
+    page.get_by_label("Ссылка MAX").fill("https://max.ru/join/admin-error")
+    page.get_by_role("button", name="Добавить", exact=True).click()
+    page.locator(".bulk-proxy-form textarea").fill("socks5://127.0.0.1:1080")
+    page.get_by_role("button", name="Добавить прокси из списка").click()
+    expect(page.locator("#notice")).to_contain_text("Добавлено 1 доступных")
+
+    connection = connect(local_app.app.state.database)
+    try:
+        group_id = connection.execute("SELECT id FROM groups WHERE name='Проверка ошибок'").fetchone()[0]
+        proxy_id = connection.execute("SELECT id FROM proxies WHERE group_id=?", (group_id,)).fetchone()[0]
+        connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'active')", (group_id, "+79380021575", "Иван"))
+        account_id = connection.execute("SELECT id FROM accounts WHERE phone='+79380021575'").fetchone()[0]
+        connection.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy_id))
+    finally:
+        connection.close()
+
+    def reject_removal(route):
+        if route.request.method == "DELETE":
+            route.fulfill(status=409, content_type="application/json", body=json.dumps({"detail": "account_has_unresolved_operation"}))
+        else:
+            route.continue_()
+
+    page.route(f"**/api/accounts/{account_id}", reject_removal)
+    page.get_by_role("button", name="Номера", exact=True).click()
+    account_row = page.locator(".row").filter(has_text=f"Аккаунт #{account_id}")
+    expect(account_row).to_be_visible()
+    expect(account_row).not_to_contain_text("+79380021575")
+    dialog_messages = []
+
+    def accept_confirmation(dialog):
+        dialog_messages.append(dialog.message)
+        dialog.accept()
+
+    page.on("dialog", accept_confirmation)
+    account_row.get_by_role("button", name="Удалить номер").click()
+    expect(page.locator("#notice")).to_contain_text("Сначала сверьте её в MAX")
+    expect(page.locator("#notice")).not_to_contain_text("account_has_unresolved_operation")
+    assert len(dialog_messages) == 1
+    assert "+79380021575" not in dialog_messages[0]
+
+    page.route(
+        f"**/api/groups/{group_id}/verify-destination",
+        lambda route: route.fulfill(status=409, content_type="application/json", body=json.dumps({"detail": "proxy_disabled"})),
+    )
+    page.get_by_role("button", name="Проверить назначение").click()
+    expect(page.locator("#notice")).to_have_text("Назначенный прокси отключён. Назначьте другой доступный прокси.")
 
 
 def page_has_no_overflow(page):

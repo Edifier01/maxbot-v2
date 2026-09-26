@@ -847,6 +847,9 @@ def create_app(
                     connection.rollback()
                     raise HTTPException(404, "invite_unavailable")
                 existing = connection.execute("SELECT id,group_id,status,session_generation FROM accounts WHERE phone=?", (phone,)).fetchone()
+                if existing is not None and existing["status"] == "removing":
+                    connection.rollback()
+                    raise HTTPException(409, "account_removal_in_progress")
                 if existing is None or existing["status"] == "removed":
                     if connection.execute("SELECT 1 FROM proxies WHERE group_id=? AND enabled=1 AND check_status='healthy' LIMIT 1", (row["group_id"],)).fetchone() is None:
                         connection.rollback()
@@ -884,9 +887,9 @@ def create_app(
                         "WHERE pa.account_id=? AND p.group_id=? AND p.enabled=1",
                         (existing["id"], row["group_id"]),
                     ).fetchone()
-                    if assignment is not None and assignment["check_status"] == "failed":
+                    if assignment is not None and assignment["check_status"] != "healthy":
                         connection.rollback()
-                        raise HTTPException(409, "proxy_check_failed")
+                        raise HTTPException(409, "proxy_check_failed" if assignment["check_status"] == "failed" else "proxy_not_healthy")
                     if assignment is None:
                         connection.rollback()
                         raise HTTPException(409, "proxy_assignment_required")
@@ -898,9 +901,9 @@ def create_app(
                 if proxy_row is None:
                     connection.rollback()
                     raise HTTPException(409, "proxy_assignment_required")
-                if proxy_row["check_status"] == "failed":
+                if proxy_row["check_status"] != "healthy":
                     connection.rollback()
-                    raise HTTPException(409, "proxy_check_failed")
+                    raise HTTPException(409, "proxy_check_failed" if proxy_row["check_status"] == "failed" else "proxy_not_healthy")
                 try:
                     proxy_url = SecretBox().decrypt(proxy_row["url_ciphertext"])
                 except ValueError as exc:
@@ -919,7 +922,7 @@ def create_app(
         def validate_onboarding_proxy() -> None:
             with db() as connection:
                 current_proxy = connection.execute(
-                    "SELECT pa.proxy_id,p.enabled,p.group_id,p.url_ciphertext "
+                    "SELECT pa.proxy_id,p.enabled,p.group_id,p.url_ciphertext,p.check_status "
                     "FROM proxy_assignments pa JOIN proxies p ON p.id=pa.proxy_id "
                     "WHERE pa.account_id=?",
                     (account_id,),
@@ -927,6 +930,8 @@ def create_app(
             if (current_proxy is None or int(current_proxy["proxy_id"]) != int(proxy_id)
                     or int(current_proxy["enabled"]) != 1 or int(current_proxy["group_id"]) != int(row["group_id"])):
                 raise RuntimeError("proxy_assignment_changed")
+            if current_proxy["check_status"] != "healthy":
+                raise RuntimeError("proxy_check_failed" if current_proxy["check_status"] == "failed" else "proxy_not_healthy")
             try:
                 current_url = SecretBox().decrypt(current_proxy["url_ciphertext"])
             except ValueError as exc:
@@ -984,8 +989,8 @@ def create_app(
                 return
             if current["proxy_id"] != runtime["proxy_id"] or current["enabled"] != 1:
                 raise RuntimeError("proxy_assignment_changed")
-            if current["check_status"] == "failed":
-                raise RuntimeError("proxy_check_failed")
+            if current["check_status"] != "healthy":
+                raise RuntimeError("proxy_check_failed" if current["check_status"] == "failed" else "proxy_not_healthy")
             logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s", session_id, runtime["account_id"], runtime["proxy_id"], stage)
             adapter = PyMaxAdapter.create(phone=runtime["phone"], work_dir="", session_name="", proxy=runtime["proxy"], auth_flow=runtime["flow"], session_vault=vault)
             logger.info("onboarding_stage session_id=%s account_id=%s proxy_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["proxy_id"], stage, int((perf_counter() - stage_started) * 1000))
@@ -1029,10 +1034,10 @@ def create_app(
                         or not current["active"] or current["session_token_hash"] != current["invite_token_hash"]
                         or current["invite_expires_at"] <= now or current["account_status"] != "pending"
                         or current["assigned_proxy_id"] != runtime["proxy_id"] or current["assigned_proxy_enabled"] != 1
-                        or current["assigned_proxy_check_status"] == "failed"):
+                        or current["assigned_proxy_check_status"] != "healthy"):
                     connection.rollback()
-                    if current is not None and current["assigned_proxy_check_status"] == "failed":
-                        raise RuntimeError("proxy_check_failed")
+                    if current is not None and current["assigned_proxy_check_status"] != "healthy":
+                        raise RuntimeError("proxy_check_failed" if current["assigned_proxy_check_status"] == "failed" else "proxy_not_healthy")
                     if current is not None and (current["assigned_proxy_id"] != runtime["proxy_id"] or current["assigned_proxy_enabled"] != 1):
                         raise RuntimeError("proxy_assignment_changed")
                     raise RuntimeError("invite_unavailable")
@@ -1056,7 +1061,7 @@ def create_app(
                 safe = "password_rejected"
             elif type(exc).__name__ == "ApiError" and auth_stage == "request_code":
                 safe = "max_auth_request_failed"
-            elif str(exc) in {"group_destination_mismatch", "max_user_id_missing", "group_resolution_failed", "account_registration_required", "cloud_password_rejected", "invite_unavailable", "proxy_assignment_changed", "proxy_check_failed"}:
+            elif str(exc) in {"group_destination_mismatch", "max_user_id_missing", "group_resolution_failed", "account_registration_required", "cloud_password_rejected", "invite_unavailable", "proxy_assignment_changed", "proxy_check_failed", "proxy_not_healthy"}:
                 safe = str(exc)
             else:
                 safe = type(exc).__name__.lower()
@@ -1166,18 +1171,40 @@ def create_app(
             ).fetchone()
         if row is None or row["token_hash"] != digest_token(token) or row["state"] != "waiting_membership" or not row["chat_id"]:
             raise HTTPException(404, "onboarding_session_unavailable")
-        if row["check_status"] == "failed":
-            raise HTTPException(409, "proxy_check_failed")
+        if row["check_status"] != "healthy":
+            raise HTTPException(409, "proxy_check_failed" if row["check_status"] == "failed" else "proxy_not_healthy")
         lock = account_session_locks.for_account(row["account_id"])
         adapter = None
         await lock.acquire()
+
+        def current_membership_proxy_url() -> str:
+            with db() as connection:
+                current_proxy = connection.execute(
+                    "SELECT pa.proxy_id,p.enabled,p.group_id,p.url_ciphertext,p.check_status "
+                    "FROM proxy_assignments pa JOIN proxies p ON p.id=pa.proxy_id WHERE pa.account_id=?",
+                    (row["account_id"],),
+                ).fetchone()
+            if (current_proxy is None or int(current_proxy["proxy_id"]) != int(row["proxy_id"])
+                    or int(current_proxy["enabled"]) != 1 or int(current_proxy["group_id"]) != int(row["group_id"])):
+                raise HTTPException(409, "account_assignment_changed_during_verification")
+            if current_proxy["check_status"] != "healthy":
+                raise HTTPException(409, "proxy_check_failed" if current_proxy["check_status"] == "failed" else "proxy_not_healthy")
+            try:
+                return SecretBox().decrypt(current_proxy["url_ciphertext"])
+            except ValueError as exc:
+                raise HTTPException(503, "proxy_unavailable") from exc
+
         try:
-            proxy_url = SecretBox().decrypt(row["url_ciphertext"])
+            proxy_url = current_membership_proxy_url()
             vault = EncryptedSessionFile(row["account_id"], generation=row["session_generation"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
             adapter = PyMaxAdapter.create(phone=row["phone"], work_dir="", session_name="", proxy=proxy_url, session_vault=vault)
             await adapter.connect()
+            if current_membership_proxy_url() != proxy_url:
+                raise HTTPException(409, "account_assignment_changed_during_verification")
             chat = await adapter.get_chat(int(row["chat_id"]))
             joined = member_proof(chat, str(row["chat_id"]))
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(503, "membership_check_unavailable") from exc
         finally:
@@ -1275,7 +1302,7 @@ def create_app(
             timezone_row = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
             week_start = monday_of(datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date()).isoformat()
             rows = connection.execute(
-                "SELECT a.id,a.full_name,a.phone,a.status,a.send_weekday,pa.proxy_id,p.label AS proxy_label,p.enabled AS proxy_enabled,p.check_status AS proxy_check_status,"
+                "SELECT a.id,a.full_name,a.status,a.send_weekday,pa.proxy_id,p.label AS proxy_label,p.enabled AS proxy_enabled,p.check_status AS proxy_check_status,"
                 "s.scheduled_date,s.status AS slot_status,s.error_code,"
                 "(SELECT os.state FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_state,"
                 "(SELECT os.error_code FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_error "
@@ -1294,7 +1321,7 @@ def create_app(
             group = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
             accounts = connection.execute(
                 "SELECT a.id,a.phone,a.session_generation,p.id AS proxy_id,p.url_ciphertext,p.check_status FROM accounts a JOIN proxy_assignments pa ON pa.account_id=a.id "
-                "JOIN proxies p ON p.id=pa.proxy_id WHERE a.group_id=? AND a.status IN ('active','needs_membership') AND p.enabled=1 AND p.check_status!='failed' ORDER BY a.id",
+                "JOIN proxies p ON p.id=pa.proxy_id WHERE a.group_id=? AND a.status IN ('active','needs_membership') AND p.enabled=1 AND p.check_status='healthy' ORDER BY a.id",
                 (group_id,),
             ).fetchall()
         if group is None:
@@ -1308,24 +1335,49 @@ def create_app(
             close_failed = False
             failure_code = None
             failure = None
+            failure_response: HTTPException | None = None
             stage = "resolve_group" if index == 0 else "check_membership"
             lock = account_session_locks.for_account(account["id"])
             await lock.acquire()
+
+            def validate_current_proxy() -> None:
+                with db() as connection:
+                    current = connection.execute(
+                        "SELECT a.status,pa.proxy_id,p.enabled,p.check_status FROM accounts a "
+                        "JOIN proxy_assignments pa ON pa.account_id=a.id JOIN proxies p ON p.id=pa.proxy_id "
+                        "WHERE a.id=? AND a.group_id=?",
+                        (account["id"], group_id),
+                    ).fetchone()
+                if (current is None or current["status"] not in {"active", "needs_membership"}
+                        or int(current["proxy_id"]) != int(account["proxy_id"])):
+                    raise HTTPException(409, "account_assignment_changed_during_verification")
+                if not current["enabled"]:
+                    raise HTTPException(409, "proxy_disabled")
+                if current["check_status"] != "healthy":
+                    raise HTTPException(409, "proxy_check_failed" if current["check_status"] == "failed" else "proxy_not_healthy")
+
             try:
+                validate_current_proxy()
                 proxy = SecretBox().decrypt(account["url_ciphertext"])
                 vault = EncryptedSessionFile(account["id"], generation=account["session_generation"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
                 adapter = PyMaxAdapter.create(phone=account["phone"], work_dir="", session_name="", proxy=proxy, session_vault=vault)
+                validate_current_proxy()
                 await adapter.connect()
                 if index == 0:
+                    validate_current_proxy()
                     resolved = await adapter.resolve_group_by_link(group["invite_link"])
                     chat_id = str(getattr(resolved, "id", "") or getattr(resolved, "chat_id", ""))
                     if not chat_id:
                         raise RuntimeError("group_resolution_failed")
                     stage = "check_membership"
+                validate_current_proxy()
                 states[int(account["id"])] = member_proof(await adapter.get_chat(int(chat_id)), chat_id)
             except Exception as exc:
-                failure_code = "group_resolution_failed" if stage == "resolve_group" else "membership_check_unavailable"
-                failure = exc
+                if isinstance(exc, HTTPException):
+                    failure_response = exc
+                else:
+                    failure_code = "group_resolution_failed" if stage == "resolve_group" else "membership_check_unavailable"
+                    failure = exc
             finally:
                 if adapter is not None:
                     try:
@@ -1336,6 +1388,8 @@ def create_app(
                 lock.release()
             if close_failed:
                 raise HTTPException(503, "session_save_failed")
+            if failure_response is not None:
+                raise failure_response
             if failure_code:
                 raise HTTPException(503, failure_code) from failure
             used_proxy_ids[int(account["id"])] = int(account["proxy_id"])
@@ -1351,9 +1405,9 @@ def create_app(
                     "JOIN proxies p ON p.id=pa.proxy_id WHERE a.id=? AND a.group_id=?",
                     (account_id, group_id),
                 ).fetchone()
-                if assignment is not None and assignment["check_status"] == "failed":
+                if assignment is not None and assignment["check_status"] != "healthy":
                     connection.rollback()
-                    raise HTTPException(409, "proxy_check_failed")
+                    raise HTTPException(409, "proxy_check_failed" if assignment["check_status"] == "failed" else "proxy_not_healthy")
                 if (assignment is None or assignment["status"] not in {"active", "needs_membership"}
                         or not assignment["enabled"] or int(assignment["proxy_id"]) != used_proxy_ids[account_id]):
                     connection.rollback()
@@ -1421,6 +1475,7 @@ def create_app(
             if unresolved is not None:
                 connection.rollback()
                 raise HTTPException(409, "account_has_unresolved_operation")
+            connection.execute("UPDATE accounts SET status='removing' WHERE id=?", (account_id,))
             session_ids = [row[0] for row in connection.execute(
                 "SELECT id FROM onboarding_sessions WHERE account_id=? AND state NOT IN ('completed','failed','expired','cancelled')",
                 (account_id,),
@@ -1443,33 +1498,34 @@ def create_app(
             with db() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 current = connection.execute("SELECT id,status FROM accounts WHERE id=?", (account_id,)).fetchone()
-                if current is None or current["status"] == "removed":
+                if current is None:
                     connection.rollback()
                     raise HTTPException(404, "account_not_found")
-                unresolved = connection.execute(
-                    "SELECT 1 FROM operations WHERE account_id=? AND status IN ('in_flight','unknown') LIMIT 1",
-                    (account_id,),
-                ).fetchone()
-                if unresolved is not None:
-                    connection.rollback()
-                    raise HTTPException(409, "account_has_unresolved_operation")
-                now = datetime.now(timezone.utc).isoformat()
-                connection.execute(
-                    "UPDATE accounts SET status='removed',max_user_id=NULL,session_generation=session_generation+1 WHERE id=?",
-                    (account_id,),
-                )
-                connection.execute("DELETE FROM proxy_assignments WHERE account_id=?", (account_id,))
-                connection.execute(
-                    "UPDATE weekly_slots SET status='blocked',error_code='account_removed',updated_at=? "
-                    "WHERE account_id=? AND status='queued'",
-                    (now, account_id),
-                )
-                connection.execute(
-                    "INSERT INTO audit_log(created_at,kind,group_id,account_id,detail) "
-                    "SELECT ?, 'account_removed', group_id, id, '{}' FROM accounts WHERE id=?",
-                    (now, account_id),
-                )
-                connection.commit()
+                if current["status"] != "removed":
+                    unresolved = connection.execute(
+                        "SELECT 1 FROM operations WHERE account_id=? AND status IN ('in_flight','unknown') LIMIT 1",
+                        (account_id,),
+                    ).fetchone()
+                    if unresolved is not None:
+                        connection.rollback()
+                        raise HTTPException(409, "account_has_unresolved_operation")
+                    now = datetime.now(timezone.utc).isoformat()
+                    connection.execute(
+                        "UPDATE accounts SET status='removed',max_user_id=NULL,session_generation=session_generation+1 WHERE id=?",
+                        (account_id,),
+                    )
+                    connection.execute("DELETE FROM proxy_assignments WHERE account_id=?", (account_id,))
+                    connection.execute(
+                        "UPDATE weekly_slots SET status='blocked',error_code='account_removed',updated_at=? "
+                        "WHERE account_id=? AND status='queued'",
+                        (now, account_id),
+                    )
+                    connection.execute(
+                        "INSERT INTO audit_log(created_at,kind,group_id,account_id,detail) "
+                        "SELECT ?, 'account_removed', group_id, id, '{}' FROM accounts WHERE id=?",
+                        (now, account_id),
+                    )
+                    connection.commit()
         finally:
             lock.release()
         for session_id in session_ids:
