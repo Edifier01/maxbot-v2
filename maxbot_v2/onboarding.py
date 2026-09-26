@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import sqlite3
 from datetime import datetime, timezone
 from time import perf_counter
@@ -13,15 +12,6 @@ from .scheduling import assign_proxy
 
 
 logger = logging.getLogger(__name__)
-
-
-def normalize_russian_phone(value: str) -> str:
-    digits = re.sub(r"\D", "", str(value))
-    if len(digits) == 11 and digits[0] in "78":
-        digits = digits[1:]
-    if len(digits) != 10:
-        raise ValueError("invalid_russian_phone")
-    return "+7" + digits
 
 
 class WebCodeAuthFlow:
@@ -136,34 +126,6 @@ def member_proof(chat: Any, expected_chat_id: str) -> bool:
         return actual_id == str(expected_chat_id) and status in {"member", "active", "joined", "in"} and joined > 0
     except (TypeError, ValueError):
         return False
-
-
-async def join_group_and_confirm_membership(
-    adapter: Any,
-    invite_link: str,
-    chat_id: str,
-    *,
-    before_action: Callable[[], None] | None = None,
-) -> tuple[bool, str | None]:
-    join_error = None
-    if before_action is not None:
-        before_action()
-    try:
-        joined = await adapter.join_group(invite_link)
-        joined_id = str(getattr(joined, "id", "") or getattr(joined, "chat_id", ""))
-        if joined_id and joined_id != str(chat_id):
-            return False, "group_destination_mismatch"
-    except Exception:
-        join_error = "auto_join_failed"
-    if before_action is not None:
-        before_action()
-    try:
-        chat = await adapter.get_chat(int(chat_id))
-    except Exception:
-        return False, join_error or "membership_check_unavailable"
-    if member_proof(chat, str(chat_id)):
-        return True, None
-    return False, join_error or "membership_not_confirmed"
 
 
 def prepare_account(connection: sqlite3.Connection, *, group_id: int, phone: str, full_name: str) -> tuple[int, int]:

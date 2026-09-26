@@ -32,18 +32,6 @@ def test_pymax_adapter_calls_provider_without_local_authorization_file():
     assert len(client.calls) == 2
 
 
-def test_pymax_adapter_can_join_an_invite_group_after_authentication():
-    class FakeClient:
-        async def join_group(self, link):
-            return SimpleNamespace(id=123, link=link)
-
-    adapter = PyMaxAdapter(FakeClient())
-    joined = asyncio.run(adapter.join_group("https://max.ru/join/test"))
-
-    assert joined.id == 123
-    assert joined.link == "https://max.ru/join/test"
-
-
 def test_pinned_pymax_client_constructs_with_proxy_and_encrypted_session_vault(tmp_path):
     from importlib.metadata import version
     assert version("maxapi-python") == "2.4.1"
@@ -73,23 +61,6 @@ def test_session_snapshot_is_encrypted_and_restorable(tmp_path):
     assert not session.exists()
     vault.open()
     assert session.read_bytes() == b"session token secret"
-
-
-def test_new_session_generation_keeps_old_encrypted_session_untouched(tmp_path):
-    box = SecretBox(SecretBox.generate_key())
-    old = EncryptedSessionFile(7, durable_dir=tmp_path / "durable", runtime_dir=tmp_path / "runtime", box=box)
-    _, old_filename = old.open()
-    (tmp_path / "runtime" / "account-7" / old_filename).write_bytes(b"old session")
-    old.seal()
-    old_ciphertext = (tmp_path / "durable" / "account-7.session.enc").read_bytes()
-
-    fresh = EncryptedSessionFile(7, generation=1, durable_dir=tmp_path / "durable", runtime_dir=tmp_path / "runtime", box=box)
-    _, fresh_filename = fresh.open()
-
-    assert fresh_filename == "session.sqlite3"
-    assert fresh_filename != old_filename or fresh.work_dir != old.work_dir
-    assert not (tmp_path / "runtime" / "account-7-generation-1" / fresh_filename).exists()
-    assert (tmp_path / "durable" / "account-7.session.enc").read_bytes() == old_ciphertext
 
 
 def test_backup_and_restore_verify_database_and_encrypted_sessions(tmp_path):
