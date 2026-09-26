@@ -8,7 +8,7 @@
 <body>
   <main id="login" class="login card">
     <div class="brand"><span class="mark">M</span><div><strong>MAXBOT</strong><small>Личный кабинет</small></div></div>
-    <h1>Вход</h1><form id="login-form"><label>Логин<input name="username" autocomplete="username" value="edifier8989" required></label><label>Пароль<input name="password" type="password" autocomplete="current-password" required></label><button>Войти</button><p class="error" id="login-error"></p></form>
+    <h1>Вход</h1><form id="login-form" autocomplete="off"><label>Логин<input name="username" autocomplete="off" required></label><label>Пароль<input name="password" type="password" autocomplete="off" required></label><button>Войти</button><p class="error" id="login-error"></p></form>
   </main>
   <div id="app" hidden>
     <aside><div class="brand"><span class="mark">M</span><div><strong>MAXBOT</strong><small>Панель управления</small></div></div><nav><button data-view="overview" class="active">Обзор</button><button data-view="groups">Группы, номера и прокси</button><button data-view="messages">Пул сообщений</button><button data-view="settings">Настройки</button><button data-view="log">Журнал</button></nav><button id="logout" class="quiet">Выйти</button></aside>
