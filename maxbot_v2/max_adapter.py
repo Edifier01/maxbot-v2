@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
+import tempfile
 from typing import Any
 
 from .session_vault import EncryptedSessionFile
@@ -26,10 +27,79 @@ class NoInteractiveAuthFlow:
         raise RuntimeError("saved_session_required")
 
 
+class _DirectCodeRequestDone(Exception):
+    """Stop the temporary PyMax connection immediately after requesting one code."""
+
+
+class _DirectCodeRequestFlow:
+    def __init__(self):
+        self.response: Any = None
+
+    async def authenticate(self, app: Any):
+        self.response = await app.api.auth.request_code(str(app.config.phone))
+        raise _DirectCodeRequestDone()
+
+
 class PyMaxAdapter:
     """The single boundary for PyMax calls."""
     def __init__(self, client: Any):
         self.client = client
+
+    @classmethod
+    async def request_code_direct(cls, *, phone: str, assigned_proxy: str):
+        """Request one OTP directly, without creating or persisting a MAX session.
+
+        The assigned proxy is required as a fail-closed precondition, but this
+        one request deliberately uses a separate temporary client without it.
+        All subsequent authorization calls use the regular proxied adapter.
+        """
+        if not assigned_proxy or not assigned_proxy.strip():
+            raise AdapterUnavailable("proxy_assignment_required")
+        try:
+            installed = version("maxapi-python")
+            if installed != REQUIRED_PYMAX_VERSION:
+                raise AdapterUnavailable("pymax_version_mismatch")
+            from pymax import Client, ExtraConfig
+        except AdapterUnavailable:
+            raise
+        except Exception as exc:
+            raise AdapterUnavailable("pymax_unavailable") from exc
+
+        auth_flow = _DirectCodeRequestFlow()
+        client = None
+        with tempfile.TemporaryDirectory(prefix="maxbot-direct-auth-") as work_dir:
+            try:
+                extra = ExtraConfig(
+                    proxy=None,
+                    reconnect=False,
+                    relogin=False,
+                    persist_session=False,
+                    telemetry=False,
+                    log_level="WARNING",
+                )
+                client = Client(
+                    phone=phone,
+                    work_dir=work_dir,
+                    session_name="request-code.db",
+                    extra_config=extra,
+                    auth_flow=auth_flow,
+                )
+                try:
+                    await client.connect()
+                except _DirectCodeRequestDone:
+                    pass
+            finally:
+                if client is not None:
+                    try:
+                        await client.close()
+                    except Exception:
+                        # A cleanup failure must not expose provider details or
+                        # turn an already accepted request into an automatic retry.
+                        pass
+
+        if auth_flow.response is None:
+            raise RuntimeError("request_code_response_missing")
+        return auth_flow.response
 
     @classmethod
     def create(cls, *, phone: str, work_dir: str, session_name: str, proxy: str | None, auth_flow: Any = None, session_vault: EncryptedSessionFile | None = None):
