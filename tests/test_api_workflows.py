@@ -12,6 +12,9 @@ from maxbot_v2.scheduling import create_weekly_slot
 
 def owner_client(tmp_path, monkeypatch):
     monkeypatch.setenv("DATA_ENCRYPTION_KEY", SecretBox.generate_key())
+    monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: {"62.109.20.186"})
+    monkeypatch.setattr("maxbot_v2.egress.host_addresses", lambda: {"62.109.20.186"})
+    monkeypatch.setattr("maxbot_v2.egress.probe_address", lambda _address: True)
     app = create_app(
         db_path=tmp_path / "app.db",
         data_dir=tmp_path / "data",
@@ -21,20 +24,20 @@ def owner_client(tmp_path, monkeypatch):
         secure_cookies=False,
     )
     client = TestClient(app, base_url="https://test.local")
+    db = connect(app.state.database)
+    db.execute("INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.186',1,1)")
+    db.close()
     response = client.post("/api/auth/login", json={"username": "edifier8989", "password": "correct horse battery"})
     assert response.status_code == 200
     return client, response.json()["csrf_token"]
 
 
-def test_group_proxy_invite_and_message_pool_are_owner_scoped(tmp_path, monkeypatch):
+def test_group_invite_and_message_pool_are_owner_scoped(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"})
     assert group.status_code == 201
     group_id = group.json()["id"]
-    proxy = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy 1", "url": "socks5://user:pass@127.0.0.1:1080"})
-    assert proxy.status_code == 201
-    assert "pass" not in proxy.text
     issued = client.post(f"/api/groups/{group_id}/onboarding-link?days=7", headers=headers, json={})
     assert issued.status_code == 200
     guest_url = issued.json()["url"]
@@ -86,11 +89,10 @@ def test_start_normalizes_phone_and_reuses_legacy_pending_account(tmp_path, monk
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"})
     db = connect(client.app.state.database)
     legacy_id = db.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,'+89991234567','Иван','pending')", (group_id,)).lastrowid
-    proxy_id = db.execute("SELECT id FROM proxies WHERE group_id=?", (group_id,)).fetchone()[0]
-    db.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (legacy_id, proxy_id))
+    ip_id = db.execute("SELECT id FROM server_ips WHERE address='62.109.20.186'").fetchone()[0]
+    db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (legacy_id, ip_id))
     db.close()
     token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
     start = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "8 (999) 123-45-67"})
@@ -115,7 +117,6 @@ def test_expired_membership_attempt_allows_new_start(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"})
     token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
     first = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "89991234567"})
     db = connect(client.app.state.database)
@@ -126,13 +127,10 @@ def test_expired_membership_attempt_allows_new_start(tmp_path, monkeypatch):
     assert second.json()["session_id"] != first.json()["session_id"]
 
 
-def test_invalid_body_does_not_echo_password_or_proxy_url(tmp_path, monkeypatch):
+def test_invalid_body_does_not_echo_password(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     secret = "synthetic-secret-" * 30
     response = client.post("/api/auth/login", json={"username": "owner", "password": secret})
-    assert response.status_code == 422
-    assert secret not in response.text
-    response = client.post("/api/groups/1/proxies", headers={"X-CSRF-Token": csrf}, json={"url": secret, "label": "test"})
     assert response.status_code == 422
     assert secret not in response.text
 
@@ -148,24 +146,63 @@ def test_account_list_does_not_return_full_phone(tmp_path, monkeypatch):
     assert "+79991234567" not in str(account)
 
 
-def test_wrong_group_proxy_delete_does_not_block_another_groups_slots(tmp_path, monkeypatch):
+def test_refresh_finds_new_ip_disabled_and_owner_can_reassign(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
-    first = client.post("/api/groups", headers=headers, json={"name": "Первая", "invite_link": "https://max.ru/join/first"}).json()["id"]
-    second = client.post("/api/groups", headers=headers, json={"name": "Вторая", "invite_link": "https://max.ru/join/second"}).json()["id"]
-    proxy_id = client.post(f"/api/groups/{second}/proxies", headers=headers, json={"label": "test", "url": "socks5://127.0.0.1:1080"}).json()["id"]
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
     db = connect(client.app.state.database)
-    account = db.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,'+79991234567','Иван','active')", (second,)).lastrowid
-    db.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account, proxy_id))
-    replace_message_pool(db, ["test"])
-    create_weekly_slot(db, account_id=account, week_start="2099-01-05", scheduled_date="2099-01-05", text="test")
-    response = client.delete(f"/api/groups/{first}/proxies/{proxy_id}", headers=headers)
-    assert response.status_code == 404
-    assert db.execute("SELECT status FROM weekly_slots WHERE account_id=?", (account,)).fetchone()[0] == "queued"
+    account_id = db.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,'+79991234567','Иван','active')", (group_id,)).lastrowid
+    ip_id = db.execute("SELECT id FROM server_ips WHERE address='62.109.20.186'").fetchone()[0]
+    db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
+    db.close()
+
+    from maxbot_v2.egress import refresh_ips
+    monkeypatch.setattr("maxbot_v2.app.refresh_ips", lambda db: refresh_ips(db, addresses={"62.109.20.186", "62.109.20.187"}, probe=lambda _address: True))
+    monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: {"62.109.20.186", "62.109.20.187"})
+    rows = client.post("/api/ips/refresh", headers=headers).json()
+    new = next(row for row in rows if row["address"] == "62.109.20.187")
+    assert new["enabled"] == 0 and new["available"] == 1
+    assert client.post(f"/api/accounts/{account_id}/ip", headers=headers, json={"ip_id": new["id"]}).status_code == 422
+    assert client.patch(f"/api/ips/{new['id']}", headers=headers, json={"enabled": True}).status_code == 200
+    assert client.post(f"/api/accounts/{account_id}/ip", headers=headers, json={"ip_id": new["id"]}).json() == {"ip_id": new["id"], "ip_address": "62.109.20.187"}
+    assert client.get(f"/api/groups/{group_id}/accounts").json()[0]["ip_id"] == new["id"]
+
+
+def test_legacy_proxy_api_removed_without_dropping_historical_rows(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    db = connect(client.app.state.database)
+    db.execute("INSERT INTO proxies(group_id,url_ciphertext,label,position) VALUES(?,'ciphertext','archived',0)", (group_id,))
+    db.close()
+    assert client.get(f"/api/groups/{group_id}/proxies").status_code == 404
+    db = connect(client.app.state.database)
+    assert db.execute("SELECT COUNT(*) FROM proxies").fetchone()[0] == 1
     db.close()
 
 
-def test_membership_check_stops_when_assigned_proxy_changes_during_connect(tmp_path, monkeypatch):
+def test_reenabling_ip_resumes_future_blocked_slot(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    db = connect(client.app.state.database)
+    account_id = db.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,'+79991234567','Иван','active')", (group_id,)).lastrowid
+    ip_id = db.execute("SELECT id FROM server_ips WHERE address='62.109.20.186'").fetchone()[0]
+    db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
+    version = replace_message_pool(db, ["test"])
+    create_weekly_slot(db, account_id=account_id, week_start="2099-01-05", scheduled_date="2099-01-05", text="test", message_version_id=version)
+    db.close()
+    assert client.patch(f"/api/ips/{ip_id}", headers=headers, json={"enabled": False}).status_code == 200
+    db = connect(client.app.state.database)
+    assert db.execute("SELECT status FROM weekly_slots WHERE account_id=?", (account_id,)).fetchone()[0] == "blocked"
+    db.close()
+    assert client.patch(f"/api/ips/{ip_id}", headers=headers, json={"enabled": True}).status_code == 200
+    db = connect(client.app.state.database)
+    assert db.execute("SELECT status FROM weekly_slots WHERE account_id=?", (account_id,)).fetchone()[0] == "queued"
+    db.close()
+
+
+def test_membership_check_stops_when_assigned_ip_changes_during_connect(tmp_path, monkeypatch):
     real_create_task = asyncio.create_task
 
     def skip(coro, **_kwargs):
@@ -178,7 +215,6 @@ def test_membership_check_stops_when_assigned_proxy_changes_during_connect(tmp_p
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    proxy_id = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"}).json()["id"]
     token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
     session_id = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79991234567"}).json()["session_id"]
     db = connect(client.app.state.database)
@@ -189,11 +225,11 @@ def test_membership_check_stops_when_assigned_proxy_changes_during_connect(tmp_p
     class FakeAdapter:
         async def connect(self):
             db = connect(client.app.state.database)
-            db.execute("UPDATE proxies SET url_ciphertext=? WHERE id=?", (SecretBox().encrypt("socks5://127.0.0.1:1081"), proxy_id))
+            db.execute("UPDATE server_ips SET enabled=0 WHERE address='62.109.20.186'")
             db.close()
 
         async def get_chat(self, _chat_id):
-            raise AssertionError("stale proxy must not be used")
+            raise AssertionError("stale IP must not be used")
 
         async def close(self):
             return None
@@ -278,27 +314,6 @@ def test_owner_link_status_ignores_failed_attempts_in_stored_use_count(tmp_path,
     assert response.json()["url"] == issued["url"]
 
 
-def test_bulk_proxy_import_is_atomic_and_reports_line_numbers(tmp_path, monkeypatch):
-    client, csrf = owner_client(tmp_path, monkeypatch)
-    headers = {"X-CSRF-Token": csrf}
-    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-
-    invalid = client.post(f"/api/groups/{group_id}/proxies/bulk", headers=headers, json={"lines": "http://127.0.0.1:1080\nnot-a-proxy"})
-    assert invalid.status_code == 422
-    assert "2" in str(invalid.json()["detail"])
-    assert client.get(f"/api/groups/{group_id}/proxies").json() == []
-
-    duplicate = client.post(f"/api/groups/{group_id}/proxies/bulk", headers=headers, json={"lines": "http://127.0.0.1:1080\n\nhttp://127.0.0.1:1080"})
-    assert duplicate.status_code == 422
-    assert "1" in str(duplicate.json()["detail"]) and "3" in str(duplicate.json()["detail"])
-    assert client.get(f"/api/groups/{group_id}/proxies").json() == []
-
-    added = client.post(f"/api/groups/{group_id}/proxies/bulk", headers=headers, json={"lines": "socks5://127.0.0.1:1080\n\nhttp://127.0.0.1:1081"})
-    assert added.status_code == 201
-    rows = client.get(f"/api/groups/{group_id}/proxies").json()
-    assert [row["label"] for row in rows] == ["Прокси 1", "Прокси 2"]
-
-
 def test_editing_group_does_not_resume_a_stopped_group(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
@@ -311,40 +326,24 @@ def test_editing_group_does_not_resume_a_stopped_group(tmp_path, monkeypatch):
     assert response.json()["active"] == 0
 
 
-def test_proxy_counts_separate_available_proxies_and_accounts_use_proxy_id(tmp_path, monkeypatch):
+def test_disabled_ip_keeps_account_assignment_but_blocks_verification(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    proxy = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "main", "url": "socks5://127.0.0.1:1080"}).json()
+    ip_id = client.get("/api/ips").json()[0]["id"]
     connection = connect(client.app.state.database)
     try:
         connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'active')", (group_id, "+79990000000", "Иван"))
         account_id = connection.execute("SELECT id FROM accounts WHERE phone=?", ("+79990000000",)).fetchone()[0]
-        connection.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy["id"]))
-        connection.execute("UPDATE proxies SET enabled=0 WHERE id=?", (proxy["id"],))
+        connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
     finally:
         connection.close()
 
-    group = next(row for row in client.get("/api/groups").json() if row["id"] == group_id)
-    assert group["proxy_count"] == 1
-    assert group["available_proxy_count"] == 0
-    assert client.get(f"/api/groups/{group_id}/accounts").json()[0]["proxy_id"] == proxy["id"]
-
-
-def test_proxy_url_only_accepts_schemes_supported_by_pinned_pymax(tmp_path, monkeypatch):
-    client, csrf = owner_client(tmp_path, monkeypatch)
-    headers = {"X-CSRF-Token": csrf}
-    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    for scheme in ("https", "socks5h"):
-        response = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": scheme, "url": f"{scheme}://127.0.0.1:1080"})
-        assert response.status_code == 422
-        assert response.json()["detail"] == "invalid_proxy_url"
-    for url in ("socks5://127.0.0.1", "http://127.0.0.1:99999"):
-        response = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "invalid", "url": url})
-        assert response.status_code == 422
-    for scheme in ("http", "socks5"):
-        response = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": scheme, "url": f"{scheme}://127.0.0.1:1080"})
-        assert response.status_code == 201
+    assert client.patch(f"/api/ips/{ip_id}", headers=headers, json={"enabled": False}).status_code == 200
+    account = client.get(f"/api/groups/{group_id}/accounts").json()[0]
+    assert account["ip_id"] == ip_id
+    assert account["ip_enabled"] == 0
+    assert client.get("/api/groups").json()[0]["verifiable_account_count"] == 0
 
 
 def test_group_invite_link_must_be_resolvable_by_pinned_pymax(tmp_path, monkeypatch):
@@ -378,7 +377,6 @@ def test_guest_auth_start_is_not_blocked_by_local_authorization_file(tmp_path, m
     assert no_csrf.status_code == 403
     csrf = client.cookies.get("owner_csrf")
     group = client.post("/api/groups", headers={"X-CSRF-Token": csrf}, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"})
-    client.post(f"/api/groups/{group.json()['id']}/proxies", headers={"X-CSRF-Token": csrf}, json={"label": "test", "url": "socks5://127.0.0.1:1080"})
     link = client.post(f"/api/groups/{group.json()['id']}/onboarding-link", headers={"X-CSRF-Token": csrf}, json={}).json()["url"]
     token = link.rsplit("/", 1)[1]
     response = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
@@ -403,7 +401,6 @@ def test_failed_first_onboarding_can_retry_same_phone_with_one_use_link(tmp_path
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"})
     link = client.post(f"/api/groups/{group_id}/onboarding-link?max_uses=1", headers=headers, json={}).json()["url"]
     token = link.rsplit("/", 1)[1]
     first = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
@@ -451,45 +448,6 @@ def test_unknown_operation_can_be_manually_resolved_without_duplicate_count(tmp_
         connection.close()
 
 
-def test_broken_proxy_does_not_leave_a_stuck_onboarding_attempt(tmp_path, monkeypatch):
-    async def no_worker_sync(_manager):
-        return None
-
-    real_create_task = asyncio.create_task
-
-    def skip_onboarding_network(coroutine, **kwargs):
-        if coroutine.cr_code.co_name == "run_onboarding_auth":
-            coroutine.close()
-            return None
-        return real_create_task(coroutine, **kwargs)
-
-    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", skip_onboarding_network)
-    monkeypatch.setattr("maxbot_v2.workers.GroupWorkerManager._sync_group_workers", no_worker_sync)
-    client, csrf = owner_client(tmp_path, monkeypatch)
-    headers = {"X-CSRF-Token": csrf}
-    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    proxy = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"}).json()
-    link = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={}).json()["url"]
-    token = link.rsplit("/", 1)[1]
-    connection = connect(client.app.state.database)
-    try:
-        connection.execute("UPDATE proxies SET url_ciphertext='broken-ciphertext' WHERE id=?", (proxy["id"],))
-    finally:
-        connection.close()
-
-    failed = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
-    assert failed.status_code == 503
-    connection = connect(client.app.state.database)
-    try:
-        assert connection.execute("SELECT COUNT(*) FROM onboarding_sessions WHERE state='starting'").fetchone()[0] == 0
-        connection.execute("UPDATE proxies SET url_ciphertext=? WHERE id=?", (SecretBox().encrypt("socks5://127.0.0.1:1080"), proxy["id"]))
-    finally:
-        connection.close()
-
-    retried = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
-    assert retried.status_code == 200
-
-
 def test_rotating_guest_link_cancels_existing_attempt_and_rejects_otp(tmp_path, monkeypatch):
     async def no_worker_sync(_manager):
         return None
@@ -507,7 +465,6 @@ def test_rotating_guest_link_cancels_existing_attempt_and_rejects_otp(tmp_path, 
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"})
     token = client.post(f"/api/groups/{group_id}/onboarding-link", headers=headers, json={}).json()["url"].rsplit("/", 1)[1]
     started = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"}).json()
     session_id = started["session_id"]
@@ -547,12 +504,12 @@ def test_destination_verification_includes_accounts_needing_membership(tmp_path,
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    proxy = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"}).json()
+    ip_id = client.get("/api/ips").json()[0]["id"]
     connection = connect(client.app.state.database)
     try:
         connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'needs_membership')", (group_id, "+79990000000", "Иван"))
         account_id = connection.execute("SELECT id FROM accounts WHERE phone='+79990000000'").fetchone()[0]
-        connection.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy["id"]))
+        connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
     finally:
         connection.close()
 
@@ -563,24 +520,24 @@ def test_destination_verification_includes_accounts_needing_membership(tmp_path,
     assert client.get(f"/api/groups/{group_id}/accounts").json()[0]["status"] == "active"
 
 
-def test_destination_verification_stops_when_proxy_changes_during_connect(tmp_path, monkeypatch):
+def test_destination_verification_stops_when_ip_changes_during_connect(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    proxy_id = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"}).json()["id"]
+    ip_id = client.get("/api/ips").json()[0]["id"]
     connection = connect(client.app.state.database)
     account_id = connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'needs_membership')", (group_id, "+79990000000", "Иван")).lastrowid
-    connection.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy_id))
+    connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
     connection.close()
 
     class FakeAdapter:
         async def connect(self):
             connection = connect(client.app.state.database)
-            connection.execute("UPDATE proxies SET url_ciphertext=? WHERE id=?", (SecretBox().encrypt("socks5://127.0.0.2:1080"), proxy_id))
+            connection.execute("UPDATE server_ips SET enabled=0 WHERE id=?", (ip_id,))
             connection.close()
 
         async def resolve_group_by_link(self, _link):
-            raise AssertionError("must not use an obsolete proxy")
+            raise AssertionError("must not use an obsolete IP")
 
         async def close(self):
             return None
@@ -591,11 +548,11 @@ def test_destination_verification_stops_when_proxy_changes_during_connect(tmp_pa
     assert response.json()["detail"] == "account_assignment_changed_during_verification"
 
 
-def test_destination_verification_button_requires_an_assigned_enabled_proxy(tmp_path, monkeypatch):
+def test_destination_verification_button_requires_an_assigned_enabled_ip(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    proxy = client.post(f"/api/groups/{group_id}/proxies", headers=headers, json={"label": "proxy", "url": "socks5://127.0.0.1:1080"}).json()
+    ip_id = client.get("/api/ips").json()[0]["id"]
     connection = connect(client.app.state.database)
     try:
         connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'needs_membership')", (group_id, "+79990000000", "Иван"))
@@ -606,8 +563,8 @@ def test_destination_verification_button_requires_an_assigned_enabled_proxy(tmp_
     assert client.get("/api/groups").json()[0]["verifiable_account_count"] == 0
     connection = connect(client.app.state.database)
     try:
-        connection.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy["id"]))
-        connection.execute("UPDATE proxies SET enabled=0 WHERE id=?", (proxy["id"],))
+        connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
+        connection.execute("UPDATE server_ips SET enabled=0 WHERE id=?", (ip_id,))
     finally:
         connection.close()
     assert client.get("/api/groups").json()[0]["verifiable_account_count"] == 0

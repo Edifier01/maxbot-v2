@@ -11,13 +11,13 @@ def test_ten_groups_one_hundred_accounts_and_unique_worker_leases(tmp_path):
     path = tmp_path / "scale.sqlite3"
     db = connect(path)
     initialize(db)
+    db.execute("INSERT INTO server_ips(id,address,enabled,available) VALUES(1,'62.109.20.186',1,1)")
     for group_id in range(1, 11):
         db.execute("INSERT INTO groups(id,name,invite_link,chat_id) VALUES(?,?,?,?)", (group_id, f"Group {group_id}", f"https://max.ru/invite/{group_id}", str(group_id)))
-        db.execute("INSERT INTO proxies(group_id,url_ciphertext,label,position) VALUES(?,?,?,0)", (group_id, "encrypted", f"proxy-{group_id}"))
         for account_index in range(10):
             account_id = (group_id - 1) * 10 + account_index + 1
             db.execute("INSERT INTO accounts(id,group_id,phone,full_name,status) VALUES(?,?,?,?, 'active')", (account_id, group_id, f"+700000{account_id:05d}", f"Account {account_id}"))
-            db.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, group_id))
+            db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,1)", (account_id,))
     replace_message_pool(db, [f"message-{i}" for i in range(100)])
     db.execute("UPDATE settings SET value='00:00-00:01' WHERE key='send_windows_weekday'")
     db.execute("UPDATE settings SET value='00:00-00:01' WHERE key='send_windows_weekend'")

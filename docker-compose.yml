@@ -8,8 +8,8 @@ services:
     env_file:
       - path: .env
         required: false
-    expose: ["8000"]
-    # Only Caddy can reach this un-published app port. Caddy sanitizes incoming forwarded headers before proxying.
+    network_mode: host
+    # Uvicorn listens on host loopback; only Caddy can reach port 8000.
     volumes:
       - maxbot_data:/data
     tmpfs:
@@ -30,7 +30,7 @@ services:
         condition: service_healthy
     environment:
       DOMAIN: ${DOMAIN:-localhost}
-    ports: ["80:80", "443:443", "443:443/udp"]
+    network_mode: host
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

@@ -41,6 +41,18 @@ CREATE TABLE IF NOT EXISTS proxy_assignments (
     proxy_id INTEGER NOT NULL REFERENCES proxies(id),
     assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS server_ips (
+    id INTEGER PRIMARY KEY,
+    address TEXT NOT NULL UNIQUE,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    available INTEGER NOT NULL DEFAULT 0,
+    last_checked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS ip_assignments (
+    account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    ip_id INTEGER NOT NULL REFERENCES server_ips(id),
+    assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS owner_sessions (
     token_hash TEXT PRIMARY KEY,
     csrf_hash TEXT NOT NULL,
@@ -180,6 +192,9 @@ def initialize(connection: sqlite3.Connection) -> None:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(accounts)")}
     if "session_generation" not in columns:
         connection.execute("ALTER TABLE accounts ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 0")
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(onboarding_sessions)")}
+    if "ip_id" not in columns:
+        connection.execute("ALTER TABLE onboarding_sessions ADD COLUMN ip_id INTEGER REFERENCES server_ips(id)")
     connection.executemany(
         "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", DEFAULTS.items()
     )

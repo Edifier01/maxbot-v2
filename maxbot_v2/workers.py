@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from .db import connect
 from .planning import prepare_week
 from .sender import DispatchPaused, KnownPreSendFailure, Sender
+from .egress import host_addresses, allowed_address
 
 
 logger = logging.getLogger(__name__)
@@ -150,8 +151,8 @@ class GroupWorkerManager:
                         self.provider_factory,
                         slot,
                         lambda connected=None: DispatchPaused("app_stopping") if self._stopping.is_set() else _dispatch_block(
-                            db, slot, expected_proxy_id=getattr(connected, "proxy_id", None),
-                            expected_proxy_ciphertext=getattr(connected, "proxy_ciphertext", None),
+                            db, slot, expected_ip_id=getattr(connected, "ip_id", None),
+                            expected_address=getattr(connected, "address", None),
                         ),
                     )
                     await Sender(db, provider, sleep=self.sleep).send_slot(slot["slot_id"], chat_id=int(slot["chat_id"]))
@@ -180,16 +181,16 @@ def _dispatch_block(
     db: sqlite3.Connection,
     slot: sqlite3.Row,
     *,
-    expected_proxy_id: int | None = None,
-    expected_proxy_ciphertext: str | None = None,
+    expected_ip_id: int | None = None,
+    expected_address: str | None = None,
 ) -> DispatchPaused | None:
     settings = dict(db.execute("SELECT key,value FROM settings WHERE key IN ('global_stop','timezone','send_windows_weekday','send_windows_weekend')").fetchall())
     if settings.get("global_stop") == "1":
         return DispatchPaused("run_stopped")
     group = db.execute("SELECT active,chat_id FROM groups WHERE id=?", (slot["group_id"],)).fetchone()
     account = db.execute(
-        "SELECT a.status,pa.proxy_id,p.enabled,p.url_ciphertext FROM accounts a LEFT JOIN proxy_assignments pa ON pa.account_id=a.id "
-        "LEFT JOIN proxies p ON p.id=pa.proxy_id WHERE a.id=?",
+        "SELECT a.status,ia.ip_id,p.address,p.enabled,p.available FROM accounts a LEFT JOIN ip_assignments ia ON ia.account_id=a.id "
+        "LEFT JOIN server_ips p ON p.id=ia.ip_id WHERE a.id=?",
         (slot["account_id"],),
     ).fetchone()
     current_slot = db.execute("SELECT status,scheduled_date FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],)).fetchone()
@@ -197,12 +198,12 @@ def _dispatch_block(
         return DispatchPaused("group_destination_changed")
     if account is None or account["status"] != "active":
         return DispatchPaused("account_not_active", blocked=True)
-    if account["enabled"] != 1:
-        return DispatchPaused("proxy_assignment_unavailable", blocked=True)
-    if expected_proxy_id is not None and int(account["proxy_id"] or 0) != int(expected_proxy_id):
-        return DispatchPaused("proxy_assignment_changed")
-    if expected_proxy_ciphertext is not None and account["url_ciphertext"] != expected_proxy_ciphertext:
-        return DispatchPaused("proxy_assignment_changed")
+    if account["enabled"] != 1 or account["available"] != 1 or not account["address"] or not allowed_address(account["address"]) or account["address"] not in host_addresses():
+        return DispatchPaused("ip_assignment_unavailable", blocked=True)
+    if expected_ip_id is not None and int(account["ip_id"] or 0) != int(expected_ip_id):
+        return DispatchPaused("ip_assignment_changed")
+    if expected_address is not None and account["address"] != expected_address:
+        return DispatchPaused("ip_assignment_changed")
     if current_slot is None or current_slot["status"] != "in_flight":
         return DispatchPaused("slot_no_longer_queued")
     now = datetime.now(ZoneInfo(settings.get("timezone", "Europe/Moscow")))

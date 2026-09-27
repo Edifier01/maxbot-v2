@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
-import logging
-import tempfile
 from typing import Any
 
+from .egress import allowed_address
 from .session_vault import EncryptedSessionFile
 
 
@@ -28,25 +30,11 @@ class NoInteractiveAuthFlow:
         raise RuntimeError("saved_session_required")
 
 
-class _DirectCodeRequestDone(Exception):
-    """Stop the temporary PyMax connection immediately after requesting one code."""
-
-
-class _DirectCodeRequestFlow:
-    def __init__(self):
-        self.response: Any = None
-
-    async def authenticate(self, app: Any):
-        self.response = await app.api.auth.request_code(str(app.config.phone))
-        raise _DirectCodeRequestDone()
-
-
 class PyMaxAdapter:
-    """The single boundary for PyMax calls."""
+    """The single boundary for PyMax calls and per-account source-IP binding."""
 
     @staticmethod
     def _silence_pymax_logs() -> None:
-        # PyMax ERROR/WARNING messages can contain remote text and proxy URLs.
         provider_logger = logging.getLogger("pymax")
         provider_logger.handlers[:] = [logging.NullHandler()]
         provider_logger.propagate = False
@@ -55,83 +43,71 @@ class PyMaxAdapter:
         self.client = client
 
     @classmethod
-    async def request_code_direct(cls, *, phone: str, assigned_proxy: str):
-        """Request one OTP directly, without creating or persisting a MAX session.
-
-        The assigned proxy is required as a fail-closed precondition, but this
-        one request deliberately uses a separate temporary client without it.
-        All subsequent authorization calls use the regular proxied adapter.
-        """
-        if not assigned_proxy or not assigned_proxy.strip():
-            raise AdapterUnavailable("proxy_assignment_required")
+    def create(
+        cls, *, phone: str, source_ip: str, session_vault: EncryptedSessionFile | None = None,
+        code_provider: Any = None, password_provider: Any = None,
+    ):
+        if not allowed_address(source_ip):
+            raise AdapterUnavailable("ip_assignment_required")
+        if session_vault is None:
+            raise AdapterUnavailable("encrypted_session_vault_required")
         try:
-            installed = version("maxapi-python")
-            if installed != REQUIRED_PYMAX_VERSION:
+            if version("maxapi-python") != REQUIRED_PYMAX_VERSION:
                 raise AdapterUnavailable("pymax_version_mismatch")
             from pymax import Client, ExtraConfig
+            from pymax.connection import ConnectionManager
+            from pymax.connection.readers import TCPReader
+            from pymax.protocol.tcp import TcpProtocol
+            from pymax.protocol.tcp.framing import TcpPacketFramer
+            from pymax.transport.tcp import TCPTransport
         except AdapterUnavailable:
             raise
         except Exception as exc:
             raise AdapterUnavailable("pymax_unavailable") from exc
 
-        auth_flow = _DirectCodeRequestFlow()
-        client = None
-        with tempfile.TemporaryDirectory(prefix="maxbot-direct-auth-") as work_dir:
-            try:
-                extra = ExtraConfig(
-                    proxy=None,
-                    reconnect=False,
-                    relogin=False,
-                    persist_session=False,
-                    telemetry=False,
-                    log_level="WARNING",
+        class BoundTransport(TCPTransport):
+            async def connect(self):
+                if self._proxy:
+                    raise AdapterUnavailable("proxy_route_forbidden")
+                self._reader, self._writer = await asyncio.open_connection(
+                    self._host, self._port, ssl=self._ssl_ctx if self._use_ssl else None,
+                    family=socket.AF_INET, local_addr=(source_ip, 0),
                 )
-                client = Client(
-                    phone=phone,
-                    work_dir=work_dir,
-                    session_name="request-code.db",
-                    extra_config=extra,
-                    auth_flow=auth_flow,
+                actual = self._writer.get_extra_info("sockname")
+                if actual is None or actual[0] != source_ip:
+                    await self.close()
+                    raise AdapterUnavailable("source_ip_mismatch")
+
+        class BoundClient(Client):
+            def _build_connection(self):
+                transport = BoundTransport(
+                    host=self.extra_config.host, port=self.extra_config.port,
+                    use_ssl=self.extra_config.use_ssl, proxy=None,
                 )
-                cls._silence_pymax_logs()
-                try:
-                    await client.connect()
-                except _DirectCodeRequestDone:
-                    pass
-            finally:
-                if client is not None:
-                    try:
-                        await client.close()
-                    except Exception:
-                        # A cleanup failure must not expose provider details or
-                        # turn an already accepted request into an automatic retry.
-                        pass
+                return ConnectionManager(
+                    reader=TCPReader(transport=transport, framer=TcpPacketFramer()),
+                    transport=transport, protocol=TcpProtocol(),
+                )
 
-        if auth_flow.response is None:
-            raise RuntimeError("request_code_response_missing")
-        return auth_flow.response
-
-    @classmethod
-    def create(cls, *, phone: str, work_dir: str, session_name: str, proxy: str | None, auth_flow: Any = None, session_vault: EncryptedSessionFile | None = None):
-        runtime_opened = False
+        opened = False
         try:
-            if not proxy:
-                raise AdapterUnavailable("proxy_assignment_required")
-            if session_vault is None:
-                raise AdapterUnavailable("encrypted_session_vault_required")
-            installed = version("maxapi-python")
-            if installed != REQUIRED_PYMAX_VERSION:
-                raise AdapterUnavailable("pymax_version_mismatch")
-            from pymax import Client, ExtraConfig
-            extra = ExtraConfig(proxy=proxy, reconnect=False, relogin=False, persist_session=True, telemetry=False, log_level="WARNING")
-            runtime_opened = True
+            extra = ExtraConfig(
+                proxy=None, reconnect=False, relogin=False, persist_session=True,
+                telemetry=False, log_level="WARNING", password_max_attempts=5,
+            )
             work_dir, session_name = session_vault.open()
-            client = Client(phone=phone, work_dir=work_dir, session_name=session_name, extra_config=extra, auth_flow=auth_flow or NoInteractiveAuthFlow())
+            opened = True
+            auth_kwargs = (
+                {"sms_code_provider": code_provider, "password_provider": password_provider}
+                if code_provider is not None else {"auth_flow": NoInteractiveAuthFlow()}
+            )
+            client = BoundClient(
+                phone=phone, work_dir=work_dir, session_name=session_name,
+                extra_config=extra, **auth_kwargs,
+            )
             cls._silence_pymax_logs()
-        except AdapterUnavailable:
-            raise
         except Exception as exc:
-            if runtime_opened:
+            if opened:
                 try:
                     session_vault.discard_working_copy()
                 except OSError as cleanup_error:
@@ -151,7 +127,6 @@ class PyMaxAdapter:
         return await self.client.join_group(link)
 
     async def get_chat(self, chat_id: int):
-        # PyMax 2.4.1 otherwise returns the chat cached during login.
         self.client._app.api.chats._remove_cached_chat(chat_id)
         return await self.client.get_chat(chat_id)
 

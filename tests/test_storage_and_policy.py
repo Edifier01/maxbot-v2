@@ -58,13 +58,13 @@ def test_pymax_adapter_joins_and_refreshes_membership_from_provider():
     assert member_proof(asyncio.run(adapter.get_chat(7001)), "7001")
 
 
-def test_pinned_pymax_client_constructs_with_proxy_and_encrypted_session_vault(tmp_path):
+def test_pinned_pymax_client_constructs_with_bound_ip_and_encrypted_session_vault(tmp_path):
     from importlib.metadata import version
     assert version("maxapi-python") == "2.4.1"
     vault = EncryptedSessionFile(10, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
-    adapter = PyMaxAdapter.create(phone="+70000000000", work_dir="", session_name="", proxy="socks5://127.0.0.1:1080", session_vault=vault)
+    adapter = PyMaxAdapter.create(phone="+70000000000", source_ip="62.109.20.186", session_vault=vault)
     assert adapter.client is not None
-    assert adapter.client.extra_config.proxy == "socks5://127.0.0.1:1080"
+    assert adapter.client.extra_config.proxy is None
     assert not (tmp_path / "encrypted" / "account-10.session.enc").exists()
 
 
@@ -83,7 +83,7 @@ def test_failed_pymax_constructor_removes_decrypted_session(tmp_path, monkeypatc
 
     monkeypatch.setattr(pymax, "Client", fail_constructor)
     try:
-        PyMaxAdapter.create(phone="+79990000000", work_dir="", session_name="", proxy="socks5://127.0.0.1:1080", session_vault=vault)
+        PyMaxAdapter.create(phone="+79990000000", source_ip="62.109.20.186", session_vault=vault)
     except Exception:
         pass
     else:
@@ -94,7 +94,7 @@ def test_failed_pymax_constructor_removes_decrypted_session(tmp_path, monkeypatc
 
 def test_pymax_error_text_is_not_emitted_to_ordinary_logs(tmp_path, caplog):
     vault = EncryptedSessionFile(10, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
-    PyMaxAdapter.create(phone="+79990000000", work_dir="", session_name="", proxy="socks5://127.0.0.1:1080", session_vault=vault)
+    PyMaxAdapter.create(phone="+79990000000", source_ip="62.109.20.186", session_vault=vault)
     with caplog.at_level(logging.ERROR, logger="pymax.audit"):
         logging.getLogger("pymax.audit").error("synthetic-private-provider-response")
     assert "synthetic-private-provider-response" not in caplog.text

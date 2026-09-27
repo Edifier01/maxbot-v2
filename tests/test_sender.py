@@ -185,10 +185,11 @@ def test_session_close_failure_after_send_is_marked_unknown(caplog):
     assert "error_class=OSError" in caplog.text
 
 
-def test_manual_run_check_does_not_depend_on_autostart_setting():
+def test_manual_run_check_does_not_depend_on_autostart_setting(monkeypatch):
     db = seeded_db()
-    db.execute("INSERT INTO proxies(group_id,url_ciphertext,label,position) VALUES(1,'ciphertext','proxy',0)")
-    db.execute("INSERT INTO proxy_assignments(account_id,proxy_id) VALUES(1,1)")
+    monkeypatch.setattr("maxbot_v2.workers.host_addresses", lambda: {"62.109.20.186"})
+    db.execute("INSERT INTO server_ips(id,address,enabled,available) VALUES(1,'62.109.20.186',1,1)")
+    db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(1,1)")
     db.execute("UPDATE settings SET value='UTC' WHERE key='timezone'")
     db.execute("UPDATE settings SET value='00:00-23:59' WHERE key IN ('send_windows_weekday','send_windows_weekend')")
     db.execute("UPDATE settings SET value='0' WHERE key IN ('auto_run','global_stop')")
@@ -200,11 +201,11 @@ def test_manual_run_check_does_not_depend_on_autostart_setting():
     slot = db.execute("SELECT s.*,g.chat_id FROM weekly_slots s JOIN groups g ON g.id=s.group_id").fetchone()
 
     assert _dispatch_block(db, slot) is None
-    changed = _dispatch_block(db, slot, expected_proxy_id=999)
-    assert changed.code == "proxy_assignment_changed"
+    changed = _dispatch_block(db, slot, expected_ip_id=999)
+    assert changed.code == "ip_assignment_changed"
     assert changed.blocked is False
-    db.execute("UPDATE proxies SET url_ciphertext='rotated' WHERE id=1")
-    rotated = _dispatch_block(db, slot, expected_proxy_id=1, expected_proxy_ciphertext="ciphertext")
-    assert rotated.code == "proxy_assignment_changed"
+    db.execute("UPDATE server_ips SET enabled=0 WHERE id=1")
+    rotated = _dispatch_block(db, slot, expected_ip_id=1, expected_address="62.109.20.186")
+    assert rotated.code == "ip_assignment_unavailable"
     db.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
     assert _dispatch_block(db, slot).code == "run_stopped"

@@ -11,7 +11,7 @@
     <h1>Вход</h1><form id="login-form" autocomplete="off"><label>Логин<input name="username" autocomplete="off" required></label><label>Пароль<input name="password" type="password" autocomplete="off" required></label><button>Войти</button><p class="error" id="login-error"></p></form>
   </main>
   <div id="app" hidden>
-    <aside><div class="brand"><span class="mark">M</span><div><strong>MAXBOT</strong><small>Панель управления</small></div></div><nav><button data-view="overview" class="active">Обзор</button><button data-view="groups">Группы, номера и прокси</button><button data-view="messages">Пул сообщений</button><button data-view="settings">Настройки</button><button data-view="log">Журнал</button></nav><button id="logout" class="quiet">Выйти</button></aside>
+    <aside><div class="brand"><span class="mark">M</span><div><strong>MAXBOT</strong><small>Панель управления</small></div></div><nav><button data-view="overview" class="active">Обзор</button><button data-view="groups">Группы, номера и IP</button><button data-view="messages">Пул сообщений</button><button data-view="settings">Настройки</button><button data-view="log">Журнал</button></nav><button id="logout" class="quiet">Выйти</button></aside>
     <section class="content"><header><div><small>MAXBOT v2</small><h1 id="title">Обзор</h1></div><div class="header-actions"><span id="run-state" class="pill"></span><button id="run-toggle" class="secondary">Остановить</button></div></header><div id="notice" role="status"></div><div id="view"></div></section>
   </div>
   <script src="/static/app.js" defer></script>
