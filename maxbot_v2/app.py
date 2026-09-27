@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import sys
 import time
 from time import perf_counter
 from contextlib import asynccontextmanager, contextmanager
@@ -32,7 +33,12 @@ from .session_lock import AccountSessionLocks
 
 
 logger = logging.getLogger(__name__)
-logging.getLogger("maxbot_v2").setLevel(os.getenv("APP_LOG_LEVEL", "INFO").upper())
+project_logger = logging.getLogger("maxbot_v2")
+project_logger.setLevel(os.getenv("APP_LOG_LEVEL", "INFO").upper())
+diagnostic_handler = logging.StreamHandler(sys.__stderr__ or sys.stderr)
+diagnostic_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+project_logger.addHandler(diagnostic_handler)
+project_logger.propagate = False
 
 
 class LoginBody(BaseModel):
