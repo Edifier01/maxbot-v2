@@ -110,14 +110,7 @@ async def run(account_id: int) -> None:
     print(f"PREFLIGHT_OK account_id={target.account_id} proxy_id={target.proxy_id}", flush=True)
     print("REQUEST_START route=direct count=1", flush=True)
     response = await request_and_hold(target)
-    print(
-        "HOLD_FINISHED "
-        f"token_present={bool(getattr(response, 'token', None))} "
-        f"code_length={getattr(response, 'code_length', None)} "
-        f"request_count_left={getattr(response, 'request_count_left', None)} "
-        f"request_timeout={getattr(response, 'request_max_duration', None)}",
-        flush=True,
-    )
+    print(f"HOLD_FINISHED response_present={response is not None}", flush=True)
 
 
 def main() -> int:
@@ -127,7 +120,12 @@ def main() -> int:
     try:
         asyncio.run(run(args.account_id))
     except Exception as exc:
-        print(f"PROBE_FAILED error_class={type(exc).__name__}", flush=True)
+        error_code = (
+            " error_code=direct_probe_connection_closed"
+            if type(exc) is RuntimeError and str(exc) == "direct_probe_connection_closed"
+            else ""
+        )
+        print(f"PROBE_FAILED{error_code} error_class={type(exc).__name__}", flush=True)
         return 1
     return 0
 

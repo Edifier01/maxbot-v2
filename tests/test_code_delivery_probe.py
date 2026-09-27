@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -54,3 +55,31 @@ def test_probe_holds_after_one_response_then_releases(monkeypatch):
 
     asyncio.run(check())
     assert calls == [("+79990000000", "socks5://127.0.0.1:1080")]
+
+
+def test_probe_reports_closed_transport_without_exposing_exception_text(monkeypatch, capsys):
+    async def fail(_account_id):
+        raise RuntimeError("direct_probe_connection_closed")
+
+    monkeypatch.setattr(probe, "run", fail)
+    monkeypatch.setattr(sys, "argv", ["probe_code_delivery", "82"])
+    assert probe.main() == 1
+    assert capsys.readouterr().out == "PROBE_FAILED error_code=direct_probe_connection_closed error_class=RuntimeError\n"
+
+
+def test_probe_final_output_contains_only_safe_response_presence(monkeypatch, capsys):
+    target = probe.Target(82, 1, "+79990000000", "socks5://127.0.0.1:1080")
+    response = SimpleNamespace(token="private-token", code_length=6, request_count_left=10)
+    monkeypatch.setattr(probe, "load_target", lambda _path, _account_id: target)
+    async def no_network(_proxy_url):
+        pass
+    async def fake_request(_target):
+        return response
+    monkeypatch.setattr(probe, "check_proxy", no_network)
+    monkeypatch.setattr(probe, "request_and_hold", fake_request)
+    asyncio.run(probe.run(82))
+    output = capsys.readouterr().out
+    assert "HOLD_FINISHED response_present=True" in output
+    assert "private-token" not in output
+    assert "code_length" not in output
+    assert "request_count_left" not in output
