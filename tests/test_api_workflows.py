@@ -1,6 +1,8 @@
 import asyncio
 
 import bcrypt
+from pymax.exceptions import ApiError
+from pymax.protocol.enums import Opcode
 from fastapi.testclient import TestClient
 
 from maxbot_v2.app import create_app
@@ -262,14 +264,9 @@ def test_rejected_pymax_session_requires_a_new_generation_on_manual_retry(tmp_pa
     group_id = client.post("/api/groups", headers={"X-CSRF-Token": csrf}, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
     token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
 
-    class ApiError(Exception):
-        error = "FAIL_LOGIN_TOKEN"
-        message = "safe synthetic provider error"
-        opcode = type("Opcode", (), {"name": "LOGIN"})()
-
     class FakeAdapter:
         async def connect(self):
-            raise ApiError("FAIL_LOGIN_TOKEN")
+            raise ApiError(opcode=Opcode.LOGIN.value, error="FAIL_LOGIN_TOKEN", message="safe synthetic provider error")
 
         async def close(self):
             return None
@@ -296,8 +293,6 @@ def test_rejected_pymax_session_requires_a_new_generation_on_manual_retry(tmp_pa
 
 
 def test_active_account_with_rejected_saved_session_can_start_manual_reauth(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
     coroutines = []
     real_create_task = asyncio.create_task
 
@@ -321,14 +316,9 @@ def test_active_account_with_rejected_saved_session_can_start_manual_reauth(tmp_
     connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
     connection.close()
 
-    class ApiError(Exception):
-        error = "FAIL_LOGIN_TOKEN"
-        message = "safe synthetic provider error"
-        opcode = SimpleNamespace(name="LOGIN")
-
     class RejectedAdapter:
         async def connect(self):
-            raise ApiError("FAIL_LOGIN_TOKEN")
+            raise ApiError(opcode=Opcode.LOGIN.value, error="FAIL_LOGIN_TOKEN", message="safe synthetic provider error")
 
         async def close(self):
             return None

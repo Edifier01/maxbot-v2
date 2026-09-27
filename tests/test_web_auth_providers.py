@@ -40,6 +40,25 @@ def test_password_provider_marks_verification_before_returning_password():
     assert updates == ["waiting_password", "verifying_password"]
 
 
+def test_repeated_password_challenge_explains_previous_rejection():
+    hints = []
+    provider = WebAuthProviders(lambda state, hint: hints.append((state, hint)), session_id="test", account_id=1, ip_id=2)
+
+    async def submit(value):
+        task = asyncio.create_task(provider.get_password())
+        await asyncio.sleep(0)
+        provider.passwords.put_nowait(value)
+        assert await task == value
+
+    async def run():
+        await submit("incorrect-password")
+        await submit("correct-password")
+
+    asyncio.run(run())
+    assert hints[0] == ("waiting_password", "Введите пароль для входа MAX.")
+    assert hints[2] == ("waiting_password", "MAX не принял предыдущий облачный пароль. Введите пароль ещё раз.")
+
+
 def test_sms_flow_requests_one_code_then_retries_password_after_two_factor_challenge():
     updates = []
     provider = WebAuthProviders(lambda state, _hint: updates.append(state), session_id="test", account_id=1, ip_id=2)

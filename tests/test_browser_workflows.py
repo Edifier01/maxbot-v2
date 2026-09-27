@@ -278,7 +278,7 @@ def test_guest_2fa_retries_wrong_password_without_requesting_a_new_otp(page: Pag
         time.sleep(0.01)
     assert local_app.password_attempts == [False]
     assert flow.waiting_for == "password"
-    expect(guest.get_by_role("heading", name="Облачный пароль MAX")).to_be_visible(timeout=5000)
+    expect(guest.locator("#password-hint")).to_contain_text("не принял предыдущий облачный пароль", timeout=5000)
     guest.get_by_label("Пароль").fill("correct-two-factor")
     guest.get_by_role("button", name="Продолжить").click()
     expect(guest.locator("#flow")).to_contain_text("Номер подключён", timeout=5000)

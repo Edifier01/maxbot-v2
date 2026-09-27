@@ -137,11 +137,12 @@ class PyMaxAdapter:
     @staticmethod
     def is_invalid_saved_session_error(exc: Exception) -> bool:
         """Match PyMax 2.4.1's explicit invalid-login-token condition safely."""
-        if type(exc).__name__ != "ApiError":
+        try:
+            from pymax.exceptions import ApiError
+            from pymax.protocol.enums import Opcode
+        except Exception:
             return False
-        opcode = getattr(exc, "opcode", None)
-        opcode_name = str(getattr(opcode, "name", "")).upper()
-        if opcode_name != "LOGIN":
+        if not isinstance(exc, ApiError) or getattr(exc, "opcode", None) != Opcode.LOGIN:
             return False
         values = {str(getattr(exc, "error", "")), str(getattr(exc, "message", ""))}
         return bool(values & {"FAIL_LOGIN_TOKEN", "FAIL_LOGOUT_ALL"})

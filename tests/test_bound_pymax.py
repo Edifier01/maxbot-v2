@@ -2,6 +2,8 @@ import asyncio
 from importlib.metadata import version
 
 import pytest
+from pymax.exceptions import ApiError
+from pymax.protocol.enums import Opcode
 
 from maxbot_v2.crypto import SecretBox
 from maxbot_v2.max_adapter import AdapterUnavailable, PyMaxAdapter
@@ -101,13 +103,7 @@ def test_bound_transport_checks_current_account_route_before_each_write(tmp_path
 
 
 def test_only_explicit_pymax_login_token_errors_require_a_new_session_generation():
-    class ApiError(Exception):
-        def __init__(self, error, opcode_name="LOGIN"):
-            self.error = error
-            self.message = "safe provider message"
-            self.opcode = type("Opcode", (), {"name": opcode_name})()
-
-    assert PyMaxAdapter.is_invalid_saved_session_error(ApiError("FAIL_LOGIN_TOKEN"))
-    assert PyMaxAdapter.is_invalid_saved_session_error(ApiError("FAIL_LOGOUT_ALL"))
-    assert not PyMaxAdapter.is_invalid_saved_session_error(ApiError("FAIL_LOGIN_TOKEN", "SEND_CODE"))
+    assert PyMaxAdapter.is_invalid_saved_session_error(ApiError(opcode=Opcode.LOGIN.value, error="FAIL_LOGIN_TOKEN"))
+    assert PyMaxAdapter.is_invalid_saved_session_error(ApiError(opcode=Opcode.LOGIN.value, error="FAIL_LOGOUT_ALL"))
+    assert not PyMaxAdapter.is_invalid_saved_session_error(ApiError(opcode=Opcode.PROFILE.value, error="FAIL_LOGIN_TOKEN"))
     assert not PyMaxAdapter.is_invalid_saved_session_error(RuntimeError("network timeout"))
