@@ -83,6 +83,7 @@ def test_direct_code_request_stops_before_pymax_without_assigned_proxy(monkeypat
 def test_direct_code_request_holds_connection_after_one_response(monkeypatch):
     calls = []
     response_seen = asyncio.Event()
+    adapter_response_seen = asyncio.Event()
     release_hold = asyncio.Event()
     clients = []
     response = SimpleNamespace(token="private-token", code_length=6)
@@ -123,9 +124,11 @@ def test_direct_code_request_holds_connection_after_one_response(monkeypatch):
                 phone="+79990000000",
                 assigned_proxy="socks5://127.0.0.1:1080",
                 hold_open_until=release_hold,
+                response_received=adapter_response_seen,
             )
         )
         await asyncio.wait_for(response_seen.wait(), timeout=1)
+        await asyncio.wait_for(adapter_response_seen.wait(), timeout=1)
         await asyncio.sleep(0)
         assert calls == [("request_code", "+79990000000")]
         assert len(clients) == 1 and not clients[0].closed
