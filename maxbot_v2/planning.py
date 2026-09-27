@@ -19,7 +19,7 @@ def prepare_week(connection: sqlite3.Connection, today: date) -> int:
     try:
         pool = MessagePool(connection)
         accounts = connection.execute(
-            "SELECT a.id FROM accounts a JOIN groups g ON g.id=a.group_id WHERE a.status='active' AND a.auth_state='authenticated' AND g.active=1 ORDER BY a.group_id,a.id"
+            "SELECT a.id FROM accounts a JOIN groups g ON g.id=a.group_id WHERE a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 ORDER BY a.group_id,a.id"
         ).fetchall()
         for row in accounts:
             account_id = int(row["id"])

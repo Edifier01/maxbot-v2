@@ -31,6 +31,8 @@ from .session_vault import EncryptedSessionFile
 from .workers import GroupWorkerManager, _inside_window
 from .sender import DispatchPaused, recover_in_flight
 from .session_lock import AccountSessionLocks
+from .lifecycle import phone_fingerprint
+from .session_vault import SessionDeletionError, SessionSnapshotUnavailable
 
 
 logger = logging.getLogger(__name__)
@@ -149,6 +151,269 @@ def create_app(
             raise ValueError("account_not_found")
         return EncryptedSessionFile(account_id, generation=row["session_generation"], durable_dir=sessions_dir, runtime_dir=runtime_dir)
 
+    def record_onboarding_event(
+        *, attempt_id: str, group_id: int, account_id: int, ip_id: int | None,
+        stage: str, result: str, duration_ms: int | None = None,
+        response_received: bool = False, error_class: str | None = None,
+    ) -> None:
+        """Persist safe diagnostics only; never include provider data or user inputs."""
+        try:
+            with db() as connection:
+                connection.execute(
+                    "INSERT INTO onboarding_events(created_at,attempt_id,group_id,account_id,ip_id,stage,result,"
+                    "duration_ms,response_received,error_class) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (datetime.now(timezone.utc).isoformat(), attempt_id, group_id, account_id, ip_id,
+                     stage[:48], result[:48], duration_ms, int(response_received),
+                     error_class[:80] if error_class else None),
+                )
+        except Exception as exc:
+            logger.warning("onboarding_event_persist_failed account_id=%s error_class=%s", account_id, type(exc).__name__)
+
+    def fingerprint_for(phone: str) -> str:
+        return phone_fingerprint(normalize_russian_phone(phone), os.getenv("DATA_ENCRYPTION_KEY", ""))
+
+    def mark_deletion_pending(account_id: int, reason: str) -> None:
+        stamp = datetime.now(timezone.utc).isoformat()
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            account = connection.execute("SELECT phone,phone_fingerprint,lifecycle FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if account is None or account["lifecycle"] != "active":
+                connection.commit()
+                return
+            fingerprint = account["phone_fingerprint"] or fingerprint_for(account["phone"])
+            connection.execute(
+                "UPDATE accounts SET lifecycle='delete_pending',deletion_reason=?,phone_fingerprint=? WHERE id=?",
+                (reason, fingerprint, account_id),
+            )
+            connection.execute("DELETE FROM ip_assignments WHERE account_id=?", (account_id,))
+            connection.execute(
+                "UPDATE weekly_slots SET status='blocked',error_code='account_deleted',updated_at=? "
+                "WHERE account_id=? AND status='queued'",
+                (stamp, account_id),
+            )
+            connection.commit()
+
+    def finish_deletion(account_id: int, *, reason: str) -> bool:
+        """Delete every generation, then scrub the account while preserving linked history."""
+        with db() as connection:
+            account = connection.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if account is None or account["lifecycle"] == "deleted":
+                return True
+            if account["lifecycle"] != "delete_pending":
+                raise ValueError("account_deletion_not_pending")
+            unresolved = connection.execute(
+                "SELECT 1 FROM operations WHERE account_id=? AND status IN ('in_flight','unknown') LIMIT 1",
+                (account_id,),
+            ).fetchone()
+            if unresolved:
+                return False
+            group_id = int(account["group_id"])
+            ip_id = connection.execute("SELECT ip_id FROM ip_assignments WHERE account_id=?", (account_id,)).fetchone()
+            if ip_id is None:
+                ip_id = connection.execute(
+                    "SELECT ip_id FROM onboarding_events WHERE account_id=? AND ip_id IS NOT NULL "
+                    "ORDER BY id DESC LIMIT 1",
+                    (account_id,),
+                ).fetchone()
+        cleanup_started = perf_counter()
+        try:
+            session_vault_for(account_id).delete_all_generations()
+        except (SessionDeletionError, OSError):
+            record_onboarding_event(
+                attempt_id=f"account-{account_id}", group_id=group_id, account_id=account_id,
+                ip_id=int(ip_id[0]) if ip_id else None, stage="session_cleanup", result="failed",
+                duration_ms=int((perf_counter() - cleanup_started) * 1000),
+                error_class="SessionDeletionError",
+            )
+            return False
+        stamp = datetime.now(timezone.utc).isoformat()
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            account = connection.execute("SELECT lifecycle,phone_fingerprint FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if account is None or account["lifecycle"] == "deleted":
+                connection.commit()
+                return True
+            unresolved = connection.execute(
+                "SELECT 1 FROM operations WHERE account_id=? AND status IN ('in_flight','unknown') LIMIT 1",
+                (account_id,),
+            ).fetchone()
+            if unresolved:
+                connection.rollback()
+                return False
+            connection.execute("DELETE FROM ip_assignments WHERE account_id=?", (account_id,))
+            connection.execute(
+                "UPDATE onboarding_sessions SET phone=NULL,full_name=NULL WHERE account_id=?",
+                (account_id,),
+            )
+            connection.execute(
+                "UPDATE accounts SET lifecycle='deleted',deletion_reason=?,phone=?,full_name='',max_user_id=NULL,"
+                "auth_state='unverified',status='pending' WHERE id=?",
+                (reason, f"deleted:{account_id}", account_id),
+            )
+            connection.execute(
+                "INSERT INTO audit_log(created_at,kind,group_id,account_id,detail) VALUES(?,?,?,?, '{}')",
+                (stamp, "account_deleted", group_id, account_id),
+            )
+            connection.commit()
+        record_onboarding_event(
+            attempt_id=f"account-{account_id}", group_id=group_id, account_id=account_id,
+            ip_id=int(ip_id[0]) if ip_id else None, stage="session_cleanup", result="deleted",
+            duration_ms=int((perf_counter() - cleanup_started) * 1000),
+        )
+        return True
+
+    def prepare_unverified_account_cleanup(attempt_id: str, account_id: int) -> bool:
+        with db() as connection:
+            account = connection.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+            tracked_attempt = connection.execute(
+                "SELECT 1 FROM onboarding_events WHERE attempt_id=? AND stage='attempt' AND result='started' LIMIT 1",
+                (attempt_id,),
+            ).fetchone()
+        # Do not turn this lifecycle change into a bulk cleanup of legacy records.
+        if tracked_attempt is None:
+            return False
+        if account is None or account["lifecycle"] != "active":
+            return False
+        if account["ever_authenticated"] or account["auth_state"] in {"authenticated", "reauth_required"}:
+            return False
+        with db() as connection:
+            attempt_ip = connection.execute(
+                "SELECT ip_id FROM onboarding_sessions WHERE id=?", (attempt_id,),
+            ).fetchone()
+        ip_id = int(attempt_ip[0]) if attempt_ip is not None and attempt_ip[0] is not None else None
+        try:
+            has_token = session_vault_for(account_id).has_saved_session_token_any_generation()
+        except SessionSnapshotUnavailable:
+            record_onboarding_event(
+                attempt_id=attempt_id, group_id=int(account["group_id"]), account_id=account_id,
+                ip_id=ip_id, stage="session_cleanup", result="deferred", error_class="SessionSnapshotUnavailable",
+            )
+            return False
+        if has_token:
+            record_onboarding_event(
+                attempt_id=attempt_id, group_id=int(account["group_id"]), account_id=account_id,
+                ip_id=ip_id, stage="session_cleanup", result="deferred", error_class="TokenBackedUnverifiedSession",
+            )
+            return False
+        mark_deletion_pending(account_id, "failed_attempt")
+        return True
+
+    def delete_unverified_after_terminal_attempt(attempt_id: str, account_id: int) -> None:
+        with db() as connection:
+            account = connection.execute("SELECT lifecycle,deletion_reason FROM accounts WHERE id=?", (account_id,)).fetchone()
+        if account is None:
+            return
+        if account["lifecycle"] == "delete_pending" and account["deletion_reason"] == "failed_attempt":
+            if not finish_deletion(account_id, reason="failed_attempt"):
+                logger.warning("onboarding_cleanup_incomplete attempt_id=%s account_id=%s", attempt_id, account_id)
+            return
+        if not prepare_unverified_account_cleanup(attempt_id, account_id):
+            return
+        if not finish_deletion(account_id, reason="failed_attempt"):
+            logger.warning("onboarding_cleanup_incomplete attempt_id=%s account_id=%s", attempt_id, account_id)
+
+    async def clean_previous_unverified_attempt(phone: str, group_id: int) -> None:
+        """Finish an old failed/expired attempt before the same phone can start again."""
+        now = datetime.now(timezone.utc).isoformat()
+        account_id: int | None = None
+        attempt_ids: list[str] = []
+        deferred_error: str | None = None
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            matches = []
+            for candidate in connection.execute(
+                "SELECT id,phone,lifecycle,deletion_reason,ever_authenticated,auth_state,status,session_generation,phone_fingerprint "
+                "FROM accounts WHERE group_id=? AND lifecycle<>'deleted'",
+                (group_id,),
+            ):
+                old_phone = str(candidate["phone"] or "")
+                try:
+                    canonical = normalize_russian_phone(old_phone.removeprefix("+8") if old_phone.startswith("+8") else old_phone)
+                except ValueError:
+                    continue
+                if canonical == phone:
+                    matches.append(candidate)
+            if len(matches) != 1:
+                connection.commit()
+                return
+            account = matches[0]
+            account_id = int(account["id"])
+            if account["lifecycle"] == "delete_pending" and account["deletion_reason"] == "failed_attempt":
+                attempt_ids = [str(row[0]) for row in connection.execute(
+                    "SELECT s.id FROM onboarding_sessions s JOIN onboarding_events e ON e.attempt_id=s.id "
+                    "WHERE s.account_id=? AND e.stage='attempt' AND e.result='started'",
+                    (account_id,),
+                )]
+            elif (account["lifecycle"] != "active" or account["ever_authenticated"]
+                    or account["auth_state"] in {"authenticated", "reauth_required"}):
+                connection.commit()
+                return
+            else:
+                terminal = connection.execute(
+                    "SELECT s.id,s.state FROM onboarding_sessions s JOIN onboarding_events e ON e.attempt_id=s.id "
+                    "WHERE s.account_id=? AND e.stage='attempt' AND e.result='started' "
+                    "AND (s.state IN ('failed','expired','cancelled') OR "
+                    "(s.state NOT IN ('completed','waiting_membership') AND s.expires_at<=?)) ORDER BY s.id",
+                    (account_id, now),
+                ).fetchall()
+                if not terminal:
+                    connection.commit()
+                    return
+                attempt_ids = [str(item["id"]) for item in terminal]
+                try:
+                    has_token = session_vault_for(account_id).has_saved_session_token_any_generation()
+                except SessionSnapshotUnavailable:
+                    has_token = True
+                    deferred_error = "SessionSnapshotUnavailable"
+                if has_token:
+                    connection.commit()
+                    deferred_error = deferred_error or "TokenBackedUnverifiedSession"
+                else:
+                    expired_ids = [str(item["id"]) for item in terminal if item["state"] not in terminal_onboarding_states]
+                    if expired_ids:
+                        connection.execute(
+                            "UPDATE onboarding_sessions SET state='expired',error_code='onboarding_attempt_expired',updated_at=?,phone=NULL,full_name=NULL "
+                            "WHERE id IN (" + ",".join("?" for _ in expired_ids) + ")",
+                            (now, *expired_ids),
+                        )
+                    fingerprint = account["phone_fingerprint"] or fingerprint_for(phone)
+                    connection.execute(
+                        "UPDATE accounts SET lifecycle='delete_pending',deletion_reason='failed_attempt',phone_fingerprint=? "
+                        "WHERE id=? AND lifecycle='active'",
+                        (fingerprint, account_id),
+                    )
+                    connection.execute("DELETE FROM ip_assignments WHERE account_id=?", (account_id,))
+                    connection.execute(
+                        "UPDATE weekly_slots SET status='blocked',error_code='account_deleted',updated_at=? "
+                        "WHERE account_id=? AND status='queued'",
+                        (now, account_id),
+                    )
+                    connection.commit()
+        if deferred_error:
+            with db() as connection:
+                deferred_ip = connection.execute(
+                    "SELECT ip_id FROM ip_assignments WHERE account_id=?", (account_id,),
+                ).fetchone()
+                if deferred_ip is None:
+                    deferred_ip = connection.execute(
+                        "SELECT ip_id FROM onboarding_events WHERE account_id=? AND ip_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+                        (account_id,),
+                    ).fetchone()
+            record_onboarding_event(
+                attempt_id=attempt_ids[-1] if attempt_ids else f"account-{account_id}",
+                group_id=group_id, account_id=int(account_id), ip_id=int(deferred_ip[0]) if deferred_ip else None,
+                stage="session_cleanup", result="deferred", error_class=deferred_error,
+            )
+            raise HTTPException(409, "account_session_review_required")
+        if account_id is None or not attempt_ids:
+            return
+        cancel_onboarding_tasks(attempt_ids)
+        lock = account_session_locks.for_account(account_id)
+        await lock.acquire()
+        lock.release()
+        if not finish_deletion(account_id, reason="failed_attempt"):
+            raise HTTPException(409, "account_deletion_incomplete")
+
     class LockedAdapter:
         def __init__(self, adapter, lock: asyncio.Lock, ip_id: int, address: str):
             self._adapter = adapter
@@ -172,11 +437,11 @@ def create_app(
     async def scheduled_provider(slot):
         with db() as connection:
             row = connection.execute(
-                "SELECT a.phone,a.auth_state,p.id AS ip_id,p.address FROM accounts a JOIN ip_assignments ia ON ia.account_id=a.id "
+                "SELECT a.phone,a.auth_state,a.lifecycle,p.id AS ip_id,p.address FROM accounts a JOIN ip_assignments ia ON ia.account_id=a.id "
                 "JOIN server_ips p ON p.id=ia.ip_id WHERE a.id=? AND p.enabled=1 AND p.available=1",
                 (slot["account_id"],),
             ).fetchone()
-        if row is not None and row["auth_state"] != "authenticated":
+        if row is not None and (row["auth_state"] != "authenticated" or row["lifecycle"] != "active"):
             raise DispatchPaused("account_reauthentication_required", blocked=True)
         if row is None or not allowed_address(row["address"]) or row["address"] not in host_addresses():
             raise DispatchPaused("ip_assignment_unavailable", blocked=True)
@@ -188,11 +453,11 @@ def create_app(
             def require_same_ip() -> None:
                 with db() as connection:
                     current = connection.execute(
-                        "SELECT ia.ip_id,p.address,p.enabled,p.available FROM ip_assignments ia "
-                        "JOIN server_ips p ON p.id=ia.ip_id WHERE ia.account_id=?",
+                        "SELECT ia.ip_id,p.address,p.enabled,p.available,a.lifecycle FROM ip_assignments ia "
+                        "JOIN server_ips p ON p.id=ia.ip_id JOIN accounts a ON a.id=ia.account_id WHERE ia.account_id=?",
                         (slot["account_id"],),
                     ).fetchone()
-                if (current is None or not current["enabled"] or not current["available"]
+                if (current is None or current["lifecycle"] != "active" or not current["enabled"] or not current["available"]
                         or int(current["ip_id"]) != int(row["ip_id"]) or current["address"] != row["address"]
                         or row["address"] not in host_addresses()):
                     raise DispatchPaused("ip_assignment_changed")
@@ -222,10 +487,21 @@ def create_app(
         with db() as connection:
             bootstrap_ips(connection)
             recover_in_flight(connection)
-            connection.execute("UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=? WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership')", (datetime.now(timezone.utc).isoformat(),))
+            connection.execute("UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=?,phone=NULL,full_name=NULL WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership')", (datetime.now(timezone.utc).isoformat(),))
             settings = dict(connection.execute("SELECT key,value FROM settings WHERE key IN ('auto_run','global_stop')").fetchall())
             if settings.get("auto_run") != "1":
                 connection.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
+            pending_deletions = [(int(row[0]), row[1] or "owner_requested") for row in connection.execute("SELECT id,deletion_reason FROM accounts WHERE lifecycle='delete_pending'")]
+            interrupted_attempts = [
+                (str(row[0]), int(row[1])) for row in connection.execute(
+                    "SELECT DISTINCT s.id,s.account_id FROM onboarding_sessions s JOIN onboarding_events e ON e.attempt_id=s.id "
+                    "WHERE s.state IN ('failed','expired','cancelled') AND e.stage='attempt' AND e.result='started'"
+                )
+            ]
+        for account_id, deletion_reason in pending_deletions:
+            finish_deletion(account_id, reason=deletion_reason)
+        for attempt_id, account_id in interrupted_attempts:
+            delete_unverified_after_terminal_attempt(attempt_id, account_id)
         await worker_manager.start()
         try:
             yield
@@ -234,7 +510,7 @@ def create_app(
             tasks = list(app.state.onboarding_tasks.items())
             with db() as connection:
                 connection.execute(
-                    "UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=? "
+                    "UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=?,phone=NULL,full_name=NULL "
                     "WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership')",
                     (datetime.now(timezone.utc).isoformat(),),
                 )
@@ -278,6 +554,7 @@ def create_app(
             stamp = datetime.now(timezone.utc).isoformat()
             connection.execute(
                 "UPDATE onboarding_sessions SET state='cancelled',error_code=?,updated_at=? "
+                ",phone=NULL,full_name=NULL "
                 "WHERE state NOT IN ('completed','failed','expired','cancelled') AND id IN (" + ",".join("?" for _ in ids) + ")",
                 (reason, stamp, *ids),
             )
@@ -311,8 +588,9 @@ def create_app(
                     error = None
                 if error:
                     connection.execute(
-                        "UPDATE onboarding_sessions SET state=?,error_code=?,updated_at=? WHERE id=?",
-                        (state, error, now, session_id),
+                        "UPDATE onboarding_sessions SET state=?,error_code=?,updated_at=?,phone=CASE WHEN ? IN ('failed','expired','cancelled') THEN NULL ELSE phone END,"
+                        "full_name=CASE WHEN ? IN ('failed','expired','cancelled') THEN NULL ELSE full_name END WHERE id=?",
+                        (state, error, now, state, state, session_id),
                     )
             else:
                 error = row["error_code"]
@@ -340,7 +618,7 @@ def create_app(
         stamp = datetime.now(timezone.utc).isoformat()
         with db() as connection:
             connection.execute(
-                "UPDATE onboarding_sessions SET state=?,error_code=?,updated_at=? WHERE id=? "
+                "UPDATE onboarding_sessions SET state=?,error_code=?,updated_at=?,phone=NULL,full_name=NULL WHERE id=? "
                 "AND state NOT IN ('completed','failed','expired','cancelled')",
                 (state, reason, stamp, session_id),
             )
@@ -433,17 +711,24 @@ def create_app(
 
     @app.get("/api/overview")
     def overview(_session: sqlite3.Row = Depends(current_session)) -> dict[str, object]:
+        now = datetime.now(timezone.utc).isoformat()
         with db() as connection:
             counts = {
-                table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                for table in ("groups", "accounts", "weekly_slots")
+                "groups": connection.execute("SELECT COUNT(*) FROM groups").fetchone()[0],
+                "accounts": connection.execute("SELECT COUNT(*) FROM accounts WHERE lifecycle='active' AND ever_authenticated=1").fetchone()[0],
+                "weekly_slots": connection.execute("SELECT COUNT(*) FROM weekly_slots").fetchone()[0],
+                "onboarding_attempts": connection.execute(
+                    "SELECT COUNT(*) FROM onboarding_sessions s JOIN accounts a ON a.id=s.account_id "
+                    "WHERE a.lifecycle='active' AND s.state IN ('starting','requesting_code','waiting_code','verifying_code',"
+                    "'waiting_password','verifying_password','joining_group') AND s.expires_at>?", (now,),
+                ).fetchone()[0],
             }
             settings = dict(connection.execute("SELECT key,value FROM settings").fetchall())
             active_groups = connection.execute("SELECT COUNT(*) FROM groups WHERE active=1").fetchone()[0]
             ready_accounts = connection.execute(
                 "SELECT COUNT(*) FROM accounts a JOIN groups g ON g.id=a.group_id "
                 "JOIN ip_assignments ia ON ia.account_id=a.id JOIN server_ips p ON p.id=ia.ip_id "
-                "WHERE a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL AND p.enabled=1 AND p.available=1"
+                "WHERE a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL AND p.enabled=1 AND p.available=1"
             ).fetchone()[0]
         stopped = settings.get("global_stop") == "1"
         if stopped:
@@ -468,21 +753,28 @@ def create_app(
         now = datetime.now(timezone.utc).isoformat()
         with db() as connection:
             rows = connection.execute(
-                "SELECT g.id,g.name,g.invite_link,g.chat_id,g.active,COUNT(DISTINCT a.id) account_count,"
-                "COUNT(DISTINCT CASE WHEN a.status='active' AND a.auth_state='authenticated' THEN a.id END) connected_account_count,"
-                "COUNT(DISTINCT CASE WHEN a.auth_state='authenticated' THEN a.id END) authenticated_account_count,"
-                "COUNT(DISTINCT CASE WHEN a.auth_state<>'authenticated' AND EXISTS (SELECT 1 FROM onboarding_sessions s "
+                "SELECT g.id,g.name,g.invite_link,g.chat_id,g.active,"
+                "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.ever_authenticated=1 THEN a.id END) account_count,"
+                "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' THEN a.id END) connected_account_count,"
+                "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state='authenticated' THEN a.id END) authenticated_account_count,"
+                "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND EXISTS (SELECT 1 FROM onboarding_sessions s "
+                "WHERE s.account_id=a.id AND s.state IN ('starting','requesting_code','waiting_code','verifying_code',"
+                "'waiting_password','verifying_password','joining_group') AND s.expires_at>?) THEN a.id END) attempt_account_count,"
+                "(SELECT COUNT(*) FROM onboarding_sessions os JOIN accounts oa ON oa.id=os.account_id WHERE oa.group_id=g.id "
+                "AND oa.lifecycle='active' AND os.state IN ('starting','requesting_code','waiting_code','verifying_code',"
+                "'waiting_password','verifying_password','joining_group') AND os.expires_at>?) onboarding_attempt_count,"
+                "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state<>'authenticated' AND EXISTS (SELECT 1 FROM onboarding_sessions s "
                 "WHERE s.account_id=a.id AND s.state IN ('starting','requesting_code','waiting_code','verifying_code',"
                 "'waiting_password','verifying_password','joining_group') AND s.expires_at>?) THEN a.id END) in_progress_account_count,"
-                "COUNT(DISTINCT CASE WHEN a.auth_state<>'authenticated' AND NOT EXISTS (SELECT 1 FROM onboarding_sessions s "
+                "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state<>'authenticated' AND NOT EXISTS (SELECT 1 FROM onboarding_sessions s "
                 "WHERE s.account_id=a.id AND s.state IN ('starting','requesting_code','waiting_code','verifying_code',"
                 "'waiting_password','verifying_password','joining_group') AND s.expires_at>?) THEN a.id END) unconfirmed_account_count,"
-                "COUNT(DISTINCT CASE WHEN a.auth_state='authenticated' AND a.status IN ('active','needs_membership') AND EXISTS ("
+                "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state='authenticated' AND a.status IN ('active','needs_membership') AND EXISTS ("
                 "SELECT 1 FROM ip_assignments ia JOIN server_ips assigned_ip ON assigned_ip.id=ia.ip_id "
                 "WHERE ia.account_id=a.id AND assigned_ip.enabled=1 AND assigned_ip.available=1) THEN a.id END) verifiable_account_count "
-                "FROM groups g LEFT JOIN accounts a ON a.group_id=g.id "
+                "FROM groups g LEFT JOIN accounts a ON a.group_id=g.id AND a.lifecycle<>'deleted' "
                 "GROUP BY g.id ORDER BY g.id",
-                (now, now),
+                (now, now, now, now),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -575,17 +867,17 @@ def create_app(
         with db() as connection:
             rows = connection.execute(
                 "SELECT p.id,p.address,p.enabled,p.available,p.last_checked_at,COUNT(DISTINCT a.id) AS assigned_count,"
-                "COUNT(DISTINCT CASE WHEN a.auth_state='authenticated' THEN a.id END) AS authenticated_count,"
-                "COUNT(DISTINCT CASE WHEN a.auth_state<>'authenticated' AND EXISTS ("
+                "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state='authenticated' THEN a.id END) AS authenticated_count,"
+                "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state<>'authenticated' AND EXISTS ("
                 "SELECT 1 FROM onboarding_sessions s WHERE s.account_id=a.id AND s.state IN "
                 "('starting','requesting_code','waiting_code','verifying_code','waiting_password','verifying_password','joining_group') "
                 "AND s.expires_at>?) THEN a.id END) AS in_progress_count,"
-                "COUNT(DISTINCT CASE WHEN a.auth_state<>'authenticated' AND NOT EXISTS ("
+                "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state<>'authenticated' AND NOT EXISTS ("
                 "SELECT 1 FROM onboarding_sessions s WHERE s.account_id=a.id AND s.state IN "
                 "('starting','requesting_code','waiting_code','verifying_code','waiting_password','verifying_password','joining_group') "
                 "AND s.expires_at>?) THEN a.id END) AS unconfirmed_count "
                 "FROM server_ips p LEFT JOIN ip_assignments ia ON ia.ip_id=p.id "
-                "LEFT JOIN accounts a ON a.id=ia.account_id GROUP BY p.id ORDER BY p.id",
+                "LEFT JOIN accounts a ON a.id=ia.account_id AND a.lifecycle<>'deleted' GROUP BY p.id ORDER BY p.id",
                 (now, now),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -673,7 +965,12 @@ def create_app(
                 "SELECT COALESCE(o.finished_at,o.started_at) AS created_at,o.status AS kind,o.operation_id,o.group_id,o.account_id,"
                 "COALESCE(o.error_code,'') AS detail FROM operations o ORDER BY o.id DESC LIMIT 200"
             ).fetchall()
-        return sorted([dict(row) for row in [*audit, *operations]], key=lambda row: row["created_at"], reverse=True)[:200]
+            onboarding = connection.execute(
+                "SELECT created_at,stage AS kind,attempt_id,group_id,account_id,ip_id,"
+                "result || CASE WHEN error_class IS NULL THEN '' ELSE ':' || error_class END AS detail,"
+                "duration_ms,response_received,error_class FROM onboarding_events ORDER BY id DESC LIMIT 200"
+            ).fetchall()
+        return sorted([dict(row) for row in [*audit, *operations, *onboarding]], key=lambda row: row["created_at"], reverse=True)[:200]
 
     @app.post("/api/operations/{operation_id}/resolve")
     def resolve_operation(operation_id: str, body: OperationResolutionBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, str]:
@@ -756,6 +1053,7 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(422, "invalid_russian_phone") from exc
         row = invite_row(None, token, require_capacity=False)
+        await clean_previous_unverified_attempt(phone, int(row["group_id"]))
         session_id = new_token(16)
         now = datetime.now(timezone.utc).isoformat()
         expired_session_ids: list[str] = []
@@ -775,7 +1073,7 @@ def create_app(
                     (now,),
                 ).fetchall()]
                 connection.execute(
-                    "UPDATE onboarding_sessions SET state='expired',error_code='onboarding_attempt_expired',updated_at=? "
+                    "UPDATE onboarding_sessions SET state='expired',error_code='onboarding_attempt_expired',updated_at=?,phone=NULL,full_name=NULL "
                     "WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership') AND expires_at<=?",
                     (now, now),
                 )
@@ -788,7 +1086,7 @@ def create_app(
                     connection.rollback()
                     raise HTTPException(409, "ip_assignment_required")
                 matches = []
-                for candidate in connection.execute("SELECT id,group_id,status,phone,auth_state,session_generation FROM accounts"):
+                for candidate in connection.execute("SELECT id,group_id,status,phone,auth_state,session_generation,lifecycle FROM accounts"):
                     old_phone = str(candidate["phone"] or "")
                     try:
                         canonical = normalize_russian_phone(old_phone.removeprefix("+8") if old_phone.startswith("+8") else old_phone)
@@ -803,7 +1101,11 @@ def create_app(
                 reusable_membership_uses = 0
                 if existing is None:
                     account_id, ip_id = prepare_account(connection, group_id=row["group_id"], phone=phone, full_name=full_name)
+                    connection.execute("UPDATE accounts SET phone_fingerprint=? WHERE id=?", (fingerprint_for(phone), account_id))
                 else:
+                    if existing["lifecycle"] != "active":
+                        connection.rollback()
+                        raise HTTPException(409, "account_deletion_incomplete")
                     reauth_required = existing["auth_state"] == "reauth_required"
                     allowed_statuses = {"pending", "active", "needs_membership"} if reauth_required else {"pending"}
                     if existing["group_id"] != row["group_id"] or existing["status"] not in allowed_statuses:
@@ -831,16 +1133,16 @@ def create_app(
                     ip_id = connection.execute("SELECT id FROM server_ips WHERE address=?", (address,)).fetchone()["id"]
                     if reauth_required:
                         connection.execute(
-                            "UPDATE onboarding_sessions SET state='cancelled',error_code='reauthentication_started',updated_at=? "
+                            "UPDATE onboarding_sessions SET state='cancelled',error_code='reauthentication_started',updated_at=?,phone=NULL,full_name=NULL "
                             "WHERE account_id=? AND state='waiting_membership'",
                             (now, existing["id"]),
                         )
                         connection.execute(
-                            "UPDATE accounts SET full_name=?,phone=?,session_generation=?,auth_state='unverified',status='pending' WHERE id=?",
-                            (full_name, phone, int(existing["session_generation"]) + 1, account_id),
+                            "UPDATE accounts SET full_name=?,phone=?,session_generation=?,auth_state='unverified',status='pending',phone_fingerprint=? WHERE id=?",
+                            (full_name, phone, int(existing["session_generation"]) + 1, fingerprint_for(phone), account_id),
                         )
                     else:
-                        connection.execute("UPDATE accounts SET full_name=?,phone=? WHERE id=?", (full_name, phone, account_id))
+                        connection.execute("UPDATE accounts SET full_name=?,phone=?,phone_fingerprint=COALESCE(phone_fingerprint,?) WHERE id=?", (full_name, phone, fingerprint_for(phone), account_id))
                 invite_use_count = max(0, active_uses - reusable_membership_uses) + 1
                 if current_invite["max_uses"] is not None and invite_use_count > current_invite["max_uses"]:
                     connection.rollback()
@@ -853,6 +1155,10 @@ def create_app(
                 connection.execute(
                     "INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,phone,full_name,state,account_id,ip_id,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?, ?,?,?,?,?)",
                     (session_id, row["id"], digest_token(token), digest_token(new_token()), phone, full_name, "starting", account_id, ip_id, (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(), now, now),
+                )
+                connection.execute(
+                    "INSERT INTO onboarding_events(created_at,attempt_id,group_id,account_id,ip_id,stage,result) VALUES(?,?,?,?,?,'attempt','started')",
+                    (now, session_id, row["group_id"], account_id, ip_id),
                 )
                 connection.execute("UPDATE onboarding_invites SET uses_count=? WHERE id=?", (invite_use_count, row["id"]))
                 connection.commit()
@@ -880,9 +1186,11 @@ def create_app(
     def set_onboarding_state(session_id: str, state: str, hint: str = "") -> None:
         with db() as connection:
             connection.execute(
-                "UPDATE onboarding_sessions SET state=?,error_code=?,updated_at=? WHERE id=? "
+                "UPDATE onboarding_sessions SET state=?,error_code=?,updated_at=?,"
+                "phone=CASE WHEN ? IN ('completed','failed','expired','cancelled') THEN NULL ELSE phone END,"
+                "full_name=CASE WHEN ? IN ('completed','failed','expired','cancelled') THEN NULL ELSE full_name END WHERE id=? "
                 "AND state NOT IN ('completed','failed','expired','cancelled')",
-                (state, hint[:120], datetime.now(timezone.utc).isoformat(), session_id),
+                (state, hint[:120], datetime.now(timezone.utc).isoformat(), state, state, session_id),
             )
 
     async def run_onboarding_auth(session_id: str, invite_link: str) -> None:
@@ -895,13 +1203,23 @@ def create_app(
         stage = "session_open"
         stage_started = perf_counter()
         lock_acquired = False
+        last_diagnostic_stage: str | None = None
+
+        def diagnostic_callback(event_stage: str, result: str, duration_ms: int, response: bool, error_class: str | None) -> None:
+            nonlocal last_diagnostic_stage
+            last_diagnostic_stage = event_stage
+            record_onboarding_event(
+                attempt_id=session_id, group_id=runtime["group_id"], account_id=runtime["account_id"],
+                ip_id=runtime["ip_id"], stage=event_stage, result=result,
+                duration_ms=duration_ms, response_received=response, error_class=error_class,
+            )
 
         def validate_target(expected_chat_id: str | None = None) -> None:
             runtime["validate_ip"]()
             with db() as connection:
                 current = connection.execute(
                     "SELECT s.state,s.expires_at,s.token_hash AS session_token_hash,i.active,i.expires_at AS invite_expires_at,"
-                    "i.token_hash AS invite_token_hash,a.status AS account_status,g.invite_link,g.chat_id "
+                    "i.token_hash AS invite_token_hash,a.status AS account_status,a.lifecycle AS account_lifecycle,g.invite_link,g.chat_id "
                     "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id "
                     "JOIN accounts a ON a.id=s.account_id JOIN groups g ON g.id=a.group_id WHERE s.id=?",
                     (session_id,),
@@ -909,7 +1227,7 @@ def create_app(
             now = datetime.now(timezone.utc).isoformat()
             if (current is None or current["state"] in terminal_onboarding_states or current["expires_at"] <= now
                     or not current["active"] or current["session_token_hash"] != current["invite_token_hash"]
-                    or current["invite_expires_at"] <= now or current["account_status"] != "pending"
+                    or current["invite_expires_at"] <= now or current["account_status"] != "pending" or current["account_lifecycle"] != "active"
                     or current["invite_link"] != invite_link):
                 raise RuntimeError("invite_unavailable")
             if current["chat_id"] and expected_chat_id and str(current["chat_id"]) != str(expected_chat_id):
@@ -924,6 +1242,7 @@ def create_app(
                 phone=runtime["phone"], source_ip=runtime["source_ip"],
                 code_provider=runtime["flow"], password_provider=runtime["flow"],
                 session_vault=vault, before_network_action=validate_target,
+                diagnostic_callback=diagnostic_callback,
             )
             logger.info("onboarding_stage session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000))
             stage = "connect"
@@ -944,19 +1263,36 @@ def create_app(
             if not adapter.persist_session_snapshot():
                 raise RuntimeError("auth_session_not_saved")
             with db() as connection:
-                connection.execute(
-                    "UPDATE accounts SET auth_state='authenticated',max_user_id=? WHERE id=? AND status='pending'",
+                saved = connection.execute(
+                    "UPDATE accounts SET auth_state='authenticated',ever_authenticated=1,max_user_id=? WHERE id=? AND status='pending' AND lifecycle='active'",
                     (max_user_id, runtime["account_id"]),
                 )
+                if saved.rowcount != 1:
+                    raise RuntimeError("account_deletion_incomplete")
+            record_onboarding_event(
+                attempt_id=session_id, group_id=runtime["group_id"], account_id=runtime["account_id"],
+                ip_id=runtime["ip_id"], stage="authentication", result="authenticated",
+                duration_ms=int((perf_counter() - stage_started) * 1000), response_received=True,
+            )
             logger.info("onboarding_stage session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000))
             try:
                 stage = "resolve_group"
                 stage_started = perf_counter()
                 resolved = await adapter.resolve_group_by_link(invite_link)
                 chat_id = str(getattr(resolved, "id", "") or getattr(resolved, "chat_id", ""))
-            except Exception:
+                resolve_error = None
+            except Exception as resolve_exception:
+                resolve_error = type(resolve_exception).__name__
                 chat_id = ""
+            if not chat_id and resolve_error is None:
+                resolve_error = "GroupResolutionError"
             logger.info("onboarding_stage session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d resolved=%s", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000), bool(chat_id))
+            record_onboarding_event(
+                attempt_id=session_id, group_id=runtime["group_id"], account_id=runtime["account_id"],
+                ip_id=runtime["ip_id"], stage="resolve_group", result="resolved" if chat_id else "failed",
+                duration_ms=int((perf_counter() - stage_started) * 1000), response_received=bool(chat_id),
+                error_class=resolve_error if not chat_id else None,
+            )
             if chat_id:
                 validate_target(chat_id)
                 set_onboarding_state(session_id, "joining_group")
@@ -967,6 +1303,12 @@ def create_app(
                 )
             else:
                 joined, join_error = False, "group_resolution_failed"
+            record_onboarding_event(
+                attempt_id=session_id, group_id=runtime["group_id"], account_id=runtime["account_id"],
+                ip_id=runtime["ip_id"], stage="membership", result="confirmed" if joined else (join_error or "not_confirmed"),
+                duration_ms=int((perf_counter() - stage_started) * 1000), response_received=bool(chat_id) and join_error != "membership_check_unavailable",
+                error_class=None if joined else ("MembershipCheckError" if join_error == "membership_check_unavailable" else "MembershipNotConfirmed"),
+            )
             logger.info(
                 "onboarding_stage session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d membership_confirmed=%s",
                 session_id, runtime["account_id"], runtime["ip_id"], stage,
@@ -1005,17 +1347,24 @@ def create_app(
                     raise ValueError("group_destination_mismatch")
                 if chat_id:
                     attach_group_on_first_account(connection, runtime["group_id"], chat_id)
-                connection.execute("UPDATE accounts SET max_user_id=?,auth_state='authenticated',status=? WHERE id=?", (max_user_id, "active" if joined else "needs_membership", runtime["account_id"]))
+                connection.execute("UPDATE accounts SET max_user_id=?,auth_state='authenticated',ever_authenticated=1,status=? WHERE id=? AND lifecycle='active'", (max_user_id, "active" if joined else "needs_membership", runtime["account_id"]))
+                final_state = "completed" if joined else "waiting_membership"
                 connection.execute(
-                    "UPDATE onboarding_sessions SET state=?,error_code=?,max_user_id=?,expires_at=?,updated_at=? WHERE id=?",
-                    ("completed" if joined else "waiting_membership", join_error, max_user_id, current["invite_expires_at"], now, session_id),
+                    "UPDATE onboarding_sessions SET state=?,error_code=?,max_user_id=?,expires_at=?,updated_at=?,"
+                    "phone=CASE WHEN ?='completed' THEN NULL ELSE phone END,"
+                    "full_name=CASE WHEN ?='completed' THEN NULL ELSE full_name END WHERE id=?",
+                    (final_state, join_error, max_user_id, current["invite_expires_at"], now,
+                     final_state, final_state, session_id),
                 )
                 connection.commit()
         except Exception as exc:
             waiting_for = getattr(runtime["flow"], "waiting_for", None)
             auth_stage = getattr(runtime["flow"], "current_stage", None)
-            if stage == "connect" and auth_stage:
-                stage = auth_stage
+            if stage == "connect":
+                if auth_stage and auth_stage != "request_code":
+                    stage = auth_stage
+                elif last_diagnostic_stage:
+                    stage = last_diagnostic_stage
             if isinstance(exc, TimeoutError):
                 safe = f"{waiting_for}_entry_timeout" if waiting_for else "network_timeout"
             elif type(exc).__name__ == "ApiError" and getattr(exc, "error", None) == "error.profile.active.session.no2fa":
@@ -1046,7 +1395,19 @@ def create_app(
                     safe = "password_entry_timeout"
                 else:
                     safe = "network_timeout"
+            event_stage = str(auth_stage if auth_stage and auth_stage != "request_code" else (last_diagnostic_stage or stage))
+            event_result = "input_timeout" if isinstance(exc, TimeoutError) and auth_stage in {"wait_code_input", "wait_password_input"} else "failed"
+            record_onboarding_event(
+                attempt_id=session_id, group_id=runtime["group_id"], account_id=runtime["account_id"],
+                ip_id=runtime["ip_id"], stage=event_stage, result=event_result,
+                duration_ms=int((perf_counter() - stage_started) * 1000),
+                response_received=False, error_class=type(exc).__name__,
+            )
             logger.warning("onboarding_failed session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d error_class=%s", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000), type(exc).__name__)
+            try:
+                prepare_unverified_account_cleanup(session_id, int(runtime["account_id"]))
+            except Exception as cleanup_error:
+                logger.warning("onboarding_cleanup_incomplete attempt_id=%s account_id=%s error_class=%s", session_id, runtime["account_id"], type(cleanup_error).__name__)
             set_onboarding_state(session_id, "failed", safe)
         finally:
             try:
@@ -1060,6 +1421,15 @@ def create_app(
                         logger.warning("onboarding_failed session_id=%s account_id=%s ip_id=%s stage=session_close_seal error_class=SessionSaveError", session_id, runtime["account_id"], runtime["ip_id"])
                         set_onboarding_state(session_id, "failed", "session_save_failed")
             finally:
+                try:
+                    with db() as connection:
+                        terminal = connection.execute(
+                            "SELECT s.state,s.account_id FROM onboarding_sessions s WHERE s.id=?", (session_id,),
+                        ).fetchone()
+                    if terminal is not None and terminal["state"] in terminal_onboarding_states:
+                        delete_unverified_after_terminal_attempt(session_id, int(terminal["account_id"]))
+                except Exception as cleanup_error:
+                    logger.warning("onboarding_cleanup_incomplete attempt_id=%s account_id=%s error_class=%s", session_id, runtime["account_id"], type(cleanup_error).__name__)
                 if lock_acquired:
                     lock.release()
                 app.state.onboarding_flows.pop(session_id, None)
@@ -1159,6 +1529,14 @@ def create_app(
             raise HTTPException(503, "group_resolution_failed")
         lock = account_session_locks.for_account(row["account_id"])
         adapter = None
+        membership_started = perf_counter()
+
+        def membership_diagnostic(stage: str, result: str, duration_ms: int, response: bool, error_class: str | None) -> None:
+            record_onboarding_event(
+                attempt_id=session_id, group_id=int(row["group_id"]), account_id=int(row["account_id"]),
+                ip_id=int(row["ip_id"]), stage=stage, result=result, duration_ms=duration_ms,
+                response_received=response, error_class=error_class,
+            )
 
         def current_membership_ip() -> str:
             with db() as connection:
@@ -1171,7 +1549,10 @@ def create_app(
         try:
             source_ip = current_membership_ip()
             vault = session_vault_for(row["account_id"])
-            adapter = PyMaxAdapter.create(phone=row["phone"], source_ip=source_ip, session_vault=vault, before_network_action=current_membership_ip)
+            adapter = PyMaxAdapter.create(
+                phone=row["phone"], source_ip=source_ip, session_vault=vault,
+                before_network_action=current_membership_ip, diagnostic_callback=membership_diagnostic,
+            )
             await adapter.connect()
             current_membership_ip()
             chat = await adapter.get_chat(int(row["chat_id"]))
@@ -1182,6 +1563,12 @@ def create_app(
         except Exception as exc:
             if PyMaxAdapter.is_invalid_saved_session_error(exc):
                 mark_reauth_required(row["account_id"])
+            record_onboarding_event(
+                attempt_id=session_id, group_id=int(row["group_id"]), account_id=int(row["account_id"]),
+                ip_id=int(row["ip_id"]), stage="membership_check", result="failed",
+                duration_ms=int((perf_counter() - membership_started) * 1000),
+                response_received=False, error_class=type(exc).__name__,
+            )
             raise HTTPException(503, "membership_check_unavailable") from exc
         finally:
             try:
@@ -1227,8 +1614,17 @@ def create_app(
                 raise HTTPException(409, "account_assignment_changed_during_verification")
             if joined:
                 connection.execute("UPDATE accounts SET status='active' WHERE id=?", (row["account_id"],))
-                connection.execute("UPDATE onboarding_sessions SET state='completed',updated_at=? WHERE id=?", (now, session_id))
+                connection.execute(
+                    "UPDATE onboarding_sessions SET state='completed',updated_at=?,phone=NULL,full_name=NULL WHERE id=?",
+                    (now, session_id),
+                )
             connection.commit()
+        record_onboarding_event(
+            attempt_id=session_id, group_id=int(row["group_id"]), account_id=int(row["account_id"]),
+            ip_id=int(row["ip_id"]), stage="membership_check", result="confirmed" if joined else "not_confirmed",
+            duration_ms=int((perf_counter() - membership_started) * 1000), response_received=True,
+            error_class=None if joined else "MembershipNotConfirmed",
+        )
         return {"joined": joined, "completed": joined}
 
     @app.post("/api/groups", status_code=201)
@@ -1292,17 +1688,87 @@ def create_app(
             timezone_row = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
             week_start = monday_of(datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date()).isoformat()
             rows = connection.execute(
-                "SELECT a.id,a.full_name,a.status,a.auth_state,a.send_weekday,ia.ip_id,p.address AS ip_address,p.enabled AS ip_enabled,p.available AS ip_available,"
+                "SELECT a.id,a.full_name,a.status,a.auth_state,a.lifecycle,a.ever_authenticated,a.send_weekday,ia.ip_id,p.address AS ip_address,p.enabled AS ip_enabled,p.available AS ip_available,"
                 "s.scheduled_date,s.status AS slot_status,s.error_code,"
                 "(SELECT os.state FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_state,"
                 "(SELECT os.error_code FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_error "
                 "FROM accounts a "
                 "LEFT JOIN ip_assignments ia ON ia.account_id=a.id LEFT JOIN server_ips p ON p.id=ia.ip_id "
                 "LEFT JOIN weekly_slots s ON s.account_id=a.id AND s.week_start=? "
-                "WHERE a.group_id=? ORDER BY a.id",
+                "WHERE a.group_id=? AND a.lifecycle<>'deleted' ORDER BY a.id",
                 (week_start, group_id),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    @app.delete("/api/accounts/{account_id}")
+    async def delete_account(account_id: int, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
+        stamp = datetime.now(timezone.utc).isoformat()
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            account = connection.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if account is None:
+                connection.rollback()
+                raise HTTPException(404, "account_not_found")
+            if account["lifecycle"] == "deleted":
+                connection.commit()
+                return {"deleted": True}
+            unresolved = connection.execute(
+                "SELECT 1 FROM operations WHERE account_id=? AND status IN ('in_flight','unknown') LIMIT 1",
+                (account_id,),
+            ).fetchone()
+            if unresolved:
+                connection.rollback()
+                raise HTTPException(409, "operation_reconciliation_required")
+            try:
+                fingerprint = account["phone_fingerprint"] or fingerprint_for(account["phone"])
+            except ValueError as exc:
+                connection.rollback()
+                raise HTTPException(503, "account_deletion_unavailable") from exc
+            connection.execute(
+                "UPDATE accounts SET lifecycle='delete_pending',deletion_reason='owner_requested',phone_fingerprint=? WHERE id=?",
+                (fingerprint, account_id),
+            )
+            cancelled = [str(row[0]) for row in connection.execute(
+                "SELECT id FROM onboarding_sessions WHERE account_id=? AND state NOT IN ('completed','failed','expired','cancelled')",
+                (account_id,),
+            )]
+            if cancelled:
+                connection.execute(
+                    "UPDATE onboarding_sessions SET state='cancelled',error_code='account_deleted',updated_at=? WHERE id IN (" + ",".join("?" for _ in cancelled) + ")",
+                    (stamp, *cancelled),
+                )
+            group_id = int(account["group_id"])
+            assignment = connection.execute(
+                "SELECT ip_id FROM ip_assignments WHERE account_id=?", (account_id,),
+            ).fetchone()
+            if assignment is not None:
+                connection.execute(
+                    "INSERT INTO onboarding_events(created_at,attempt_id,group_id,account_id,ip_id,stage,result) "
+                    "VALUES(?,?,?,?,?,'deletion','started')",
+                    (stamp, f"account-{account_id}", group_id, account_id, assignment["ip_id"]),
+                )
+            connection.execute("DELETE FROM ip_assignments WHERE account_id=?", (account_id,))
+            connection.execute(
+                "UPDATE weekly_slots SET status='blocked',error_code='account_deleted',updated_at=? WHERE account_id=? AND status='queued'",
+                (stamp, account_id),
+            )
+            connection.commit()
+        cancel_onboarding_tasks(cancelled)
+        lock = account_session_locks.for_account(account_id)
+        await lock.acquire()
+        try:
+            with db() as connection:
+                unresolved = connection.execute(
+                    "SELECT 1 FROM operations WHERE account_id=? AND status IN ('in_flight','unknown') LIMIT 1",
+                    (account_id,),
+                ).fetchone()
+            if unresolved:
+                raise HTTPException(409, "operation_reconciliation_required")
+            if not finish_deletion(account_id, reason="owner_requested"):
+                raise HTTPException(503, "account_deletion_incomplete")
+        finally:
+            lock.release()
+        return {"deleted": True}
 
     @app.post("/api/groups/{group_id}/verify-destination")
     async def verify_destination(group_id: int, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
@@ -1311,7 +1777,7 @@ def create_app(
             group = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
             accounts = connection.execute(
                 "SELECT a.id,a.phone,p.id AS ip_id,p.address FROM accounts a JOIN ip_assignments ia ON ia.account_id=a.id "
-                "JOIN server_ips p ON p.id=ia.ip_id WHERE a.group_id=? AND a.auth_state='authenticated' AND a.status IN ('active','needs_membership') "
+                "JOIN server_ips p ON p.id=ia.ip_id WHERE a.group_id=? AND a.lifecycle='active' AND a.auth_state='authenticated' AND a.status IN ('active','needs_membership') "
                 "AND p.enabled=1 AND p.available=1 ORDER BY a.id",
                 (group_id,),
             ).fetchall()
@@ -1418,9 +1884,9 @@ def create_app(
     def reassign_ip(account_id: int, body: IPAssignmentBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            account = connection.execute("SELECT group_id FROM accounts WHERE id=?", (account_id,)).fetchone()
+            account = connection.execute("SELECT group_id,lifecycle FROM accounts WHERE id=?", (account_id,)).fetchone()
             ip_row = connection.execute("SELECT id,address,enabled,available FROM server_ips WHERE id=?", (body.ip_id,)).fetchone()
-            if account is None or ip_row is None:
+            if account is None or account["lifecycle"] != "active" or ip_row is None:
                 connection.rollback()
                 raise HTTPException(404, "account_or_ip_not_found")
             if not ip_row["enabled"] or not ip_row["available"] or not allowed_address(ip_row["address"]) or ip_row["address"] not in host_addresses():

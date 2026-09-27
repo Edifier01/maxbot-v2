@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 from maxbot_v2.db import connect, initialize
 from maxbot_v2.egress import assign_ip, bootstrap_ips, probe_address, refresh_ips
 from maxbot_v2.message_pool import replace_message_pool
@@ -15,6 +17,75 @@ def test_assignment_uses_enabled_least_loaded_server_ip():
 
     assert assign_ip(db, 1) == '62.109.20.186'
     assert assign_ip(db, 2) == '62.109.20.186'
+
+
+def test_equal_load_ip_assignments_rotate_from_the_least_recently_used_ip():
+    db = connect(":memory:")
+    initialize(db)
+    group_id = db.execute("INSERT INTO groups(name,invite_link) VALUES('group','link')").lastrowid
+    db.execute("INSERT INTO server_ips(id,address,enabled,available) VALUES(1,'62.109.20.186',1,1)")
+    db.execute("INSERT INTO server_ips(id,address,enabled,available) VALUES(2,'62.109.20.187',1,1)")
+
+    selected = []
+    for index in range(3):
+        account_id = db.execute(
+            "INSERT INTO accounts(group_id,phone,full_name) VALUES(?,?,?)",
+            (group_id, f'+7999000000{index}', 'guest'),
+        ).lastrowid
+        selected.append(assign_ip(db, account_id))
+
+    assert selected == ['62.109.20.186', '62.109.20.187', '62.109.20.186']
+
+
+def test_ip_bootstrap_does_not_assign_deleted_accounts():
+    db = connect(":memory:")
+    initialize(db)
+    group_id = db.execute("INSERT INTO groups(name,invite_link) VALUES('group','link')").lastrowid
+    active_id = db.execute(
+        "INSERT INTO accounts(group_id,phone,full_name) VALUES(?, '+79990000001','active')", (group_id,),
+    ).lastrowid
+    deleted_id = db.execute(
+        "INSERT INTO accounts(group_id,phone,full_name,lifecycle) VALUES(?, 'deleted:2','','deleted')", (group_id,),
+    ).lastrowid
+
+    bootstrap_ips(db, addresses={"62.109.20.186"}, probe=lambda _address: True)
+
+    assert db.execute("SELECT COUNT(*) FROM ip_assignments WHERE account_id=?", (active_id,)).fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM ip_assignments WHERE account_id=?", (deleted_id,)).fetchone()[0] == 0
+
+
+def test_concurrent_transactions_keep_new_ip_assignments_balanced(tmp_path):
+    path = tmp_path / "parallel-ip.db"
+    db = connect(path)
+    initialize(db)
+    group_id = db.execute("INSERT INTO groups(name,invite_link) VALUES('group','https://max.ru/join/test')").lastrowid
+    db.executemany(
+        "INSERT INTO server_ips(address,enabled,available) VALUES(?,1,1)",
+        [("62.109.20.186",), ("62.109.20.187",)],
+    )
+    db.close()
+
+    def add_account(index):
+        connection = connect(path)
+        connection.execute("BEGIN IMMEDIATE")
+        account_id = connection.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'pending')",
+            (group_id, f"+79990000{index:03d}", "guest"),
+        ).lastrowid
+        selected = assign_ip(connection, account_id)
+        connection.commit()
+        connection.close()
+        return selected
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        selected = list(pool.map(add_account, range(8)))
+
+    assert selected.count("62.109.20.186") == 4
+    assert selected.count("62.109.20.187") == 4
+    db = connect(path)
+    assert db.execute("SELECT COUNT(*) FROM ip_assignments").fetchone()[0] == 8
+    assert db.execute("SELECT COUNT(*) FROM server_ips WHERE last_assigned_at IS NOT NULL").fetchone()[0] == 2
+    db.close()
 
 
 def test_refresh_excludes_legacy_ip_and_leaves_new_ip_disabled():

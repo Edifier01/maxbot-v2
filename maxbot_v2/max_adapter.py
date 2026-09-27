@@ -6,6 +6,7 @@ import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
+from time import perf_counter
 from typing import Any, Callable
 
 from .egress import allowed_address
@@ -42,11 +43,32 @@ class PyMaxAdapter:
     def __init__(self, client: Any):
         self.client = client
 
+    @staticmethod
+    def auth_stage_for_opcode(opcode: int) -> str | None:
+        """Map PyMax 2.4.1 protocol opcodes to safe authentication stages."""
+        try:
+            from pymax.protocol.enums import Opcode
+            value = int(opcode)
+        except (ImportError, TypeError, ValueError):
+            return None
+        return {
+            int(Opcode.SESSION_INIT): "handshake",
+            int(Opcode.AUTH_REQUEST): "request_code",
+            int(Opcode.AUTH): "otp",
+            int(Opcode.AUTH_LOGIN_CHECK_PASSWORD): "two_factor",
+            int(Opcode.LOGIN): "login",
+            int(Opcode.PROFILE): "profile",
+            int(Opcode.CHAT_CHECK_LINK): "resolve_group",
+            int(Opcode.CHAT_JOIN): "join_group",
+            int(Opcode.CHAT_INFO): "check_membership",
+        }.get(value)
+
     @classmethod
     def create(
         cls, *, phone: str, source_ip: str, session_vault: EncryptedSessionFile | None = None,
         code_provider: Any = None, password_provider: Any = None,
         before_network_action: Callable[[], None] | None = None,
+        diagnostic_callback: Callable[[str, str, int, bool, str | None], None] | None = None,
     ):
         if not allowed_address(source_ip):
             raise AdapterUnavailable("ip_assignment_required")
@@ -58,6 +80,7 @@ class PyMaxAdapter:
             from pymax import Client, ExtraConfig
             from pymax.connection import ConnectionManager
             from pymax.connection.readers import TCPReader
+            from pymax.protocol.enums import Command
             from pymax.protocol.tcp import TcpProtocol
             from pymax.protocol.tcp.framing import TcpPacketFramer
             from pymax.transport.tcp import TCPTransport
@@ -68,18 +91,26 @@ class PyMaxAdapter:
 
         class BoundTransport(TCPTransport):
             async def connect(self):
+                started = perf_counter()
                 if before_network_action is not None:
                     before_network_action()
                 if self._proxy:
                     raise AdapterUnavailable("proxy_route_forbidden")
-                self._reader, self._writer = await asyncio.open_connection(
-                    self._host, self._port, ssl=self._ssl_ctx if self._use_ssl else None,
-                    family=socket.AF_INET, local_addr=(source_ip, 0),
-                )
-                actual = self._writer.get_extra_info("sockname")
-                if actual is None or actual[0] != source_ip:
-                    await self.close()
-                    raise AdapterUnavailable("source_ip_mismatch")
+                try:
+                    self._reader, self._writer = await asyncio.open_connection(
+                        self._host, self._port, ssl=self._ssl_ctx if self._use_ssl else None,
+                        family=socket.AF_INET, local_addr=(source_ip, 0),
+                    )
+                    actual = self._writer.get_extra_info("sockname")
+                    if actual is None or actual[0] != source_ip:
+                        await self.close()
+                        raise AdapterUnavailable("source_ip_mismatch")
+                except BaseException as exc:
+                    if diagnostic_callback is not None and not isinstance(exc, asyncio.CancelledError):
+                        diagnostic_callback("connect", "failed", int((perf_counter() - started) * 1000), False, type(exc).__name__)
+                    raise
+                if diagnostic_callback is not None:
+                    diagnostic_callback("connect", "connected", int((perf_counter() - started) * 1000), False, None)
 
             async def send(self, data):
                 if before_network_action is not None:
@@ -92,7 +123,28 @@ class PyMaxAdapter:
                     host=self.extra_config.host, port=self.extra_config.port,
                     use_ssl=self.extra_config.use_ssl, proxy=None,
                 )
-                return ConnectionManager(
+
+                class DiagnosticConnectionManager(ConnectionManager):
+                    async def request(self, frame, *, timeout=None):
+                        stage = PyMaxAdapter.auth_stage_for_opcode(frame.opcode)
+                        started = perf_counter()
+                        try:
+                            response = await super().request(frame, timeout=timeout)
+                        except BaseException as exc:
+                            if (diagnostic_callback is not None and stage is not None
+                                    and not isinstance(exc, asyncio.CancelledError)):
+                                diagnostic_callback(stage, "failed", int((perf_counter() - started) * 1000), False, type(exc).__name__)
+                            raise
+                        if diagnostic_callback is not None and stage is not None:
+                            rejected = response.cmd == Command.ERROR
+                            diagnostic_callback(
+                                stage, "rejected" if rejected else "response",
+                                int((perf_counter() - started) * 1000), True,
+                                "ApiError" if rejected else None,
+                            )
+                        return response
+
+                return DiagnosticConnectionManager(
                     reader=TCPReader(transport=transport, framer=TcpPacketFramer()),
                     transport=transport, protocol=TcpProtocol(),
                 )

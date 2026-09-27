@@ -1,6 +1,8 @@
 import asyncio
+import threading
 
 import bcrypt
+import pytest
 from pymax.exceptions import ApiError
 from pymax.protocol.enums import Opcode
 from fastapi.testclient import TestClient
@@ -187,7 +189,7 @@ def test_ip_api_splits_assignments_authentication_and_live_attempts(tmp_path, mo
         account_id = connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'pending')", (group_id, f'+7999000000{index}', 'guest')).lastrowid
         connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
         accounts.append(account_id)
-    connection.execute("UPDATE accounts SET auth_state='authenticated',status='needs_membership' WHERE id=?", (accounts[0],))
+    connection.execute("UPDATE accounts SET auth_state='authenticated',status='needs_membership',ever_authenticated=1 WHERE id=?", (accounts[0],))
     invite = connection.execute("SELECT id,token_hash FROM onboarding_invites WHERE group_id=?", (group_id,)).fetchone()
     invite_id = invite["id"]
     connection.execute("INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,state,account_id,expires_at,created_at,updated_at) VALUES('live-count',?,'hash-counts','csrf','waiting_code',?,'2099-01-01','2026-09-27','2026-09-27')", (invite_id, accounts[1]))
@@ -202,8 +204,9 @@ def test_ip_api_splits_assignments_authentication_and_live_attempts(tmp_path, mo
     assert ip["in_progress_count"] == 1
     assert ip["unconfirmed_count"] == 1
     group = next(row for row in client.get("/api/groups").json() if row["id"] == group_id)
-    assert group["account_count"] == 3
+    assert group["account_count"] == 1
     assert group["authenticated_account_count"] == 1
+    assert group["onboarding_attempt_count"] == 1
     assert group["in_progress_account_count"] == 1
     assert group["unconfirmed_account_count"] == 1
 
@@ -310,7 +313,7 @@ def test_active_account_with_rejected_saved_session_can_start_manual_reauth(tmp_
     ip_id = client.get("/api/ips").json()[0]["id"]
     connection = connect(client.app.state.database)
     account_id = connection.execute(
-        "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,max_user_id) VALUES(?,?,?,'active','authenticated','max-user')",
+        "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,max_user_id,ever_authenticated) VALUES(?,?,?,'active','authenticated','max-user',1)",
         (group_id, "+79990000000", "Иван"),
     ).lastrowid
     connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
@@ -328,6 +331,7 @@ def test_active_account_with_rejected_saved_session_can_start_manual_reauth(tmp_
     assert checked.status_code == 503
     connection = connect(client.app.state.database)
     assert connection.execute("SELECT auth_state FROM accounts WHERE id=?", (account_id,)).fetchone()[0] == "reauth_required"
+    assert connection.execute("SELECT ever_authenticated,lifecycle FROM accounts WHERE id=?", (account_id,)).fetchone()[:] == (1, "active")
     invite = connection.execute("SELECT id,token_hash FROM onboarding_invites WHERE group_id=?", (group_id,)).fetchone()
     connection.execute("UPDATE onboarding_invites SET max_uses=1,uses_count=1 WHERE id=?", (invite["id"],))
     connection.execute("UPDATE accounts SET status='needs_membership' WHERE id=?", (account_id,))
@@ -346,7 +350,11 @@ def test_active_account_with_rejected_saved_session_can_start_manual_reauth(tmp_
     assert tuple(connection.execute("SELECT state,error_code FROM onboarding_sessions WHERE id='old-membership'").fetchone()) == ("cancelled", "reauthentication_started")
     assert connection.execute("SELECT COUNT(*) FROM ip_assignments WHERE account_id=?", (account_id,)).fetchone()[0] == 1
     connection.close()
-    coroutines.pop().close()
+    asyncio.run(coroutines.pop())
+    connection = connect(client.app.state.database)
+    assert connection.execute("SELECT ever_authenticated,lifecycle,auth_state FROM accounts WHERE id=?", (account_id,)).fetchone()[:] == (1, "active", "reauth_required")
+    assert connection.execute("SELECT phone,full_name FROM onboarding_sessions WHERE id=?", (restarted.json()["session_id"],)).fetchone()[:] == (None, None)
+    connection.close()
 
 
 def test_invalid_body_does_not_echo_password(tmp_path, monkeypatch):
@@ -366,6 +374,330 @@ def test_account_list_does_not_return_full_phone(tmp_path, monkeypatch):
     account = client.get(f"/api/groups/{group_id}/accounts").json()[0]
     assert "phone" not in account
     assert "+79991234567" not in str(account)
+
+
+def test_owner_deletion_erases_all_session_generations_and_preserves_history(tmp_path, monkeypatch):
+    from maxbot_v2.session_vault import EncryptedSessionFile
+
+    monkeypatch.setenv("SESSION_RUNTIME_DIR", str(tmp_path / "runtime"))
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post(
+        "/api/groups", headers=headers,
+        json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
+    ).json()["id"]
+    connection = connect(client.app.state.database)
+    account_id = connection.execute(
+        "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,ever_authenticated,phone_fingerprint) "
+        "VALUES(?, '+79990000001','Guest','active','authenticated',1,'private-fingerprint')",
+        (group_id,),
+    ).lastrowid
+    ip_id = connection.execute("SELECT id FROM server_ips LIMIT 1").fetchone()[0]
+    connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
+    event_id = connection.execute(
+        "INSERT INTO onboarding_events(created_at,attempt_id,group_id,account_id,ip_id,stage,result) "
+        "VALUES('2026-09-27','attempt-1',?,?,?,'request_code','failed')",
+        (group_id, account_id, ip_id),
+    ).lastrowid
+    connection.close()
+
+    data_dir = client.app.state.data_dir
+    box = SecretBox()
+    vaults = [
+        EncryptedSessionFile(account_id, generation=generation, durable_dir=data_dir / "sessions", runtime_dir=tmp_path / "runtime", box=box)
+        for generation in (0, 1)
+    ]
+    neighbor = EncryptedSessionFile(account_id + 1, durable_dir=data_dir / "sessions", runtime_dir=tmp_path / "runtime", box=box)
+    for vault in (*vaults, neighbor):
+        vault.open()
+        vault.work_path.write_bytes(b"temporary sqlite")
+        vault.encrypted_path.write_bytes(box.encrypt_bytes(b"encrypted session"))
+
+    response = client.delete(f"/api/accounts/{account_id}", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": True}
+    connection = connect(client.app.state.database)
+    account = connection.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+    assert account["lifecycle"] == "deleted"
+    assert account["phone"] == f"deleted:{account_id}"
+    assert account["full_name"] == ""
+    assert account["phone_fingerprint"] == "private-fingerprint"
+    assert connection.execute("SELECT 1 FROM ip_assignments WHERE account_id=?", (account_id,)).fetchone() is None
+    assert connection.execute("SELECT id FROM onboarding_events WHERE id=?", (event_id,)).fetchone()[0] == event_id
+    cleanup_event = connection.execute(
+        "SELECT ip_id,result FROM onboarding_events WHERE account_id=? AND stage='session_cleanup' ORDER BY id DESC LIMIT 1",
+        (account_id,),
+    ).fetchone()
+    assert tuple(cleanup_event) == (ip_id, "deleted")
+    deletion_event = connection.execute(
+        "SELECT ip_id,result FROM onboarding_events WHERE account_id=? AND stage='deletion' ORDER BY id DESC LIMIT 1",
+        (account_id,),
+    ).fetchone()
+    assert tuple(deletion_event) == (ip_id, "started")
+    assert connection.execute("SELECT COUNT(*) FROM accounts WHERE phone='+79990000001'").fetchone()[0] == 0
+    connection.close()
+    assert all(not vault.encrypted_path.exists() and not vault.work_dir.exists() for vault in vaults)
+    assert neighbor.encrypted_path.exists() and neighbor.work_path.exists()
+
+
+def test_owner_deletion_waits_for_live_auth_client_to_close(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSION_RUNTIME_DIR", str(tmp_path / "runtime"))
+    real_create_task = asyncio.create_task
+    tasks = []
+
+    def create_tracked_task(coro, **kwargs):
+        task = real_create_task(coro, **kwargs)
+        if coro.cr_code.co_name == "run_onboarding_auth":
+            tasks.append(task)
+        return task
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", create_tracked_task)
+    started = threading.Event()
+    closed = threading.Event()
+
+    class BlockingAdapter:
+        async def connect(self):
+            started.set()
+            await asyncio.sleep(3600)
+
+        async def close(self):
+            closed.set()
+
+    monkeypatch.setattr(
+        "maxbot_v2.app.PyMaxAdapter.create",
+        classmethod(lambda _cls, **_kwargs: BlockingAdapter()),
+    )
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post(
+        "/api/groups", headers=headers,
+        json={"name": "Гонка удаления", "invite_link": "https://max.ru/join/delete-race"},
+    ).json()["id"]
+    token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
+    attempt = client.post(
+        f"/api/public/onboarding/{token}/start",
+        json={"full_name": "Тестовый пользователь", "phone": "+79990000444"},
+    )
+    assert attempt.status_code == 200
+    assert started.wait(timeout=3)
+    connection = connect(client.app.state.database)
+    account_id = connection.execute(
+        "SELECT account_id FROM onboarding_sessions WHERE id=?", (attempt.json()["session_id"],),
+    ).fetchone()[0]
+    connection.close()
+
+    response = client.delete(f"/api/accounts/{account_id}", headers=headers)
+
+    assert response.status_code == 200
+    assert closed.wait(timeout=1)
+    connection = connect(client.app.state.database)
+    account = connection.execute(
+        "SELECT lifecycle,phone FROM accounts WHERE id=?", (account_id,),
+    ).fetchone()
+    attempt_row = connection.execute(
+        "SELECT state,phone,full_name FROM onboarding_sessions WHERE id=?", (attempt.json()["session_id"],),
+    ).fetchone()
+    connection.close()
+    assert tuple(account) == ("deleted", f"deleted:{account_id}")
+    assert tuple(attempt_row) == ("cancelled", None, None)
+
+
+def test_failed_new_onboarding_cleans_account_and_logs_safe_failure_before_retry(tmp_path, monkeypatch):
+    coroutines = []
+    real_create_task = asyncio.create_task
+
+    def capture(coro, **_kwargs):
+        if coro.cr_code.co_name == "run_onboarding_auth":
+            coroutines.append(coro)
+            return None
+        return real_create_task(coro, **_kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", capture)
+    client, _csrf = owner_client(tmp_path, monkeypatch)
+    group_id = client.post(
+        "/api/groups", headers={"X-CSRF-Token": _csrf},
+        json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
+    ).json()["id"]
+    token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
+
+    class FakeAdapter:
+        async def connect(self):
+            raise OSError("synthetic network text must never be logged")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(lambda _cls, **_kwargs: FakeAdapter()))
+    first = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79991234567"})
+    connection = connect(client.app.state.database)
+    old_id = int(connection.execute("SELECT account_id FROM onboarding_sessions WHERE id=?", (first.json()["session_id"],)).fetchone()[0])
+    connection.close()
+    asyncio.run(coroutines.pop())
+
+    connection = connect(client.app.state.database)
+    account = connection.execute("SELECT lifecycle,phone,full_name FROM accounts WHERE id=?", (old_id,)).fetchone()
+    attempt = connection.execute("SELECT state,phone,full_name FROM onboarding_sessions WHERE id=?", (first.json()["session_id"],)).fetchone()
+    assert tuple(account) == ("deleted", f"deleted:{old_id}", "")
+    assert tuple(attempt) == ("failed", None, None)
+    assert connection.execute("SELECT 1 FROM ip_assignments WHERE account_id=?", (old_id,)).fetchone() is None
+    connection.close()
+    log = client.get("/api/log").json()
+    failure = next(entry for entry in log if entry.get("attempt_id") == first.json()["session_id"] and entry["detail"].startswith("failed"))
+    assert failure["kind"] == "connect"
+    assert failure["error_class"] == "OSError"
+    assert "+79991234567" not in str(log) and "synthetic network text" not in str(log)
+    assert client.get("/api/overview").json()["counts"]["accounts"] == 0
+
+    second = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79991234567"})
+    assert second.status_code == 200
+    connection = connect(client.app.state.database)
+    new_id = int(connection.execute("SELECT account_id FROM onboarding_sessions WHERE id=?", (second.json()["session_id"],)).fetchone()[0])
+    assert new_id != old_id
+    assert connection.execute("SELECT COUNT(*) FROM accounts WHERE phone='+79991234567' AND lifecycle='active'", ()).fetchone()[0] == 1
+    connection.close()
+    coroutines.pop().close()
+
+
+def test_failed_attempt_cleanup_failure_blocks_reuse_until_retry_completes(tmp_path, monkeypatch):
+    from maxbot_v2.session_vault import EncryptedSessionFile
+
+    coroutines = []
+    real_create_task = asyncio.create_task
+
+    def capture(coro, **kwargs):
+        if coro.cr_code.co_name == "run_onboarding_auth":
+            coroutines.append(coro)
+            return None
+        return real_create_task(coro, **kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", capture)
+    client, _csrf = owner_client(tmp_path, monkeypatch)
+    group_id = client.post(
+        "/api/groups", headers={"X-CSRF-Token": _csrf},
+        json={"name": "Сбой очистки", "invite_link": "https://max.ru/join/cleanup-retry"},
+    ).json()["id"]
+    token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
+
+    class FailedAdapter:
+        async def connect(self):
+            raise OSError("safe synthetic connection failure")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(lambda _cls, **_kwargs: FailedAdapter()))
+    delete_all = EncryptedSessionFile.delete_all_generations
+    monkeypatch.setattr(EncryptedSessionFile, "delete_all_generations", lambda _self: (_ for _ in ()).throw(OSError("private path")))
+    first = client.post(
+        f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000999"},
+    )
+    connection = connect(client.app.state.database)
+    account_id = connection.execute(
+        "SELECT account_id FROM onboarding_sessions WHERE id=?", (first.json()["session_id"],),
+    ).fetchone()[0]
+    connection.close()
+    asyncio.run(coroutines.pop())
+
+    connection = connect(client.app.state.database)
+    failed = connection.execute("SELECT state,phone,full_name FROM onboarding_sessions WHERE id=?", (first.json()["session_id"],)).fetchone()
+    pending = connection.execute("SELECT lifecycle FROM accounts WHERE id=?", (account_id,)).fetchone()[0]
+    connection.close()
+    assert tuple(failed) == ("failed", None, None)
+    assert pending == "delete_pending"
+    retry_while_blocked = client.post(
+        f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000999"},
+    )
+    assert retry_while_blocked.status_code == 409
+    assert retry_while_blocked.json()["detail"] == "account_deletion_incomplete"
+
+    monkeypatch.setattr(EncryptedSessionFile, "delete_all_generations", delete_all)
+    retry = client.post(
+        f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000999"},
+    )
+    assert retry.status_code == 200
+    connection = connect(client.app.state.database)
+    new_id = connection.execute(
+        "SELECT account_id FROM onboarding_sessions WHERE id=?", (retry.json()["session_id"],),
+    ).fetchone()[0]
+    assert new_id != account_id
+    assert connection.execute("SELECT lifecycle FROM accounts WHERE id=?", (account_id,)).fetchone()[0] == "deleted"
+    connection.close()
+    coroutines.pop().close()
+
+
+@pytest.mark.parametrize("operation_status", ["in_flight", "unknown"])
+def test_owner_delete_conflicts_unresolved_send_without_changing_account_or_ip(tmp_path, monkeypatch, operation_status):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post(
+        "/api/groups", headers=headers,
+        json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
+    ).json()["id"]
+    db = connect(client.app.state.database)
+    account_id = db.execute(
+        "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?, '+79990000002','Member','active','authenticated')",
+        (group_id,),
+    ).lastrowid
+    ip_id = db.execute("SELECT id FROM server_ips LIMIT 1").fetchone()[0]
+    db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
+    version_id = db.execute(
+        "INSERT INTO message_versions(created_at,checksum) VALUES('2026-09-27','test-version')"
+    ).lastrowid
+    slot = create_weekly_slot(db, account_id=account_id, week_start="2026-09-21", scheduled_date="2026-09-21", text="hello", message_version_id=version_id)
+    db.execute(
+        "INSERT INTO operations(operation_id,slot_id,account_id,group_id,status,started_at) VALUES('unresolved-op',?,?,?,?, '2026-09-21')",
+        (slot["slot_id"], account_id, group_id, operation_status),
+    )
+    db.close()
+
+    response = client.delete(f"/api/accounts/{account_id}", headers=headers)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "operation_reconciliation_required"
+    db = connect(client.app.state.database)
+    assert db.execute("SELECT lifecycle,phone FROM accounts WHERE id=?", (account_id,)).fetchone()["lifecycle"] == "active"
+    assert db.execute("SELECT ip_id FROM ip_assignments WHERE account_id=?", (account_id,)).fetchone()[0] == ip_id
+    assert db.execute("SELECT status FROM operations WHERE operation_id='unresolved-op'").fetchone()[0] == operation_status
+    db.close()
+
+
+def test_owner_delete_keeps_retryable_state_when_session_file_removal_fails(tmp_path, monkeypatch):
+    from maxbot_v2.session_vault import EncryptedSessionFile
+
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post(
+        "/api/groups", headers=headers,
+        json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
+    ).json()["id"]
+    db = connect(client.app.state.database)
+    account_id = db.execute(
+        "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,ever_authenticated) VALUES(?, '+79990000003','Member','active','authenticated',1)",
+        (group_id,),
+    ).lastrowid
+    ip_id = db.execute("SELECT id FROM server_ips LIMIT 1").fetchone()[0]
+    db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
+    db.close()
+    original_delete = EncryptedSessionFile.delete_all_generations
+
+    def fail_delete(_vault):
+        raise OSError("private path")
+
+    monkeypatch.setattr(EncryptedSessionFile, "delete_all_generations", fail_delete)
+    first = client.delete(f"/api/accounts/{account_id}", headers=headers)
+    assert first.status_code == 503
+    db = connect(client.app.state.database)
+    pending = db.execute("SELECT lifecycle,phone FROM accounts WHERE id=?", (account_id,)).fetchone()
+    assert tuple(pending) == ("delete_pending", "+79990000003")
+    assert db.execute("SELECT 1 FROM ip_assignments WHERE account_id=?", (account_id,)).fetchone() is None
+    db.close()
+
+    monkeypatch.setattr(EncryptedSessionFile, "delete_all_generations", original_delete)
+    second = client.delete(f"/api/accounts/{account_id}", headers=headers)
+    assert second.status_code == 200
+    assert second.json() == {"deleted": True}
+    assert client.delete(f"/api/accounts/{account_id}", headers=headers).json() == {"deleted": True}
 
 
 def test_refresh_finds_new_ip_disabled_and_owner_can_reassign(tmp_path, monkeypatch):

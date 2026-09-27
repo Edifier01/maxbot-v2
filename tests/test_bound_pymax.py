@@ -107,3 +107,14 @@ def test_only_explicit_pymax_login_token_errors_require_a_new_session_generation
     assert PyMaxAdapter.is_invalid_saved_session_error(ApiError(opcode=Opcode.LOGIN.value, error="FAIL_LOGOUT_ALL"))
     assert not PyMaxAdapter.is_invalid_saved_session_error(ApiError(opcode=Opcode.PROFILE.value, error="FAIL_LOGIN_TOKEN"))
     assert not PyMaxAdapter.is_invalid_saved_session_error(RuntimeError("network timeout"))
+
+
+def test_auth_opcode_to_safe_diagnostic_stage_mapping():
+    assert PyMaxAdapter.auth_stage_for_opcode(17) == "request_code"
+    assert PyMaxAdapter.auth_stage_for_opcode(18) == "otp"
+    assert PyMaxAdapter.auth_stage_for_opcode(115) == "two_factor"
+    assert PyMaxAdapter.auth_stage_for_opcode(19) == "login"
+    assert PyMaxAdapter.auth_stage_for_opcode(16) == "profile"
+    assert PyMaxAdapter.auth_stage_for_opcode(56) == "resolve_group"
+    assert PyMaxAdapter.auth_stage_for_opcode(57) == "join_group"
+    assert PyMaxAdapter.auth_stage_for_opcode(9999) is None

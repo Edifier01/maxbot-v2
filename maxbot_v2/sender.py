@@ -48,11 +48,11 @@ class Sender:
             self.db.rollback()
             return str(slot["status"])
         group = self.db.execute("SELECT chat_id,active FROM groups WHERE id=?", (slot["group_id"],)).fetchone()
-        account = self.db.execute("SELECT status FROM accounts WHERE id=?", (slot["account_id"],)).fetchone()
+        account = self.db.execute("SELECT status,lifecycle,phone_fingerprint FROM accounts WHERE id=?", (slot["account_id"],)).fetchone()
         if group is None or not int(group["active"]):
             self.db.rollback()
             return "blocked"
-        if not account or account["status"] != "active":
+        if not account or account["status"] != "active" or account["lifecycle"] != "active":
             self.db.execute("UPDATE weekly_slots SET status='blocked',error_code='account_not_active',updated_at=? WHERE slot_id=?", (stamp, slot_id))
             self.db.commit()
             return "blocked"
@@ -60,7 +60,12 @@ class Sender:
             self.db.execute("UPDATE weekly_slots SET status='blocked',error_code='destination_unverified',updated_at=? WHERE slot_id=?", (stamp, slot_id))
             self.db.commit()
             return "blocked"
-        if self.db.execute("SELECT 1 FROM send_log WHERE account_id=? AND slot_id<>? AND sent_at>=?", (slot["account_id"], slot_id, slot["week_start"])).fetchone():
+        if self.db.execute(
+            "SELECT 1 FROM send_log prior JOIN accounts prior_account ON prior_account.id=prior.account_id "
+            "WHERE prior.slot_id<>? AND prior.sent_at>=? AND (prior.account_id=? OR "
+            "(? IS NOT NULL AND prior_account.phone_fingerprint=?)) LIMIT 1",
+            (slot_id, slot["week_start"], slot["account_id"], account["phone_fingerprint"], account["phone_fingerprint"]),
+        ).fetchone():
             self.db.execute("UPDATE weekly_slots SET status='blocked',error_code='weekly_limit_reached',updated_at=? WHERE slot_id=?", (stamp, slot_id))
             self.db.commit()
             return "blocked"
