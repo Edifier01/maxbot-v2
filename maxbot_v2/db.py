@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     full_name TEXT NOT NULL,
     max_user_id TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
+    auth_state TEXT NOT NULL DEFAULT 'unverified',
     send_weekday INTEGER CHECK(send_weekday BETWEEN 0 AND 6),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -192,6 +193,11 @@ def initialize(connection: sqlite3.Connection) -> None:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(accounts)")}
     if "session_generation" not in columns:
         connection.execute("ALTER TABLE accounts ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 0")
+    if "auth_state" not in columns:
+        connection.execute("ALTER TABLE accounts ADD COLUMN auth_state TEXT NOT NULL DEFAULT 'unverified'")
+        connection.execute(
+            "UPDATE accounts SET auth_state='authenticated' WHERE status IN ('active','needs_membership')"
+        )
     columns = {row[1] for row in connection.execute("PRAGMA table_info(onboarding_sessions)")}
     if "ip_id" not in columns:
         connection.execute("ALTER TABLE onboarding_sessions ADD COLUMN ip_id INTEGER REFERENCES server_ips(id)")

@@ -7,8 +7,13 @@ from pathlib import Path
 from .crypto import SecretBox
 
 
+class SessionSnapshotUnavailable(RuntimeError):
+    """The live PyMax database could not be read as a complete SQLite snapshot."""
+
+
 class EncryptedSessionFile:
     """Encrypted durable snapshot with a transient working copy on tmpfs."""
+
     def __init__(self, account_id: int, *, generation: int = 0, durable_dir: str | Path, runtime_dir: str | Path, box: SecretBox | None = None):
         self.account_id = int(account_id)
         self.generation = max(0, int(generation))
@@ -31,40 +36,75 @@ class EncryptedSessionFile:
                 pass
         return str(self.work_dir), self.work_path.name
 
+    def snapshot(self) -> bool:
+        """Atomically save a consistent encrypted snapshot when a MAX token exists.
+
+        SQLite's backup API includes committed WAL pages. The source database remains
+        open and unchanged so PyMax can continue using it after authentication.
+        Empty or tokenless databases never replace an existing saved generation.
+        """
+        if not self.work_path.exists():
+            return False
+        source = None
+        snapshot = None
+        try:
+            source = sqlite3.connect(self.work_path)
+            snapshot = sqlite3.connect(":memory:")
+            source.backup(snapshot)
+            tables = {row[0] for row in snapshot.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "sessions" not in tables:
+                return False
+            row = snapshot.execute("SELECT 1 FROM sessions WHERE token IS NOT NULL AND token<>'' LIMIT 1").fetchone()
+            if row is None:
+                return False
+            raw = snapshot.serialize()
+        except sqlite3.DatabaseError as exc:
+            raise SessionSnapshotUnavailable("session_snapshot_unavailable") from exc
+        finally:
+            if snapshot is not None:
+                snapshot.close()
+            if source is not None:
+                source.close()
+
+        self.durable_dir.mkdir(parents=True, exist_ok=True)
+        encrypted = self.box.encrypt_bytes(raw)
+        temp_path = self.encrypted_path.with_suffix(".tmp")
+        try:
+            with temp_path.open("wb") as handle:
+                handle.write(encrypted)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.chmod(temp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(temp_path, self.encrypted_path)
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        return True
+
     def seal(self) -> None:
         if not self.work_path.exists():
             return
         try:
-            connection = sqlite3.connect(self.work_path)
-            try:
-                connection.execute("PRAGMA wal_checkpoint(FULL)")
-            finally:
-                connection.close()
-        except sqlite3.DatabaseError:
-            pass
-        encrypted = self.box.encrypt_bytes(self.work_path.read_bytes())
-        temp_path = self.encrypted_path.with_suffix(".tmp")
-        temp_path.write_bytes(encrypted)
-        try:
-            os.chmod(temp_path, 0o600)
-        except OSError:
-            pass
-        temp_path.replace(self.encrypted_path)
-        for path in self.work_dir.glob("*"):
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        try:
-            self.work_dir.rmdir()
-        except OSError:
-            pass
+            self.snapshot()
+        finally:
+            self.discard_working_copy()
 
     def discard_working_copy(self) -> None:
-        """Remove plaintext after a failed client construction without replacing the durable snapshot."""
+        """Remove plaintext after client close without replacing a durable snapshot."""
         if not self.work_dir.exists():
             return
         for path in self.work_dir.iterdir():
             if path.is_file():
-                path.unlink()
-        self.work_dir.rmdir()
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        try:
+            self.work_dir.rmdir()
+        except OSError:
+            pass

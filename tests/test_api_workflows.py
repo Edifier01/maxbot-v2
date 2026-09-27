@@ -104,7 +104,7 @@ def test_start_normalizes_phone_and_reuses_legacy_pending_account(tmp_path, monk
     db.close()
 
 
-def test_expired_membership_attempt_allows_new_start(tmp_path, monkeypatch):
+def test_authenticated_membership_attempt_survives_auth_expiry_and_cannot_retry_login(tmp_path, monkeypatch):
     real_create_task = asyncio.create_task
 
     def skip(coro, **_kwargs):
@@ -121,10 +121,242 @@ def test_expired_membership_attempt_allows_new_start(tmp_path, monkeypatch):
     first = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "89991234567"})
     db = connect(client.app.state.database)
     db.execute("UPDATE onboarding_sessions SET state='waiting_membership',expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (first.json()["session_id"],))
+    db.execute("UPDATE accounts SET status='needs_membership',auth_state='authenticated' WHERE phone='+79991234567'")
     db.close()
-    second = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79991234567"})
+    monkeypatch.setattr("maxbot_v2.app.bootstrap_ips", lambda _connection: None)
+
+    with TestClient(client.app, base_url="https://test.local") as restarted:
+        status = restarted.get(f"/api/public/onboarding/{token}/{first.json()['session_id']}")
+        second = restarted.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79991234567"})
+
+    assert status.json()["state"] == "waiting_membership"
+    assert status.json()["retryable"] is False
+    connection = connect(client.app.state.database)
+    invite_expiry = connection.execute("SELECT expires_at FROM onboarding_invites WHERE group_id=?", (group_id,)).fetchone()[0]
+    connection.close()
+    assert status.json()["expires_at"] == invite_expiry
+    assert second.status_code == 409
+    assert second.json()["detail"] == "phone_already_exists"
+    connection = connect(client.app.state.database)
+    connection.execute("UPDATE onboarding_invites SET expires_at='2000-01-01T00:00:00+00:00' WHERE group_id=?", (group_id,))
+    connection.close()
+    expired = client.get(f"/api/public/onboarding/{token}/{first.json()['session_id']}")
+    assert expired.json()["state"] == "cancelled"
+    assert expired.json()["error"] == "invite_unavailable"
+    assert expired.json()["retryable"] is False
+
+
+def test_expired_attempt_releases_one_use_invite_before_capacity_check(tmp_path, monkeypatch):
+    real_create_task = asyncio.create_task
+
+    def skip(coro, **_kwargs):
+        if coro.cr_code.co_name == "run_onboarding_auth":
+            coro.close()
+            return None
+        return real_create_task(coro, **_kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", skip)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    token = client.post(f"/api/groups/{group_id}/onboarding-link?max_uses=1", headers=headers, json={}).json()["url"].rsplit("/", 1)[1]
+    first = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79991234567"})
+    assert first.status_code == 200
+    connection = connect(client.app.state.database)
+    connection.execute("UPDATE onboarding_sessions SET state='waiting_code',expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (first.json()["session_id"],))
+    connection.close()
+
+    second = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Пётр", "phone": "+79991234568"})
+
     assert second.status_code == 200
-    assert second.json()["session_id"] != first.json()["session_id"]
+    connection = connect(client.app.state.database)
+    states = [row[0] for row in connection.execute("SELECT state FROM onboarding_sessions ORDER BY created_at,id")]
+    connection.close()
+    assert states == ["expired", "starting"]
+
+
+def test_ip_api_splits_assignments_authentication_and_live_attempts(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    group_id = client.post("/api/groups", headers={"X-CSRF-Token": csrf}, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    ip_id = client.get("/api/ips").json()[0]["id"]
+    connection = connect(client.app.state.database)
+    accounts = []
+    for index in range(3):
+        account_id = connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'pending')", (group_id, f'+7999000000{index}', 'guest')).lastrowid
+        connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
+        accounts.append(account_id)
+    connection.execute("UPDATE accounts SET auth_state='authenticated',status='needs_membership' WHERE id=?", (accounts[0],))
+    invite = connection.execute("SELECT id,token_hash FROM onboarding_invites WHERE group_id=?", (group_id,)).fetchone()
+    invite_id = invite["id"]
+    connection.execute("INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,state,account_id,expires_at,created_at,updated_at) VALUES('live-count',?,'hash-counts','csrf','waiting_code',?,'2099-01-01','2026-09-27','2026-09-27')", (invite_id, accounts[1]))
+    connection.execute("UPDATE onboarding_sessions SET token_hash=? WHERE id='live-count'", (invite["token_hash"],))
+    connection.execute("INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,state,account_id,expires_at,created_at,updated_at) VALUES('failed-count',?,?,?,'failed',?,'2099-01-01','2026-09-27','2026-09-27')", (invite_id, invite["token_hash"], 'csrf', accounts[2]))
+    connection.close()
+
+    ip = next(row for row in client.get("/api/ips").json() if row["id"] == ip_id)
+
+    assert ip["assigned_count"] == 3
+    assert ip["authenticated_count"] == 1
+    assert ip["in_progress_count"] == 1
+    assert ip["unconfirmed_count"] == 1
+    group = next(row for row in client.get("/api/groups").json() if row["id"] == group_id)
+    assert group["account_count"] == 3
+    assert group["authenticated_account_count"] == 1
+    assert group["in_progress_account_count"] == 1
+    assert group["unconfirmed_account_count"] == 1
+
+
+def test_guest_form_rejects_duplicate_code_and_password_while_verifying(tmp_path, monkeypatch):
+    real_create_task = asyncio.create_task
+
+    def skip(coro, **_kwargs):
+        if coro.cr_code.co_name == "run_onboarding_auth":
+            coro.close()
+            return None
+        return real_create_task(coro, **_kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", skip)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    group_id = client.post("/api/groups", headers={"X-CSRF-Token": csrf}, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
+    session_id = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"}).json()["session_id"]
+    runtime = client.app.state.onboarding_flows[session_id]
+    connection = connect(client.app.state.database)
+    connection.execute("UPDATE onboarding_sessions SET state='waiting_code' WHERE id=?", (session_id,))
+    connection.close()
+
+    code = client.post(f"/api/public/onboarding/{token}/{session_id}/code", json={"code": "123456"})
+    duplicate_code = client.post(f"/api/public/onboarding/{token}/{session_id}/code", json={"code": "654321"})
+
+    assert code.status_code == 200
+    assert duplicate_code.status_code == 409
+    assert duplicate_code.json()["detail"] == "onboarding_session_not_waiting_for_code"
+    assert runtime["flow"].codes.qsize() == 1
+
+    runtime["flow"].codes.get_nowait()
+    connection = connect(client.app.state.database)
+    connection.execute("UPDATE onboarding_sessions SET state='waiting_password' WHERE id=?", (session_id,))
+    connection.close()
+    password = client.post(f"/api/public/onboarding/{token}/{session_id}/password", json={"password": "synthetic-password"})
+    duplicate_password = client.post(f"/api/public/onboarding/{token}/{session_id}/password", json={"password": "another-password"})
+
+    assert password.status_code == 200
+    assert password.json()["state"] == "verifying_password"
+    assert duplicate_password.status_code == 409
+    assert duplicate_password.json()["detail"] == "onboarding_session_not_waiting_for_password"
+    assert runtime["flow"].passwords.qsize() == 1
+
+
+def test_rejected_pymax_session_requires_a_new_generation_on_manual_retry(tmp_path, monkeypatch):
+    coroutines = []
+    real_create_task = asyncio.create_task
+
+    def capture(coro, **_kwargs):
+        if coro.cr_code.co_name == "run_onboarding_auth":
+            coroutines.append(coro)
+            return None
+        return real_create_task(coro, **_kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", capture)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    group_id = client.post("/api/groups", headers={"X-CSRF-Token": csrf}, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
+
+    class ApiError(Exception):
+        error = "FAIL_LOGIN_TOKEN"
+        message = "safe synthetic provider error"
+        opcode = type("Opcode", (), {"name": "LOGIN"})()
+
+    class FakeAdapter:
+        async def connect(self):
+            raise ApiError("FAIL_LOGIN_TOKEN")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(lambda _cls, **_kwargs: FakeAdapter()))
+    first = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
+    asyncio.run(coroutines.pop())
+    connection = connect(client.app.state.database)
+    account_id = connection.execute("SELECT account_id FROM onboarding_sessions WHERE id=?", (first.json()["session_id"],)).fetchone()[0]
+    original_ip = connection.execute("SELECT ip_id FROM ip_assignments WHERE account_id=?", (account_id,)).fetchone()[0]
+    assert connection.execute("SELECT auth_state FROM accounts WHERE id=?", (account_id,)).fetchone()[0] == "reauth_required"
+    assert connection.execute("SELECT error_code FROM onboarding_sessions WHERE id=?", (first.json()["session_id"],)).fetchone()[0] == "saved_session_rejected"
+    connection.close()
+
+    retry = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
+    connection = connect(client.app.state.database)
+    reset = connection.execute("SELECT session_generation,auth_state FROM accounts WHERE id=?", (account_id,)).fetchone()
+    assert (reset["session_generation"], reset["auth_state"]) == (1, "unverified")
+    assert connection.execute("SELECT ip_id FROM ip_assignments WHERE account_id=?", (account_id,)).fetchone()[0] == original_ip
+    assert connection.execute("SELECT COUNT(*) FROM ip_assignments WHERE account_id=?", (account_id,)).fetchone()[0] == 1
+    connection.close()
+    coroutines.pop().close()
+    assert retry.status_code == 200
+
+
+def test_active_account_with_rejected_saved_session_can_start_manual_reauth(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    coroutines = []
+    real_create_task = asyncio.create_task
+
+    def capture(coro, **kwargs):
+        if coro.cr_code.co_name == "run_onboarding_auth":
+            coroutines.append(coro)
+            return None
+        return real_create_task(coro, **kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", capture)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
+    ip_id = client.get("/api/ips").json()[0]["id"]
+    connection = connect(client.app.state.database)
+    account_id = connection.execute(
+        "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,max_user_id) VALUES(?,?,?,'active','authenticated','max-user')",
+        (group_id, "+79990000000", "Иван"),
+    ).lastrowid
+    connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
+    connection.close()
+
+    class ApiError(Exception):
+        error = "FAIL_LOGIN_TOKEN"
+        message = "safe synthetic provider error"
+        opcode = SimpleNamespace(name="LOGIN")
+
+    class RejectedAdapter:
+        async def connect(self):
+            raise ApiError("FAIL_LOGIN_TOKEN")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(lambda _cls, **_kwargs: RejectedAdapter()))
+    checked = client.post(f"/api/groups/{group_id}/verify-destination", headers=headers, json={})
+    assert checked.status_code == 503
+    connection = connect(client.app.state.database)
+    assert connection.execute("SELECT auth_state FROM accounts WHERE id=?", (account_id,)).fetchone()[0] == "reauth_required"
+    invite = connection.execute("SELECT id,token_hash FROM onboarding_invites WHERE group_id=?", (group_id,)).fetchone()
+    connection.execute("UPDATE onboarding_invites SET max_uses=1,uses_count=1 WHERE id=?", (invite["id"],))
+    connection.execute("UPDATE accounts SET status='needs_membership' WHERE id=?", (account_id,))
+    connection.execute(
+        "INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,phone,full_name,state,account_id,ip_id,expires_at,created_at,updated_at) "
+        "VALUES('old-membership',?,?,?,'+79990000000','Иван','waiting_membership',?,?, '2099-01-01T00:00:00+00:00','2026-09-27T00:00:00+00:00','2026-09-27T00:00:00+00:00')",
+        (invite["id"], invite["token_hash"], "synthetic-csrf-hash", account_id, ip_id),
+    )
+    connection.close()
+
+    restarted = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79990000000"})
+    assert restarted.status_code == 200
+    connection = connect(client.app.state.database)
+    account = connection.execute("SELECT status,auth_state,session_generation FROM accounts WHERE id=?", (account_id,)).fetchone()
+    assert tuple(account) == ("pending", "unverified", 1)
+    assert tuple(connection.execute("SELECT state,error_code FROM onboarding_sessions WHERE id='old-membership'").fetchone()) == ("cancelled", "reauthentication_started")
+    assert connection.execute("SELECT COUNT(*) FROM ip_assignments WHERE account_id=?", (account_id,)).fetchone()[0] == 1
+    connection.close()
+    coroutines.pop().close()
 
 
 def test_invalid_body_does_not_echo_password(tmp_path, monkeypatch):
@@ -220,6 +452,7 @@ def test_membership_check_stops_when_assigned_ip_changes_during_connect(tmp_path
     db = connect(client.app.state.database)
     db.execute("UPDATE groups SET chat_id='7001' WHERE id=?", (group_id,))
     db.execute("UPDATE onboarding_sessions SET state='waiting_membership' WHERE id=?", (session_id,))
+    db.execute("UPDATE accounts SET status='needs_membership',auth_state='authenticated' WHERE id=(SELECT account_id FROM onboarding_sessions WHERE id=?)", (session_id,))
     db.close()
 
     class FakeAdapter:
@@ -410,6 +643,8 @@ def test_failed_first_onboarding_can_retry_same_phone_with_one_use_link(tmp_path
     try:
         connection.execute("UPDATE onboarding_sessions SET state='failed',error_code='timeouterror' WHERE id=?", (first.json()["session_id"],))
         first_account_id = connection.execute("SELECT account_id FROM onboarding_sessions WHERE id=?", (first.json()["session_id"],)).fetchone()[0]
+        connection.execute("UPDATE accounts SET auth_state='reauth_required' WHERE id=?", (first_account_id,))
+        original_ip = connection.execute("SELECT ip_id FROM ip_assignments WHERE account_id=?", (first_account_id,)).fetchone()[0]
     finally:
         connection.close()
 
@@ -420,6 +655,9 @@ def test_failed_first_onboarding_can_retry_same_phone_with_one_use_link(tmp_path
     try:
         retry_account_id = connection.execute("SELECT account_id FROM onboarding_sessions WHERE id=?", (retry.json()["session_id"],)).fetchone()[0]
         assert retry_account_id == first_account_id
+        assert connection.execute("SELECT session_generation FROM accounts WHERE id=?", (first_account_id,)).fetchone()[0] == 1
+        assert connection.execute("SELECT ip_id FROM ip_assignments WHERE account_id=?", (first_account_id,)).fetchone()[0] == original_ip
+        assert connection.execute("SELECT COUNT(*) FROM ip_assignments WHERE account_id=?", (first_account_id,)).fetchone()[0] == 1
         assert connection.execute("SELECT uses_count FROM onboarding_invites WHERE group_id=?", (group_id,)).fetchone()[0] == 1
     finally:
         connection.close()
@@ -507,7 +745,7 @@ def test_destination_verification_includes_accounts_needing_membership(tmp_path,
     ip_id = client.get("/api/ips").json()[0]["id"]
     connection = connect(client.app.state.database)
     try:
-        connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'needs_membership')", (group_id, "+79990000000", "Иван"))
+        connection.execute("INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,?,?,'needs_membership','authenticated')", (group_id, "+79990000000", "Иван"))
         account_id = connection.execute("SELECT id FROM accounts WHERE phone='+79990000000'").fetchone()[0]
         connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
     finally:
@@ -526,7 +764,7 @@ def test_destination_verification_stops_when_ip_changes_during_connect(tmp_path,
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
     ip_id = client.get("/api/ips").json()[0]["id"]
     connection = connect(client.app.state.database)
-    account_id = connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'needs_membership')", (group_id, "+79990000000", "Иван")).lastrowid
+    account_id = connection.execute("INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,?,?,'needs_membership','authenticated')", (group_id, "+79990000000", "Иван")).lastrowid
     connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
     connection.close()
 
@@ -555,7 +793,7 @@ def test_destination_verification_button_requires_an_assigned_enabled_ip(tmp_pat
     ip_id = client.get("/api/ips").json()[0]["id"]
     connection = connect(client.app.state.database)
     try:
-        connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'needs_membership')", (group_id, "+79990000000", "Иван"))
+        connection.execute("INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,?,?,'needs_membership','authenticated')", (group_id, "+79990000000", "Иван"))
         account_id = connection.execute("SELECT id FROM accounts WHERE phone='+79990000000'").fetchone()[0]
     finally:
         connection.close()

@@ -106,10 +106,15 @@ def assign_ip(connection: sqlite3.Connection, account_id: int) -> str:
         if assigned is None:
             raise ValueError("ip_assignment_unavailable")
         return assigned[1]
+    now = datetime.now(timezone.utc).isoformat()
     candidates = connection.execute(
-        "SELECT p.id,p.address,COUNT(a.account_id) AS load FROM server_ips p "
-        "LEFT JOIN ip_assignments a ON a.ip_id=p.id WHERE p.enabled=1 AND p.available=1 "
-        "GROUP BY p.id ORDER BY load,p.id"
+        "SELECT p.id,p.address,COUNT(DISTINCT CASE WHEN a.auth_state='authenticated' OR EXISTS ("
+        "SELECT 1 FROM onboarding_sessions s WHERE s.account_id=a.id AND s.state IN "
+        "('starting','requesting_code','waiting_code','verifying_code','waiting_password','verifying_password','joining_group') "
+        "AND s.expires_at>?) THEN a.id END) AS load FROM server_ips p "
+        "LEFT JOIN ip_assignments ia ON ia.ip_id=p.id LEFT JOIN accounts a ON a.id=ia.account_id "
+        "WHERE p.enabled=1 AND p.available=1 GROUP BY p.id ORDER BY load,p.id",
+        (now,),
     ).fetchall()
     chosen = next((row for row in candidates if allowed_address(row["address"])), None)
     if chosen is None:

@@ -50,6 +50,7 @@ class WebAuthProviders:
         finally:
             self.waiting_for = None
         self.current_stage = "check_password"
+        self.update("verifying_password", "")
         return password
 
 

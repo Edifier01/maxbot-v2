@@ -32,7 +32,7 @@ def test_week_is_monday_based():
 def test_ip_assignment_uses_least_loaded_and_persists(db):
     db.execute("INSERT INTO groups(id, name, invite_link) VALUES (1, 'G', 'https://max.ru/join/a')")
     db.execute("INSERT INTO server_ips(id,address,enabled,available) VALUES (1,'62.109.20.186',1,1),(2,'62.109.20.187',1,1)")
-    db.execute("INSERT INTO accounts(id, group_id, phone, full_name, status) VALUES (1, 1, '+70000000001', 'One', 'active'), (2, 1, '+70000000002', 'Two', 'active'), (3, 1, '+70000000003', 'Three', 'active')")
+    db.execute("INSERT INTO accounts(id, group_id, phone, full_name, status, auth_state) VALUES (1, 1, '+70000000001', 'One', 'active','authenticated'), (2, 1, '+70000000002', 'Two', 'active','authenticated'), (3, 1, '+70000000003', 'Three', 'active','authenticated')")
     from maxbot_v2.egress import assign_ip
 
     assert assign_ip(db, 1) == "62.109.20.186"
