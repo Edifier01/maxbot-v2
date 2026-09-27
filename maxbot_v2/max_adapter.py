@@ -6,7 +6,7 @@ import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
-from typing import Any
+from typing import Any, Callable
 
 from .egress import allowed_address
 from .session_vault import EncryptedSessionFile
@@ -46,6 +46,7 @@ class PyMaxAdapter:
     def create(
         cls, *, phone: str, source_ip: str, session_vault: EncryptedSessionFile | None = None,
         code_provider: Any = None, password_provider: Any = None,
+        before_network_action: Callable[[], None] | None = None,
     ):
         if not allowed_address(source_ip):
             raise AdapterUnavailable("ip_assignment_required")
@@ -67,6 +68,8 @@ class PyMaxAdapter:
 
         class BoundTransport(TCPTransport):
             async def connect(self):
+                if before_network_action is not None:
+                    before_network_action()
                 if self._proxy:
                     raise AdapterUnavailable("proxy_route_forbidden")
                 self._reader, self._writer = await asyncio.open_connection(
@@ -77,6 +80,11 @@ class PyMaxAdapter:
                 if actual is None or actual[0] != source_ip:
                     await self.close()
                     raise AdapterUnavailable("source_ip_mismatch")
+
+            async def send(self, data):
+                if before_network_action is not None:
+                    before_network_action()
+                await super().send(data)
 
         class BoundClient(Client):
             def _build_connection(self):
@@ -119,6 +127,25 @@ class PyMaxAdapter:
 
     async def connect(self) -> None:
         await self.client.connect()
+
+    def persist_session_snapshot(self) -> bool:
+        vault = getattr(self, "_session_vault", None)
+        if vault is None:
+            return False
+        return vault.snapshot()
+
+    @staticmethod
+    def is_invalid_saved_session_error(exc: Exception) -> bool:
+        """Match PyMax 2.4.1's explicit invalid-login-token condition safely."""
+        try:
+            from pymax.exceptions import ApiError
+            from pymax.protocol.enums import Opcode
+        except Exception:
+            return False
+        if not isinstance(exc, ApiError) or getattr(exc, "opcode", None) != Opcode.LOGIN:
+            return False
+        values = {str(getattr(exc, "error", "")), str(getattr(exc, "message", ""))}
+        return bool(values & {"FAIL_LOGIN_TOKEN", "FAIL_LOGOUT_ALL"})
 
     async def resolve_group_by_link(self, link: str):
         return await self.client.resolve_group_by_link(link)

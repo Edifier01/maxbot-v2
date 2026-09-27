@@ -25,6 +25,7 @@ class WebAuthProviders:
         self.waiting_for: str | None = None
         self.current_stage = "request_code"
         self.hint = ""
+        self.password_prompt_count = 0
 
     async def get_code(self, _phone: str) -> str:
         self.current_stage = "wait_code_input"
@@ -43,13 +44,18 @@ class WebAuthProviders:
     async def get_password(self, _hint=None) -> str:
         self.current_stage = "wait_password_input"
         self.waiting_for = "password"
-        self.hint = "Введите пароль для входа MAX."
+        if self.password_prompt_count:
+            self.hint = "MAX не принял предыдущий облачный пароль. Введите пароль ещё раз."
+        else:
+            self.hint = "Введите пароль для входа MAX."
+        self.password_prompt_count += 1
         self.update("waiting_password", self.hint)
         try:
             password = await asyncio.wait_for(self.passwords.get(), timeout=300)
         finally:
             self.waiting_for = None
         self.current_stage = "check_password"
+        self.update("verifying_password", "")
         return password
 
 

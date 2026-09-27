@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from maxbot_v2.crypto import SecretBox
 from maxbot_v2.db import connect, initialize
+from maxbot_v2.egress import assign_ip
 from maxbot_v2.session_vault import EncryptedSessionFile
 from maxbot_v2.max_adapter import PyMaxAdapter
 from maxbot_v2.onboarding import join_group_and_confirm_membership, member_proof, normalize_russian_phone
@@ -74,7 +75,9 @@ def test_failed_pymax_constructor_removes_decrypted_session(tmp_path, monkeypatc
     vault = EncryptedSessionFile(10, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
     vault.open()
     connection = sqlite3.connect(vault.work_path)
-    connection.execute("CREATE TABLE proof (value INTEGER)")
+    connection.execute("CREATE TABLE sessions (token TEXT NOT NULL PRIMARY KEY)")
+    connection.execute("INSERT INTO sessions(token) VALUES('previously-saved-token')")
+    connection.commit()
     connection.close()
     vault.seal()
 
@@ -168,15 +171,21 @@ def test_auto_join_refuses_a_different_chat():
 def test_session_snapshot_is_encrypted_and_restorable(tmp_path):
     box = SecretBox(SecretBox.generate_key())
     vault = EncryptedSessionFile(7, durable_dir=tmp_path / "durable", runtime_dir=tmp_path / "runtime", box=box)
-    work_dir, filename = vault.open()
-    session = tmp_path / "runtime" / "account-7" / filename
-    session.write_bytes(b"session token secret")
+    vault.open()
+    session = vault.work_path
+    connection = sqlite3.connect(session)
+    connection.execute("CREATE TABLE sessions (token TEXT NOT NULL PRIMARY KEY)")
+    connection.execute("INSERT INTO sessions(token) VALUES('session-token-secret')")
+    connection.commit()
+    connection.close()
     vault.seal()
     encrypted = (tmp_path / "durable" / "account-7.session.enc").read_bytes()
-    assert b"session token secret" not in encrypted
+    assert b"session-token-secret" not in encrypted
     assert not session.exists()
     vault.open()
-    assert session.read_bytes() == b"session token secret"
+    restored = sqlite3.connect(session)
+    assert restored.execute("SELECT token FROM sessions").fetchone() == ("session-token-secret",)
+    restored.close()
 
 
 def test_existing_session_generation_schema_and_file_survive_restart(tmp_path):
@@ -190,13 +199,19 @@ def test_existing_session_generation_schema_and_file_survive_restart(tmp_path):
     connection.close()
     box = SecretBox(SecretBox.generate_key())
     old = EncryptedSessionFile(account_id, generation=2, durable_dir=tmp_path / "sessions", runtime_dir=tmp_path / "runtime", box=box)
-    _, filename = old.open()
-    (old.work_dir / filename).write_bytes(b"encrypted MAX session")
+    old.open()
+    session_db = sqlite3.connect(old.work_path)
+    session_db.execute("CREATE TABLE sessions (token TEXT NOT NULL PRIMARY KEY)")
+    session_db.execute("INSERT INTO sessions(token) VALUES('generation-token')")
+    session_db.commit()
+    session_db.close()
     old.seal()
     assert old.encrypted_path.name == f"account-{account_id}-generation-2.session.enc"
     restored = EncryptedSessionFile(account_id, generation=2, durable_dir=tmp_path / "sessions", runtime_dir=tmp_path / "runtime", box=box)
     restored.open()
-    assert restored.work_path.read_bytes() == b"encrypted MAX session"
+    restored_db = sqlite3.connect(restored.work_path)
+    assert restored_db.execute("SELECT token FROM sessions").fetchone() == ("generation-token",)
+    restored_db.close()
 
 
 def test_backup_and_restore_verify_database_and_encrypted_sessions(tmp_path):
@@ -218,3 +233,109 @@ def test_backup_and_restore_verify_database_and_encrypted_sessions(tmp_path):
     assert connection.execute("SELECT name FROM groups").fetchone()[0] == "group"
     connection.close()
     assert (restored / "sessions" / "account-1.session.enc").read_bytes() == b"encrypted-content"
+
+
+def test_seal_does_not_persist_a_pymax_database_without_a_session_token(tmp_path):
+    from maxbot_v2.crypto import SecretBox
+    from maxbot_v2.session_vault import EncryptedSessionFile
+
+    vault = EncryptedSessionFile(31, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
+    vault.open()
+    connection = sqlite3.connect(vault.work_path)
+    connection.execute("CREATE TABLE sessions (token TEXT NOT NULL PRIMARY KEY)")
+    connection.close()
+
+    vault.seal()
+
+    assert not vault.encrypted_path.exists()
+
+
+def test_tokenless_attempt_does_not_replace_an_existing_session_generation(tmp_path):
+    box = SecretBox(SecretBox.generate_key())
+    vault = EncryptedSessionFile(35, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=box)
+    vault.open()
+    connection = sqlite3.connect(vault.work_path)
+    connection.execute("CREATE TABLE sessions (token TEXT NOT NULL PRIMARY KEY)")
+    connection.execute("INSERT INTO sessions(token) VALUES('valid-old-token')")
+    connection.commit()
+    connection.close()
+    vault.seal()
+    previous = vault.encrypted_path.read_bytes()
+
+    vault.open()
+    connection = sqlite3.connect(vault.work_path)
+    connection.execute("DELETE FROM sessions")
+    connection.commit()
+    connection.close()
+    vault.seal()
+
+    assert vault.encrypted_path.read_bytes() == previous
+
+
+def test_snapshot_encrypts_a_live_session_without_removing_the_working_database(tmp_path):
+    from maxbot_v2.crypto import SecretBox
+    from maxbot_v2.session_vault import EncryptedSessionFile
+
+    box = SecretBox(SecretBox.generate_key())
+    vault = EncryptedSessionFile(32, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=box)
+    vault.open()
+    connection = sqlite3.connect(vault.work_path)
+    connection.execute("CREATE TABLE sessions (token TEXT NOT NULL PRIMARY KEY)")
+    connection.execute("INSERT INTO sessions(token) VALUES('synthetic-token')")
+    connection.commit()
+    connection.close()
+
+    vault.snapshot()
+
+    assert vault.encrypted_path.exists()
+    assert vault.work_path.exists()
+    decrypted = box.decrypt_bytes(vault.encrypted_path.read_bytes())
+    assert b"synthetic-token" not in vault.encrypted_path.read_bytes()
+    restored = sqlite3.connect(":memory:")
+    restored.deserialize(decrypted)
+    assert restored.execute("SELECT token FROM sessions").fetchone() == ("synthetic-token",)
+
+
+def test_initialize_conservatively_backfills_authentication_once(tmp_path):
+    connection = sqlite3.connect(tmp_path / "legacy.db")
+    connection.execute("CREATE TABLE groups (id INTEGER PRIMARY KEY, name TEXT NOT NULL, invite_link TEXT NOT NULL, chat_id TEXT, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    connection.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, group_id INTEGER NOT NULL REFERENCES groups(id), phone TEXT NOT NULL UNIQUE, full_name TEXT NOT NULL, max_user_id TEXT, status TEXT NOT NULL DEFAULT 'pending', send_weekday INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
+    connection.execute("INSERT INTO groups(name,invite_link) VALUES('group','https://max.ru/join/test')")
+    connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(1,'+79990000001','active','active')")
+    connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(1,'+79990000002','membership','needs_membership')")
+    connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(1,'+79990000003','pending','pending')")
+
+    initialize(connection)
+    connection.execute("UPDATE accounts SET auth_state='reauth_required' WHERE id=1")
+    initialize(connection)
+
+    states = [row[0] for row in connection.execute("SELECT auth_state FROM accounts ORDER BY id")]
+    connection.close()
+    assert states == ["reauth_required", "authenticated", "unverified"]
+
+
+def test_allocator_ignores_old_failed_ip_assignments(tmp_path):
+    connection = connect(tmp_path / "allocator.db")
+    initialize(connection)
+    group_id = connection.execute("INSERT INTO groups(name,invite_link) VALUES('group','https://max.ru/join/test')").lastrowid
+    ip_a = connection.execute("INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.186',1,1)").lastrowid
+    connection.execute("INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.187',1,1)")
+    accounts = []
+    for index in range(4):
+        account_id = connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'pending')", (group_id, f'+7999000000{index}', 'guest')).lastrowid
+        connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_a))
+        accounts.append(account_id)
+    connection.execute("UPDATE accounts SET auth_state='authenticated' WHERE id=?", (accounts[0],))
+    connection.execute("INSERT INTO onboarding_invites(group_id,token_hash,token_ciphertext,created_at,expires_at) VALUES(1,'hash','cipher','2026-09-27','2099-01-01')")
+    invite_id = connection.execute("SELECT id FROM onboarding_invites").fetchone()[0]
+    connection.execute(
+        "INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,state,account_id,expires_at,created_at,updated_at) "
+        "VALUES('active-attempt',?,'hash','csrf','waiting_code',?,'2099-01-01','2026-09-27','2026-09-27')",
+        (invite_id, accounts[1]),
+    )
+    new_id = connection.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?,?,?,'pending')", (group_id, '+799900000099', 'new')).lastrowid
+
+    selected = assign_ip(connection, new_id)
+
+    assert selected == '62.109.20.187'
+    connection.close()

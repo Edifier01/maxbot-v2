@@ -130,6 +130,10 @@ def create_app(
         finally:
             connection.close()
 
+    def mark_reauth_required(account_id: int) -> None:
+        with db() as connection:
+            connection.execute("UPDATE accounts SET auth_state='reauth_required' WHERE id=?", (account_id,))
+
     with db() as connection:
         initialize(connection)
 
@@ -168,10 +172,12 @@ def create_app(
     async def scheduled_provider(slot):
         with db() as connection:
             row = connection.execute(
-                "SELECT a.phone,p.id AS ip_id,p.address FROM accounts a JOIN ip_assignments ia ON ia.account_id=a.id "
+                "SELECT a.phone,a.auth_state,p.id AS ip_id,p.address FROM accounts a JOIN ip_assignments ia ON ia.account_id=a.id "
                 "JOIN server_ips p ON p.id=ia.ip_id WHERE a.id=? AND p.enabled=1 AND p.available=1",
                 (slot["account_id"],),
             ).fetchone()
+        if row is not None and row["auth_state"] != "authenticated":
+            raise DispatchPaused("account_reauthentication_required", blocked=True)
         if row is None or not allowed_address(row["address"]) or row["address"] not in host_addresses():
             raise DispatchPaused("ip_assignment_unavailable", blocked=True)
         vault = session_vault_for(slot["account_id"])
@@ -192,11 +198,13 @@ def create_app(
                     raise DispatchPaused("ip_assignment_changed")
 
             require_same_ip()
-            adapter = PyMaxAdapter.create(phone=row["phone"], source_ip=row["address"], session_vault=vault)
+            adapter = PyMaxAdapter.create(phone=row["phone"], source_ip=row["address"], session_vault=vault, before_network_action=require_same_ip)
             await adapter.connect()
             require_same_ip()
             return LockedAdapter(adapter, lock, int(row["ip_id"]), row["address"])
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, Exception) and PyMaxAdapter.is_invalid_saved_session_error(exc):
+                mark_reauth_required(slot["account_id"])
             try:
                 if adapter is not None:
                     try:
@@ -214,7 +222,7 @@ def create_app(
         with db() as connection:
             bootstrap_ips(connection)
             recover_in_flight(connection)
-            connection.execute("UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=? WHERE state NOT IN ('completed','failed','expired','cancelled')", (datetime.now(timezone.utc).isoformat(),))
+            connection.execute("UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=? WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership')", (datetime.now(timezone.utc).isoformat(),))
             settings = dict(connection.execute("SELECT key,value FROM settings WHERE key IN ('auto_run','global_stop')").fetchall())
             if settings.get("auto_run") != "1":
                 connection.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
@@ -227,7 +235,7 @@ def create_app(
             with db() as connection:
                 connection.execute(
                     "UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=? "
-                    "WHERE state NOT IN ('completed','failed','expired','cancelled')",
+                    "WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership')",
                     (datetime.now(timezone.utc).isoformat(),),
                 )
             for _session_id, task in tasks:
@@ -287,9 +295,17 @@ def create_app(
             state = row["state"]
             if state not in terminal_onboarding_states:
                 now = datetime.now(timezone.utc).isoformat()
-                if row["expires_at"] <= now:
+                invite_valid = bool(row["invite_active"] and row["current_invite_hash"] == row["token_hash"] and row["invite_expires_at"] > now)
+                if state == "waiting_membership":
+                    if not invite_valid:
+                        state, error = "cancelled", "invite_unavailable"
+                    else:
+                        error = row["error_code"]
+                        if row["expires_at"] != row["invite_expires_at"]:
+                            connection.execute("UPDATE onboarding_sessions SET expires_at=?,updated_at=? WHERE id=?", (row["invite_expires_at"], now, session_id))
+                elif row["expires_at"] <= now:
                     state, error = "expired", "onboarding_attempt_expired"
-                elif (not row["invite_active"] or row["current_invite_hash"] != row["token_hash"] or row["invite_expires_at"] <= now):
+                elif not invite_valid:
                     state, error = "cancelled", "invite_unavailable"
                 else:
                     error = None
@@ -303,6 +319,8 @@ def create_app(
             result = dict(row)
             result["state"] = state
             result["error_code"] = error
+            if row["state"] == "waiting_membership" and state == "waiting_membership":
+                result["expires_at"] = row["invite_expires_at"]
             active_invite = bool(row["invite_active"] and row["current_invite_hash"] == row["token_hash"] and row["invite_expires_at"] > datetime.now(timezone.utc).isoformat())
         if state in {"expired", "cancelled"}:
             cancel_onboarding_tasks([session_id])
@@ -425,7 +443,7 @@ def create_app(
             ready_accounts = connection.execute(
                 "SELECT COUNT(*) FROM accounts a JOIN groups g ON g.id=a.group_id "
                 "JOIN ip_assignments ia ON ia.account_id=a.id JOIN server_ips p ON p.id=ia.ip_id "
-                "WHERE a.status='active' AND g.active=1 AND g.chat_id IS NOT NULL AND p.enabled=1 AND p.available=1"
+                "WHERE a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL AND p.enabled=1 AND p.available=1"
             ).fetchone()[0]
         stopped = settings.get("global_stop") == "1"
         if stopped:
@@ -447,15 +465,24 @@ def create_app(
 
     @app.get("/api/groups")
     def groups(_session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
+        now = datetime.now(timezone.utc).isoformat()
         with db() as connection:
             rows = connection.execute(
                 "SELECT g.id,g.name,g.invite_link,g.chat_id,g.active,COUNT(DISTINCT a.id) account_count,"
-                "COUNT(DISTINCT CASE WHEN a.status='active' THEN a.id END) connected_account_count,"
-                "COUNT(DISTINCT CASE WHEN a.status IN ('active','needs_membership') AND EXISTS ("
+                "COUNT(DISTINCT CASE WHEN a.status='active' AND a.auth_state='authenticated' THEN a.id END) connected_account_count,"
+                "COUNT(DISTINCT CASE WHEN a.auth_state='authenticated' THEN a.id END) authenticated_account_count,"
+                "COUNT(DISTINCT CASE WHEN a.auth_state<>'authenticated' AND EXISTS (SELECT 1 FROM onboarding_sessions s "
+                "WHERE s.account_id=a.id AND s.state IN ('starting','requesting_code','waiting_code','verifying_code',"
+                "'waiting_password','verifying_password','joining_group') AND s.expires_at>?) THEN a.id END) in_progress_account_count,"
+                "COUNT(DISTINCT CASE WHEN a.auth_state<>'authenticated' AND NOT EXISTS (SELECT 1 FROM onboarding_sessions s "
+                "WHERE s.account_id=a.id AND s.state IN ('starting','requesting_code','waiting_code','verifying_code',"
+                "'waiting_password','verifying_password','joining_group') AND s.expires_at>?) THEN a.id END) unconfirmed_account_count,"
+                "COUNT(DISTINCT CASE WHEN a.auth_state='authenticated' AND a.status IN ('active','needs_membership') AND EXISTS ("
                 "SELECT 1 FROM ip_assignments ia JOIN server_ips assigned_ip ON assigned_ip.id=ia.ip_id "
                 "WHERE ia.account_id=a.id AND assigned_ip.enabled=1 AND assigned_ip.available=1) THEN a.id END) verifiable_account_count "
                 "FROM groups g LEFT JOIN accounts a ON a.group_id=g.id "
-                "GROUP BY g.id ORDER BY g.id"
+                "GROUP BY g.id ORDER BY g.id",
+                (now, now),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -544,11 +571,22 @@ def create_app(
 
     @app.get("/api/ips")
     def list_ips(_session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
+        now = datetime.now(timezone.utc).isoformat()
         with db() as connection:
             rows = connection.execute(
-                "SELECT p.id,p.address,p.enabled,p.available,p.last_checked_at,"
-                "COUNT(ia.account_id) AS assigned_count FROM server_ips p "
-                "LEFT JOIN ip_assignments ia ON ia.ip_id=p.id GROUP BY p.id ORDER BY p.id"
+                "SELECT p.id,p.address,p.enabled,p.available,p.last_checked_at,COUNT(DISTINCT a.id) AS assigned_count,"
+                "COUNT(DISTINCT CASE WHEN a.auth_state='authenticated' THEN a.id END) AS authenticated_count,"
+                "COUNT(DISTINCT CASE WHEN a.auth_state<>'authenticated' AND EXISTS ("
+                "SELECT 1 FROM onboarding_sessions s WHERE s.account_id=a.id AND s.state IN "
+                "('starting','requesting_code','waiting_code','verifying_code','waiting_password','verifying_password','joining_group') "
+                "AND s.expires_at>?) THEN a.id END) AS in_progress_count,"
+                "COUNT(DISTINCT CASE WHEN a.auth_state<>'authenticated' AND NOT EXISTS ("
+                "SELECT 1 FROM onboarding_sessions s WHERE s.account_id=a.id AND s.state IN "
+                "('starting','requesting_code','waiting_code','verifying_code','waiting_password','verifying_password','joining_group') "
+                "AND s.expires_at>?) THEN a.id END) AS unconfirmed_count "
+                "FROM server_ips p LEFT JOIN ip_assignments ia ON ia.ip_id=p.id "
+                "LEFT JOIN accounts a ON a.id=ia.account_id GROUP BY p.id ORDER BY p.id",
+                (now, now),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -717,7 +755,7 @@ def create_app(
             phone = normalize_russian_phone(str(payload.get("phone", "")))
         except ValueError as exc:
             raise HTTPException(422, "invalid_russian_phone") from exc
-        row = invite_row(None, token)
+        row = invite_row(None, token, require_capacity=False)
         session_id = new_token(16)
         now = datetime.now(timezone.utc).isoformat()
         expired_session_ids: list[str] = []
@@ -732,16 +770,13 @@ def create_app(
                         or current_invite["token_hash"] != digest_token(token) or current_invite["expires_at"] <= now):
                     connection.rollback()
                     raise HTTPException(404, "invite_unavailable")
-                if connection.execute("SELECT 1 FROM server_ips WHERE enabled=1 AND available=1 LIMIT 1").fetchone() is None:
-                    connection.rollback()
-                    raise HTTPException(409, "ip_assignment_required")
                 expired_session_ids = [old[0] for old in connection.execute(
-                    "SELECT id FROM onboarding_sessions WHERE state NOT IN ('completed','failed','expired','cancelled') AND expires_at<=?",
+                    "SELECT id FROM onboarding_sessions WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership') AND expires_at<=?",
                     (now,),
                 ).fetchall()]
                 connection.execute(
                     "UPDATE onboarding_sessions SET state='expired',error_code='onboarding_attempt_expired',updated_at=? "
-                    "WHERE state NOT IN ('completed','failed','expired','cancelled') AND expires_at<=?",
+                    "WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership') AND expires_at<=?",
                     (now, now),
                 )
                 active_uses = connection.execute(
@@ -749,11 +784,11 @@ def create_app(
                     "AND state NOT IN ('failed','expired','cancelled')",
                     (row["id"], digest_token(token)),
                 ).fetchone()[0]
-                if current_invite["max_uses"] is not None and active_uses >= current_invite["max_uses"]:
+                if connection.execute("SELECT 1 FROM server_ips WHERE enabled=1 AND available=1 LIMIT 1").fetchone() is None:
                     connection.rollback()
-                    raise HTTPException(404, "invite_unavailable")
+                    raise HTTPException(409, "ip_assignment_required")
                 matches = []
-                for candidate in connection.execute("SELECT id,group_id,status,phone FROM accounts"):
+                for candidate in connection.execute("SELECT id,group_id,status,phone,auth_state,session_generation FROM accounts"):
                     old_phone = str(candidate["phone"] or "")
                     try:
                         canonical = normalize_russian_phone(old_phone.removeprefix("+8") if old_phone.startswith("+8") else old_phone)
@@ -765,19 +800,28 @@ def create_app(
                     connection.rollback()
                     raise HTTPException(409, "phone_already_exists")
                 existing = matches[0] if matches else None
+                reusable_membership_uses = 0
                 if existing is None:
                     account_id, ip_id = prepare_account(connection, group_id=row["group_id"], phone=phone, full_name=full_name)
                 else:
-                    if existing["group_id"] != row["group_id"] or existing["status"] != "pending":
+                    reauth_required = existing["auth_state"] == "reauth_required"
+                    allowed_statuses = {"pending", "active", "needs_membership"} if reauth_required else {"pending"}
+                    if existing["group_id"] != row["group_id"] or existing["status"] not in allowed_statuses:
                         connection.rollback()
                         raise HTTPException(409, "phone_already_exists")
                     in_progress = connection.execute(
-                        "SELECT 1 FROM onboarding_sessions WHERE account_id=? AND state NOT IN ('failed','completed','expired','cancelled') LIMIT 1",
+                        "SELECT 1 FROM onboarding_sessions WHERE account_id=? AND state NOT IN ('failed','completed','expired','cancelled') "
+                        + ("AND state<>'waiting_membership' " if reauth_required else "") + "LIMIT 1",
                         (existing["id"],),
                     ).fetchone()
                     if in_progress is not None:
                         connection.rollback()
                         raise HTTPException(409, "onboarding_in_progress")
+                    if reauth_required:
+                        reusable_membership_uses = connection.execute(
+                            "SELECT COUNT(*) FROM onboarding_sessions WHERE account_id=? AND invite_id=? AND token_hash=? AND state='waiting_membership'",
+                            (existing["id"], row["id"], digest_token(token)),
+                        ).fetchone()[0]
                     try:
                         address = assign_ip(connection, existing["id"])
                     except ValueError as exc:
@@ -785,7 +829,22 @@ def create_app(
                         raise HTTPException(409, "ip_assignment_unavailable") from exc
                     account_id = existing["id"]
                     ip_id = connection.execute("SELECT id FROM server_ips WHERE address=?", (address,)).fetchone()["id"]
-                    connection.execute("UPDATE accounts SET full_name=?,phone=? WHERE id=?", (full_name, phone, account_id))
+                    if reauth_required:
+                        connection.execute(
+                            "UPDATE onboarding_sessions SET state='cancelled',error_code='reauthentication_started',updated_at=? "
+                            "WHERE account_id=? AND state='waiting_membership'",
+                            (now, existing["id"]),
+                        )
+                        connection.execute(
+                            "UPDATE accounts SET full_name=?,phone=?,session_generation=?,auth_state='unverified',status='pending' WHERE id=?",
+                            (full_name, phone, int(existing["session_generation"]) + 1, account_id),
+                        )
+                    else:
+                        connection.execute("UPDATE accounts SET full_name=?,phone=? WHERE id=?", (full_name, phone, account_id))
+                invite_use_count = max(0, active_uses - reusable_membership_uses) + 1
+                if current_invite["max_uses"] is not None and invite_use_count > current_invite["max_uses"]:
+                    connection.rollback()
+                    raise HTTPException(404, "invite_unavailable")
                 ip_row = connection.execute("SELECT address FROM server_ips WHERE id=? AND enabled=1 AND available=1", (ip_id,)).fetchone()
                 if ip_row is None or not allowed_address(ip_row["address"]) or ip_row["address"] not in host_addresses():
                     connection.rollback()
@@ -795,7 +854,7 @@ def create_app(
                     "INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,phone,full_name,state,account_id,ip_id,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?, ?,?,?,?,?)",
                     (session_id, row["id"], digest_token(token), digest_token(new_token()), phone, full_name, "starting", account_id, ip_id, (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(), now, now),
                 )
-                connection.execute("UPDATE onboarding_invites SET uses_count=? WHERE id=?", (active_uses + 1, row["id"]))
+                connection.execute("UPDATE onboarding_invites SET uses_count=? WHERE id=?", (invite_use_count, row["id"]))
                 connection.commit()
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "phone_already_exists") from exc
@@ -861,7 +920,11 @@ def create_app(
             lock_acquired = True
             validate_target()
             logger.info("onboarding_stage session_id=%s account_id=%s ip_id=%s stage=%s", session_id, runtime["account_id"], runtime["ip_id"], stage)
-            adapter = PyMaxAdapter.create(phone=runtime["phone"], source_ip=runtime["source_ip"], code_provider=runtime["flow"], password_provider=runtime["flow"], session_vault=vault)
+            adapter = PyMaxAdapter.create(
+                phone=runtime["phone"], source_ip=runtime["source_ip"],
+                code_provider=runtime["flow"], password_provider=runtime["flow"],
+                session_vault=vault, before_network_action=validate_target,
+            )
             logger.info("onboarding_stage session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000))
             stage = "connect"
             stage_started = perf_counter()
@@ -876,7 +939,19 @@ def create_app(
             if not max_user_id:
                 raise RuntimeError("max_user_id_missing")
             validate_target()
+            stage = "persist_authenticated_session"
+            stage_started = perf_counter()
+            if not adapter.persist_session_snapshot():
+                raise RuntimeError("auth_session_not_saved")
+            with db() as connection:
+                connection.execute(
+                    "UPDATE accounts SET auth_state='authenticated',max_user_id=? WHERE id=? AND status='pending'",
+                    (max_user_id, runtime["account_id"]),
+                )
+            logger.info("onboarding_stage session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000))
             try:
+                stage = "resolve_group"
+                stage_started = perf_counter()
                 resolved = await adapter.resolve_group_by_link(invite_link)
                 chat_id = str(getattr(resolved, "id", "") or getattr(resolved, "chat_id", ""))
             except Exception:
@@ -930,10 +1005,10 @@ def create_app(
                     raise ValueError("group_destination_mismatch")
                 if chat_id:
                     attach_group_on_first_account(connection, runtime["group_id"], chat_id)
-                connection.execute("UPDATE accounts SET max_user_id=?,status=? WHERE id=?", (max_user_id, "active" if joined else "needs_membership", runtime["account_id"]))
+                connection.execute("UPDATE accounts SET max_user_id=?,auth_state='authenticated',status=? WHERE id=?", (max_user_id, "active" if joined else "needs_membership", runtime["account_id"]))
                 connection.execute(
-                    "UPDATE onboarding_sessions SET state=?,error_code=?,max_user_id=?,updated_at=? WHERE id=?",
-                    ("completed" if joined else "waiting_membership", join_error, max_user_id, now, session_id),
+                    "UPDATE onboarding_sessions SET state=?,error_code=?,max_user_id=?,expires_at=?,updated_at=? WHERE id=?",
+                    ("completed" if joined else "waiting_membership", join_error, max_user_id, current["invite_expires_at"], now, session_id),
                 )
                 connection.commit()
         except Exception as exc:
@@ -957,10 +1032,20 @@ def create_app(
                 safe = "password_rejected"
             elif str(exc) == "Authentication failed: no token received":
                 safe = "auth_token_missing"
-            elif str(exc) in {"group_destination_mismatch", "max_user_id_missing", "group_resolution_failed", "account_registration_required", "cloud_password_rejected", "invite_unavailable", "ip_assignment_changed"}:
+            elif str(exc) in {"group_destination_mismatch", "max_user_id_missing", "group_resolution_failed", "account_registration_required", "cloud_password_rejected", "invite_unavailable", "ip_assignment_changed", "auth_session_not_saved"}:
                 safe = str(exc)
             else:
                 safe = type(exc).__name__.lower()
+            if PyMaxAdapter.is_invalid_saved_session_error(exc):
+                mark_reauth_required(runtime["account_id"])
+                safe = "saved_session_rejected"
+            if isinstance(exc, TimeoutError):
+                if auth_stage == "wait_code_input":
+                    safe = "code_entry_timeout"
+                elif auth_stage == "wait_password_input":
+                    safe = "password_entry_timeout"
+                else:
+                    safe = "network_timeout"
             logger.warning("onboarding_failed session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d error_class=%s", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000), type(exc).__name__)
             set_onboarding_state(session_id, "failed", safe)
         finally:
@@ -996,7 +1081,8 @@ def create_app(
         if not code.isdigit() or not 4 <= len(code) <= 8:
             raise HTTPException(422, "invalid_code")
         if runtime["flow"].codes.full():
-            runtime["flow"].codes.get_nowait()
+            raise HTTPException(409, "onboarding_session_not_waiting_for_code")
+        set_onboarding_state(session_id, "verifying_code")
         runtime["flow"].codes.put_nowait(code)
         return {"state": "verifying_code"}
 
@@ -1017,7 +1103,8 @@ def create_app(
         if not password or len(password) > 256:
             raise HTTPException(422, "invalid_password")
         if runtime["flow"].passwords.full():
-            runtime["flow"].passwords.get_nowait()
+            raise HTTPException(409, "onboarding_session_not_waiting_for_password")
+        set_onboarding_state(session_id, "verifying_password")
         runtime["flow"].passwords.put_nowait(password)
         return {"state": "verifying_password"}
 
@@ -1063,7 +1150,7 @@ def create_app(
                 "SELECT s.*,a.group_id,a.phone,g.chat_id,p.address FROM onboarding_sessions s "
                 "JOIN accounts a ON a.id=s.account_id JOIN groups g ON g.id=a.group_id "
                 "JOIN ip_assignments ia ON ia.account_id=a.id JOIN server_ips p ON p.id=ia.ip_id "
-                "AND p.enabled=1 AND p.available=1 WHERE s.id=?",
+                "AND p.enabled=1 AND p.available=1 WHERE s.id=? AND a.auth_state='authenticated'",
                 (session_id,),
             ).fetchone()
         if row is None or row["token_hash"] != digest_token(token) or row["state"] != "waiting_membership":
@@ -1084,7 +1171,7 @@ def create_app(
         try:
             source_ip = current_membership_ip()
             vault = session_vault_for(row["account_id"])
-            adapter = PyMaxAdapter.create(phone=row["phone"], source_ip=source_ip, session_vault=vault)
+            adapter = PyMaxAdapter.create(phone=row["phone"], source_ip=source_ip, session_vault=vault, before_network_action=current_membership_ip)
             await adapter.connect()
             current_membership_ip()
             chat = await adapter.get_chat(int(row["chat_id"]))
@@ -1093,6 +1180,8 @@ def create_app(
         except HTTPException:
             raise
         except Exception as exc:
+            if PyMaxAdapter.is_invalid_saved_session_error(exc):
+                mark_reauth_required(row["account_id"])
             raise HTTPException(503, "membership_check_unavailable") from exc
         finally:
             try:
@@ -1111,7 +1200,7 @@ def create_app(
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
                 "SELECT s.state,s.expires_at,s.token_hash AS session_token_hash,i.active,"
-                "i.expires_at AS invite_expires_at,i.token_hash AS invite_token_hash,a.group_id,a.status AS account_status,"
+                "i.expires_at AS invite_expires_at,i.token_hash AS invite_token_hash,a.group_id,a.status AS account_status,a.auth_state,"
                 "g.chat_id,ia.ip_id AS assigned_ip_id,p.enabled AS assigned_ip_enabled,p.available AS assigned_ip_available,p.address "
                 "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id "
                 "JOIN accounts a ON a.id=s.account_id JOIN groups g ON g.id=a.group_id "
@@ -1129,6 +1218,9 @@ def create_app(
                     or current["account_status"] not in {"pending", "needs_membership"}):
                 connection.rollback()
                 raise HTTPException(409, "group_invite_changed_during_verification")
+            if current["auth_state"] != "authenticated":
+                connection.rollback()
+                raise HTTPException(409, "account_session_unverified")
             if (current["assigned_ip_id"] != row["ip_id"] or current["assigned_ip_enabled"] != 1
                     or current["assigned_ip_available"] != 1 or current["address"] != row["address"]):
                 connection.rollback()
@@ -1200,7 +1292,7 @@ def create_app(
             timezone_row = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
             week_start = monday_of(datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date()).isoformat()
             rows = connection.execute(
-                "SELECT a.id,a.full_name,a.status,a.send_weekday,ia.ip_id,p.address AS ip_address,p.enabled AS ip_enabled,p.available AS ip_available,"
+                "SELECT a.id,a.full_name,a.status,a.auth_state,a.send_weekday,ia.ip_id,p.address AS ip_address,p.enabled AS ip_enabled,p.available AS ip_available,"
                 "s.scheduled_date,s.status AS slot_status,s.error_code,"
                 "(SELECT os.state FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_state,"
                 "(SELECT os.error_code FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_error "
@@ -1219,7 +1311,7 @@ def create_app(
             group = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
             accounts = connection.execute(
                 "SELECT a.id,a.phone,p.id AS ip_id,p.address FROM accounts a JOIN ip_assignments ia ON ia.account_id=a.id "
-                "JOIN server_ips p ON p.id=ia.ip_id WHERE a.group_id=? AND a.status IN ('active','needs_membership') "
+                "JOIN server_ips p ON p.id=ia.ip_id WHERE a.group_id=? AND a.auth_state='authenticated' AND a.status IN ('active','needs_membership') "
                 "AND p.enabled=1 AND p.available=1 ORDER BY a.id",
                 (group_id,),
             ).fetchall()
@@ -1241,7 +1333,7 @@ def create_app(
                 def require_current_assignment() -> None:
                     with db() as connection:
                         current = connection.execute(
-                            "SELECT a.status,ia.ip_id,p.address,p.enabled,p.available FROM accounts a "
+                            "SELECT a.status,a.auth_state,ia.ip_id,p.address,p.enabled,p.available FROM accounts a "
                             "JOIN ip_assignments ia ON ia.account_id=a.id JOIN server_ips p ON p.id=ia.ip_id "
                             "WHERE a.id=? AND a.group_id=?",
                             (account["id"], group_id),
@@ -1249,14 +1341,14 @@ def create_app(
                         current_group = connection.execute("SELECT invite_link FROM groups WHERE id=?", (group_id,)).fetchone()
                     if current_group is None or current_group["invite_link"] != group["invite_link"]:
                         raise HTTPException(409, "group_invite_changed_during_verification")
-                    if (current is None or current["status"] not in {"active", "needs_membership"}
+                    if (current is None or current["status"] not in {"active", "needs_membership"} or current["auth_state"] != "authenticated"
                             or not current["enabled"] or not current["available"] or int(current["ip_id"]) != int(account["ip_id"])
                             or current["address"] != account["address"] or account["address"] not in host_addresses()):
                         raise HTTPException(409, "account_assignment_changed_during_verification")
 
                 require_current_assignment()
                 vault = session_vault_for(account["id"])
-                adapter = PyMaxAdapter.create(phone=account["phone"], source_ip=account["address"], session_vault=vault)
+                adapter = PyMaxAdapter.create(phone=account["phone"], source_ip=account["address"], session_vault=vault, before_network_action=require_current_assignment)
                 await adapter.connect()
                 require_current_assignment()
                 if index == 0:
@@ -1269,6 +1361,8 @@ def create_app(
                 states[int(account["id"])] = member_proof(await adapter.get_chat(int(chat_id)), chat_id)
                 require_current_assignment()
             except Exception as exc:
+                if PyMaxAdapter.is_invalid_saved_session_error(exc):
+                    mark_reauth_required(account["id"])
                 failure_code = "group_resolution_failed" if stage == "resolve_group" else "membership_check_unavailable"
                 failure = exc
             finally:
@@ -1294,18 +1388,18 @@ def create_app(
                 raise HTTPException(409, "group_invite_changed_during_verification")
             for account_id in states:
                 assignment = connection.execute(
-                    "SELECT a.status,ia.ip_id,p.address,p.enabled,p.available FROM accounts a JOIN ip_assignments ia ON ia.account_id=a.id "
+                    "SELECT a.status,a.auth_state,ia.ip_id,p.address,p.enabled,p.available FROM accounts a JOIN ip_assignments ia ON ia.account_id=a.id "
                     "JOIN server_ips p ON p.id=ia.ip_id WHERE a.id=? AND a.group_id=?",
                     (account_id, group_id),
                 ).fetchone()
-                if (assignment is None or assignment["status"] not in {"active", "needs_membership"}
+                if (assignment is None or assignment["status"] not in {"active", "needs_membership"} or assignment["auth_state"] != "authenticated"
                         or not assignment["enabled"] or not assignment["available"] or int(assignment["ip_id"]) != used_ips[account_id][0]
                         or assignment["address"] != used_ips[account_id][1]):
                     connection.rollback()
                     raise HTTPException(409, "account_assignment_changed_during_verification")
             connection.execute("UPDATE groups SET chat_id=? WHERE id=?", (chat_id, group_id))
             for account_id, joined in states.items():
-                connection.execute("UPDATE accounts SET status=? WHERE id=?", ("active" if joined else "needs_membership", account_id))
+                connection.execute("UPDATE accounts SET auth_state='authenticated',status=? WHERE id=?", ("active" if joined else "needs_membership", account_id))
                 tzrow = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
                 from zoneinfo import ZoneInfo
                 today = datetime.now(ZoneInfo(tzrow[0] if tzrow else "Europe/Moscow")).date().isoformat()

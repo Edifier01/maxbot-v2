@@ -28,6 +28,7 @@ def fake_pymax(monkeypatch):
     join_should_fail = set()
     resolve_should_fail = set()
     auth_error = {"value": None}
+    password_attempts = []
 
     class FakeAuth:
         async def request_code(self, phone):
@@ -37,9 +38,19 @@ def fake_pymax(monkeypatch):
         async def send_code(self, token, code):
             assert token == "fixture-auth-token"
             assert code == "123456"
+            if auth_error["value"] == "password_challenge":
+                return SimpleNamespace(login_token=None, password_challenge=SimpleNamespace(track_id="fixture-track", hint="Проверьте облачный пароль"), register_token=None)
             if auth_error["value"]:
                 raise ApiError(opcode=18, error=auth_error["value"])
             return SimpleNamespace(login_token="fixture-login-token", password_challenge=None, register_token=None)
+
+        async def check_password(self, track_id, password):
+            assert track_id == "fixture-track"
+            accepted = password == "correct-two-factor"
+            password_attempts.append(accepted)
+            if not accepted:
+                raise ApiError(opcode=18, error="wrong_password")
+            return SimpleNamespace(error=None, login_token="fixture-login-token")
 
     class FakeAdapter:
         def __init__(self, phone, code_provider, password_provider, session_vault):
@@ -58,12 +69,14 @@ def fake_pymax(monkeypatch):
                 await self.auth_flow.authenticate(app)
                 connection = sqlite3.connect(self.session_vault.work_path)
                 try:
-                    connection.execute("CREATE TABLE IF NOT EXISTS fake_session (authenticated INTEGER NOT NULL)")
-                    connection.execute("DELETE FROM fake_session")
-                    connection.execute("INSERT INTO fake_session(authenticated) VALUES(1)")
+                    connection.execute("CREATE TABLE IF NOT EXISTS sessions (token TEXT NOT NULL PRIMARY KEY)")
+                    connection.execute("INSERT OR REPLACE INTO sessions(token) VALUES('fixture-auth-token')")
                     connection.commit()
                 finally:
                     connection.close()
+
+        def persist_session_snapshot(self):
+            return self.session_vault.snapshot()
 
         async def resolve_group_by_link(self, _link):
             if self.phone in resolve_should_fail:
@@ -88,7 +101,7 @@ def fake_pymax(monkeypatch):
         "maxbot_v2.app.PyMaxAdapter.create",
         classmethod(lambda _cls, *, phone, code_provider=None, password_provider=None, session_vault, **_kwargs: FakeAdapter(phone, code_provider, password_provider, session_vault)),
     )
-    return SimpleNamespace(code_requests=code_requests, joined_requests=joined_requests, memberships=memberships, join_should_fail=join_should_fail, resolve_should_fail=resolve_should_fail, auth_error=auth_error)
+    return SimpleNamespace(code_requests=code_requests, joined_requests=joined_requests, memberships=memberships, join_should_fail=join_should_fail, resolve_should_fail=resolve_should_fail, auth_error=auth_error, password_attempts=password_attempts)
 
 
 @pytest.fixture
@@ -134,7 +147,7 @@ def local_app(tmp_path, monkeypatch, fake_pymax):
         raise RuntimeError("test application did not start")
 
     try:
-        yield SimpleNamespace(app=app, url=f"http://127.0.0.1:{port}", password=password, code_requests=fake_pymax.code_requests, joined_requests=fake_pymax.joined_requests, memberships=fake_pymax.memberships, join_should_fail=fake_pymax.join_should_fail, resolve_should_fail=fake_pymax.resolve_should_fail, auth_error=fake_pymax.auth_error)
+        yield SimpleNamespace(app=app, url=f"http://127.0.0.1:{port}", password=password, code_requests=fake_pymax.code_requests, joined_requests=fake_pymax.joined_requests, memberships=fake_pymax.memberships, join_should_fail=fake_pymax.join_should_fail, resolve_should_fail=fake_pymax.resolve_should_fail, auth_error=fake_pymax.auth_error, password_attempts=fake_pymax.password_attempts)
     finally:
         server.should_exit = True
         thread.join(timeout=5)
@@ -237,6 +250,41 @@ def test_guest_connect_survives_reload_and_verifies_membership(page: Page, brows
         assert (local_app.app.state.data_dir / "sessions" / f"account-{account_id}.session.enc").exists()
     finally:
         connection.close()
+
+
+def test_guest_2fa_retries_wrong_password_without_requesting_a_new_otp(page: Page, browser, local_app):
+    local_app.auth_error["value"] = "password_challenge"
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и IP").click()
+    page.get_by_label("Название", exact=True).fill("Двухфакторная группа")
+    page.get_by_label("Ссылка MAX").fill("https://max.ru/join/two-factor-test")
+    page.get_by_role("button", name="Добавить", exact=True).click()
+    guest = browser.new_page()
+    guest.goto(page.locator(".invite-link a").get_attribute("href"))
+    guest.get_by_label("ФИО").fill("Тестовый пользователь")
+    guest.get_by_label("Телефон").fill("+79990000000")
+    guest.get_by_role("button", name="Начать подключение").click()
+    expect(guest.get_by_role("heading", name="Введите код MAX")).to_be_visible()
+    guest.get_by_label("Код").fill("123456")
+    guest.get_by_role("button", name="Проверить код").click()
+
+    expect(guest.get_by_role("heading", name="Облачный пароль MAX")).to_be_visible()
+    guest.get_by_label("Пароль").fill("incorrect-two-factor")
+    guest.get_by_role("button", name="Продолжить").click()
+    session_id = guest.evaluate("Object.values(sessionStorage)[0]")
+    flow = local_app.app.state.onboarding_flows[session_id]["flow"]
+    deadline = time.monotonic() + 5
+    while (not local_app.password_attempts or flow.waiting_for != "password") and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert local_app.password_attempts == [False]
+    assert flow.waiting_for == "password"
+    expect(guest.locator("#password-hint")).to_contain_text("не принял предыдущий облачный пароль", timeout=5000)
+    guest.get_by_label("Пароль").fill("correct-two-factor")
+    guest.get_by_role("button", name="Продолжить").click()
+    expect(guest.locator("#flow")).to_contain_text("Номер подключён", timeout=5000)
+
+    assert len(local_app.code_requests) == 1
+    assert local_app.password_attempts == [False, True]
 
 
 def test_guest_can_cancel_an_authorization_attempt(page: Page, browser, local_app):

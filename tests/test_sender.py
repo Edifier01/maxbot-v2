@@ -18,7 +18,7 @@ def seeded_db():
     db.execute("PRAGMA foreign_keys=ON")
     initialize(db)
     db.execute("INSERT INTO groups(name,invite_link,chat_id) VALUES('group','https://max.ru/invite','10')")
-    db.execute("INSERT INTO accounts(group_id,phone,full_name,status) VALUES(1,'+70000000001','Name','active')")
+    db.execute("INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(1,'+70000000001','Name','active','authenticated')")
     replace_message_pool(db, ["one", "two"])
     return db
 
@@ -201,6 +201,11 @@ def test_manual_run_check_does_not_depend_on_autostart_setting(monkeypatch):
     slot = db.execute("SELECT s.*,g.chat_id FROM weekly_slots s JOIN groups g ON g.id=s.group_id").fetchone()
 
     assert _dispatch_block(db, slot) is None
+    db.execute("UPDATE accounts SET auth_state='reauth_required' WHERE id=1")
+    reauth = _dispatch_block(db, slot)
+    assert reauth.code == "account_reauthentication_required"
+    assert reauth.blocked is True
+    db.execute("UPDATE accounts SET auth_state='authenticated' WHERE id=1")
     changed = _dispatch_block(db, slot, expected_ip_id=999)
     assert changed.code == "ip_assignment_changed"
     assert changed.blocked is False
