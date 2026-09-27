@@ -25,6 +25,17 @@ def test_weekday_assignment_balances_and_is_stable(db):
     assert assign_weekday(db, 1) == 0
 
 
+def test_deleted_account_does_not_skew_new_weekday_assignment(db):
+    db.execute("INSERT INTO groups(id, name, invite_link) VALUES (1, 'G', 'https://max.ru/join/a')")
+    db.execute(
+        "INSERT INTO accounts(id,group_id,phone,full_name,send_weekday,lifecycle) "
+        "VALUES (1,1,'deleted:1','',0,'deleted')"
+    )
+    db.execute("INSERT INTO accounts(id,group_id,phone,full_name) VALUES (2,1,'+70000000002','Name')")
+
+    assert assign_weekday(db, 2) == 0
+
+
 def test_week_is_monday_based():
     assert monday_of(date(2026, 9, 27)) == date(2026, 9, 21)
 

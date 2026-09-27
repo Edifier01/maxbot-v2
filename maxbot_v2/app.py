@@ -44,6 +44,19 @@ project_logger.addHandler(diagnostic_handler)
 project_logger.propagate = False
 
 
+def _log_timestamp_key(value: object) -> datetime:
+    """Parse SQLite UTC timestamps and ISO timestamps into comparable UTC values."""
+    if not isinstance(value, str):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 class LoginBody(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=256)
@@ -970,7 +983,11 @@ def create_app(
                 "result || CASE WHEN error_class IS NULL THEN '' ELSE ':' || error_class END AS detail,"
                 "duration_ms,response_received,error_class FROM onboarding_events ORDER BY id DESC LIMIT 200"
             ).fetchall()
-        return sorted([dict(row) for row in [*audit, *operations, *onboarding]], key=lambda row: row["created_at"], reverse=True)[:200]
+        return sorted(
+            [dict(row) for row in [*audit, *operations, *onboarding]],
+            key=lambda row: _log_timestamp_key(row["created_at"]),
+            reverse=True,
+        )[:200]
 
     @app.post("/api/operations/{operation_id}/resolve")
     def resolve_operation(operation_id: str, body: OperationResolutionBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, str]:

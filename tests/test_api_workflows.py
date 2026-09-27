@@ -1165,3 +1165,20 @@ def test_autostart_off_starts_stopped_but_manual_start_works(tmp_path, monkeypat
         assert overview["stopped"] is True
         assert client.post("/api/run/start", headers=headers, json={}).json()["stopped"] is False
         assert client.get("/api/overview").json()["stopped"] is False
+
+
+def test_api_log_sorts_sqlite_and_iso_timestamps_chronologically(tmp_path, monkeypatch):
+    client, _csrf = owner_client(tmp_path, monkeypatch)
+    connection = connect(client.app.state.database)
+    connection.executemany(
+        "INSERT INTO audit_log(created_at,kind,detail) VALUES(?,?,?)",
+        [
+            ("2026-09-27 10:00:00", "later", "later"),
+            ("2026-09-27T09:59:00+00:00", "earlier", "earlier"),
+        ],
+    )
+    connection.close()
+
+    entries = client.get("/api/log").json()
+
+    assert [entry["detail"] for entry in entries[:2]] == ["later", "earlier"]
