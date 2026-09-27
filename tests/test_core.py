@@ -29,16 +29,16 @@ def test_week_is_monday_based():
     assert monday_of(date(2026, 9, 27)) == date(2026, 9, 21)
 
 
-def test_proxy_assignment_uses_least_loaded_and_persists(db):
+def test_ip_assignment_uses_least_loaded_and_persists(db):
     db.execute("INSERT INTO groups(id, name, invite_link) VALUES (1, 'G', 'https://max.ru/join/a')")
-    db.execute("INSERT INTO proxies(id, group_id, url_ciphertext, label, position) VALUES (1, 1, 'cipher-a', 'a:1', 0), (2, 1, 'cipher-b', 'b:2', 1)")
+    db.execute("INSERT INTO server_ips(id,address,enabled,available) VALUES (1,'62.109.20.186',1,1),(2,'62.109.20.187',1,1)")
     db.execute("INSERT INTO accounts(id, group_id, phone, full_name, status) VALUES (1, 1, '+70000000001', 'One', 'active'), (2, 1, '+70000000002', 'Two', 'active'), (3, 1, '+70000000003', 'Three', 'active')")
-    from maxbot_v2.scheduling import assign_proxy
+    from maxbot_v2.egress import assign_ip
 
-    assert assign_proxy(db, 1, 1) == 1
-    assert assign_proxy(db, 2, 1) == 2
-    assert assign_proxy(db, 3, 1) == 1
-    assert assign_proxy(db, 1, 1) == 1
+    assert assign_ip(db, 1) == "62.109.20.186"
+    assert assign_ip(db, 2) == "62.109.20.187"
+    assert assign_ip(db, 3) == "62.109.20.186"
+    assert assign_ip(db, 1) == "62.109.20.186"
 
 
 def test_weekly_slot_is_unique_per_account_and_freezes_text(db):

@@ -1,4 +1,5 @@
 FROM python:3.12-slim
+RUN apt-get update && apt-get install --no-install-recommends -y iproute2 && rm -rf /var/lib/apt/lists/*
 ARG BUILD_REVISION=unknown
 ENV BUILD_REVISION=${BUILD_REVISION}
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
@@ -10,5 +11,4 @@ COPY scripts ./scripts
 COPY static ./static
 RUN useradd --system --uid 10001 --home-dir /nonexistent maxbot && mkdir -p /data && chown -R 10001:10001 /data
 USER 10001:10001
-EXPOSE 8000
-CMD ["uvicorn", "maxbot_v2.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--no-access-log"]
+CMD ["uvicorn", "maxbot_v2.app:create_app", "--factory", "--host", "127.0.0.1", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1", "--no-access-log"]
