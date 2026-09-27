@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -33,11 +34,16 @@ class _DirectCodeRequestDone(Exception):
 
 
 class _DirectCodeRequestFlow:
-    def __init__(self):
+    def __init__(self, hold_open_until: asyncio.Event | None = None):
         self.response: Any = None
+        self.hold_open_until = hold_open_until
 
     async def authenticate(self, app: Any):
         self.response = await app.api.auth.request_code(str(app.config.phone))
+        if self.hold_open_until is not None:
+            await self.hold_open_until.wait()
+            if not app.connection.is_open:
+                raise RuntimeError("direct_probe_connection_closed")
         raise _DirectCodeRequestDone()
 
 
@@ -55,7 +61,10 @@ class PyMaxAdapter:
         self.client = client
 
     @classmethod
-    async def request_code_direct(cls, *, phone: str, assigned_proxy: str):
+    async def request_code_direct(
+        cls, *, phone: str, assigned_proxy: str,
+        hold_open_until: asyncio.Event | None = None,
+    ):
         """Request one OTP directly, without creating or persisting a MAX session.
 
         The assigned proxy is required as a fail-closed precondition, but this
@@ -74,7 +83,7 @@ class PyMaxAdapter:
         except Exception as exc:
             raise AdapterUnavailable("pymax_unavailable") from exc
 
-        auth_flow = _DirectCodeRequestFlow()
+        auth_flow = _DirectCodeRequestFlow(hold_open_until)
         client = None
         with tempfile.TemporaryDirectory(prefix="maxbot-direct-auth-") as work_dir:
             try:
