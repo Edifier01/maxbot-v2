@@ -1,9 +1,14 @@
 import sqlite3
+import sys
+from unittest.mock import patch
+
+import pytest
 
 from maxbot_v2.db import connect, initialize
 from maxbot_v2.crypto import SecretBox
+from maxbot_v2.lifecycle import phone_fingerprint
 from maxbot_v2.session_vault import EncryptedSessionFile
-from scripts.cleanup_unverified_accounts import apply_cleanup, inspect_database
+from scripts.cleanup_unverified_accounts import apply_cleanup, inspect_database, main
 
 
 def prepare_database(tmp_path):
@@ -126,3 +131,95 @@ def test_legacy_cleanup_skips_accounts_with_any_saved_token_generation(tmp_path,
     report = inspect_database(db_path, data_dir, tmp_path / "runtime")
 
     assert report == [(eligible, "eligible"), (token_account, "saved_session_token")]
+
+
+@pytest.mark.parametrize("legacy_phone", ["+89990000001", " +89990000001 "])
+def test_legacy_cleanup_normalizes_plus8_before_retaining_fingerprint(tmp_path, monkeypatch, legacy_phone):
+    key = SecretBox.generate_key()
+    monkeypatch.setenv("DATA_ENCRYPTION_KEY", key)
+    db_path, eligible, _connected, _group = prepare_database(tmp_path)
+    db = connect(db_path)
+    db.execute("UPDATE accounts SET phone=? WHERE id=?", (legacy_phone, eligible))
+    db.close()
+
+    result = apply_cleanup(db_path, tmp_path / "data", tmp_path / "runtime", [eligible])
+
+    assert result == [(eligible, "deleted")]
+    db = connect(db_path)
+    row = db.execute("SELECT lifecycle,phone_fingerprint FROM accounts WHERE id=?", (eligible,)).fetchone()
+    assert row["lifecycle"] == "deleted"
+    assert row["phone_fingerprint"] == phone_fingerprint("+79990000001", key)
+    db.close()
+
+
+def test_legacy_cleanup_anonymizes_unparseable_phone_without_send_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_ENCRYPTION_KEY", SecretBox.generate_key())
+    db_path, eligible, _connected, _group = prepare_database(tmp_path)
+    db = connect(db_path)
+    db.execute("UPDATE accounts SET phone='legacy-invalid' WHERE id=?", (eligible,))
+    db.close()
+
+    result = apply_cleanup(db_path, tmp_path / "data", tmp_path / "runtime", [eligible])
+
+    assert result == [(eligible, "deleted")]
+    db = connect(db_path)
+    row = db.execute("SELECT lifecycle,phone,full_name,phone_fingerprint FROM accounts WHERE id=?", (eligible,)).fetchone()
+    assert tuple(row) == ("deleted", f"deleted:{eligible}", "", None)
+    db.close()
+
+
+def test_legacy_cleanup_preserves_unparseable_phone_with_slot_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_ENCRYPTION_KEY", SecretBox.generate_key())
+    db_path, eligible, _connected, group_id = prepare_database(tmp_path)
+    db = connect(db_path)
+    db.execute("UPDATE accounts SET phone='legacy-invalid' WHERE id=?", (eligible,))
+    version_id = db.execute(
+        "INSERT INTO message_versions(created_at,checksum) VALUES('2026-09-28','test-checksum')"
+    ).lastrowid
+    db.execute(
+        "INSERT INTO weekly_slots(slot_id,account_id,group_id,week_start,scheduled_date,message_version_id,text,updated_at) "
+        "VALUES('old-slot',?,?,'2026-09-28','2026-09-28',?,'test message','2026-09-28')",
+        (eligible, group_id, version_id),
+    )
+    db.close()
+
+    result = apply_cleanup(db_path, tmp_path / "data", tmp_path / "runtime", [eligible])
+
+    assert result == [(eligible, "send_history")]
+    db = connect(db_path)
+    row = db.execute("SELECT lifecycle,phone FROM accounts WHERE id=?", (eligible,)).fetchone()
+    assert tuple(row) == ("active", "legacy-invalid")
+    db.close()
+
+
+def test_legacy_cleanup_apply_returns_failure_when_any_reviewed_id_is_skipped(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("DATA_ENCRYPTION_KEY", SecretBox.generate_key())
+    db_path, eligible, connected, _group = prepare_database(tmp_path)
+    monkeypatch.setattr(sys, "argv", [
+        "cleanup_unverified_accounts", "--db-path", str(db_path),
+        "--data-dir", str(tmp_path / "data"), "--runtime-dir", str(tmp_path / "runtime"),
+        "--apply", "--account-ids", str(eligible), str(connected),
+    ])
+
+    result = main()
+
+    assert result == 1
+    output = capsys.readouterr().out
+    assert f"account_id={eligible} result=deleted" in output
+    assert f"account_id={connected} result=not_eligible" in output
+
+
+def test_legacy_cleanup_apply_returns_failure_when_selected_cleanup_fails(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("DATA_ENCRYPTION_KEY", SecretBox.generate_key())
+    db_path, eligible, _connected, _group = prepare_database(tmp_path)
+    monkeypatch.setattr(sys, "argv", [
+        "cleanup_unverified_accounts", "--db-path", str(db_path),
+        "--data-dir", str(tmp_path / "data"), "--runtime-dir", str(tmp_path / "runtime"),
+        "--apply", "--account-ids", str(eligible),
+    ])
+
+    with patch("scripts.cleanup_unverified_accounts.apply_cleanup", return_value=[(eligible, "cleanup_incomplete")]):
+        result = main()
+
+    assert result == 1
+    assert f"account_id={eligible} result=cleanup_incomplete" in capsys.readouterr().out
