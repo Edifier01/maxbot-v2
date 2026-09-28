@@ -105,9 +105,19 @@ def apply_cleanup(db_path: str | Path, data_dir: str | Path, runtime_dir: str | 
                 connection.rollback()
                 outcomes.append((account_id, reason))
                 continue
+            raw_phone = str(account["phone"] or "").strip()
             try:
-                fingerprint = account["phone_fingerprint"] or phone_fingerprint(
-                    normalize_russian_phone(account["phone"]), os.getenv("DATA_ENCRYPTION_KEY", ""),
+                canonical_phone = normalize_russian_phone(
+                    raw_phone.removeprefix("+8") if raw_phone.startswith("+8") else raw_phone
+                )
+            except ValueError:
+                # candidate_reason already ruled out all send history, so an old
+                # unparseable phone needs no retained weekly-limit fingerprint.
+                canonical_phone = None
+            try:
+                fingerprint = account["phone_fingerprint"] or (
+                    phone_fingerprint(canonical_phone, os.getenv("DATA_ENCRYPTION_KEY", ""))
+                    if canonical_phone else None
                 )
             except ValueError:
                 connection.rollback()
@@ -197,11 +207,16 @@ def main() -> int:
         eligible = {account_id for account_id, reason in report if reason == "eligible"}
         requested = list(dict.fromkeys(args.account_ids))
         selected = [account_id for account_id in requested if account_id in eligible]
+        incomplete = False
         for account_id in requested:
             if account_id not in eligible:
                 print(f"account_id={account_id} result=not_eligible")
+                incomplete = True
         for account_id, result in apply_cleanup(args.db_path, args.data_dir, args.runtime_dir, selected):
             print(f"account_id={account_id} result={result}")
+            if result != "deleted":
+                incomplete = True
+        return int(incomplete)
     return 0
 
 
