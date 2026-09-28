@@ -4,8 +4,10 @@ import socket
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from types import SimpleNamespace
 from urllib.request import urlopen
+from zoneinfo import ZoneInfo
 
 import bcrypt
 import pytest
@@ -18,6 +20,7 @@ from playwright.sync_api import Page, expect
 from maxbot_v2.app import create_app
 from maxbot_v2.crypto import SecretBox
 from maxbot_v2.db import connect
+from maxbot_v2.scheduling import monday_of
 
 
 @pytest.fixture
@@ -473,6 +476,47 @@ def test_owner_deletes_account_and_sessions_with_keyboard_confirmation(page: Pag
     page.keyboard.press("Enter")
     expect(page.locator("#notice")).to_have_text("Номер и сессии удалены")
     expect(page.locator(f'[data-account-delete="{account_id}"]')).to_have_count(0)
+    assert page_has_no_overflow(page)
+
+
+@pytest.mark.parametrize("width", [390, 768, 1440])
+def test_account_list_shows_slot_error_only_when_present(page: Page, local_app, width):
+    page.set_viewport_size({"width": width, "height": 900})
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и IP").click()
+    page.get_by_label("Название", exact=True).fill("Проверка слотов")
+    page.get_by_label("Ссылка MAX").fill("https://max.ru/join/slot-errors")
+    page.get_by_role("button", name="Добавить", exact=True).click()
+    expect(page.locator("#group-list")).to_contain_text("Проверка слотов")
+    connection = connect(local_app.app.state.database)
+    try:
+        group_id = connection.execute("SELECT id FROM groups ORDER BY id DESC LIMIT 1").fetchone()[0]
+        accounts = []
+        for index in (1, 2):
+            accounts.append(connection.execute(
+                "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,?,?,?,?)",
+                (group_id, f"+7999000020{index}", f"Аккаунт {index}", "active", "authenticated"),
+            ).lastrowid)
+        version_id = connection.execute(
+            "INSERT INTO message_versions(created_at,checksum) VALUES(CURRENT_TIMESTAMP,'slot-error-test')"
+        ).lastrowid
+        week_start = monday_of(datetime.now(ZoneInfo("Europe/Moscow")).date()).isoformat()
+        for account_id, status, error_code in ((accounts[0], "queued", None), (accounts[1], "blocked", "run_stopped")):
+            connection.execute(
+                "INSERT INTO weekly_slots(slot_id,account_id,group_id,week_start,scheduled_date,message_version_id,text,status,error_code,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                (f"slot-{account_id}", account_id, group_id, week_start, week_start, version_id, "test", status, error_code),
+            )
+    finally:
+        connection.close()
+
+    page.get_by_role("button", name="Номера", exact=True).focus()
+    page.keyboard.press("Enter")
+    queued_row = page.locator(f'[data-account-delete="{accounts[0]}"]').locator("xpath=../..")
+    blocked_row = page.locator(f'[data-account-delete="{accounts[1]}"]').locator("xpath=../..")
+    expect(queued_row).to_contain_text("слот: запланирован")
+    expect(queued_row).not_to_contain_text("Не удалось выполнить действие")
+    expect(blocked_row).to_contain_text("Работа остановлена.")
     assert page_has_no_overflow(page)
 
 
