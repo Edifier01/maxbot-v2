@@ -20,7 +20,7 @@ def assign_weekday(connection: sqlite3.Connection, account_id: int) -> int:
     counts = [0] * 7
     for item in connection.execute(
         "SELECT send_weekday, COUNT(*) AS n FROM accounts "
-        "WHERE send_weekday IS NOT NULL GROUP BY send_weekday"
+        "WHERE lifecycle='active' AND send_weekday IS NOT NULL GROUP BY send_weekday"
     ):
         counts[int(item["send_weekday"])] = int(item["n"])
     weekday = min(range(7), key=lambda value: (counts[value], value))

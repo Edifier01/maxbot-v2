@@ -311,7 +311,7 @@ def test_guest_can_cancel_an_authorization_attempt(page: Page, browser, local_ap
         connection.close()
 
 
-def test_no2fa_after_otp_keeps_account_for_manual_retry_without_new_code(page: Page, browser, local_app):
+def test_no2fa_after_otp_cleans_unverified_account_without_automatic_code_retry(page: Page, browser, local_app):
     local_app.auth_error["value"] = "error.profile.active.session.no2fa"
     login(page, local_app)
     page.get_by_role("button", name="Группы, номера и IP").click()
@@ -330,8 +330,12 @@ def test_no2fa_after_otp_keeps_account_for_manual_retry_without_new_code(page: P
     assert len(local_app.code_requests) == 1
     connection = connect(local_app.app.state.database)
     try:
-        assert connection.execute("SELECT status FROM accounts WHERE phone='+79990000000'").fetchone()[0] == "pending"
+        account = connection.execute("SELECT id,lifecycle,phone FROM accounts WHERE full_name=''").fetchone()
+        assert account["lifecycle"] == "deleted"
+        assert account["phone"] == f"deleted:{account['id']}"
+        assert connection.execute("SELECT COUNT(*) FROM ip_assignments WHERE account_id=?", (account["id"],)).fetchone()[0] == 0
         assert connection.execute("SELECT error_code FROM onboarding_sessions").fetchone()[0] == "max_password_required_on_active_session"
+        assert connection.execute("SELECT phone,full_name FROM onboarding_sessions").fetchone()[:] == (None, None)
     finally:
         connection.close()
 
@@ -350,6 +354,7 @@ def test_expired_attempt_releases_account_lock_for_new_start(page: Page, browser
     expect(guest.get_by_role("heading", name="Введите код MAX")).to_be_visible()
     guest.close()
     connection = connect(local_app.app.state.database)
+    old_account_id = connection.execute("SELECT account_id FROM onboarding_sessions").fetchone()[0]
     connection.execute("UPDATE onboarding_sessions SET expires_at='2000-01-01T00:00:00+00:00' WHERE state='waiting_code'")
     connection.close()
     second = browser.new_page()
@@ -359,6 +364,16 @@ def test_expired_attempt_releases_account_lock_for_new_start(page: Page, browser
     second.get_by_role("button", name="Начать подключение").click()
     expect(second.get_by_role("heading", name="Введите код MAX")).to_be_visible(timeout=5000)
     assert len(local_app.code_requests) == 2
+    connection = connect(local_app.app.state.database)
+    try:
+        new_account_id = connection.execute(
+            "SELECT account_id FROM onboarding_sessions WHERE id=(SELECT id FROM onboarding_sessions ORDER BY created_at DESC LIMIT 1)",
+        ).fetchone()[0]
+        assert new_account_id != old_account_id
+        assert connection.execute("SELECT lifecycle FROM accounts WHERE id=?", (old_account_id,)).fetchone()[0] == "deleted"
+        assert connection.execute("SELECT COUNT(*) FROM ip_assignments WHERE account_id=?", (old_account_id,)).fetchone()[0] == 0
+    finally:
+        connection.close()
 
 
 def test_failed_auto_join_keeps_session_for_manual_membership_check(page: Page, browser, local_app):
@@ -381,12 +396,28 @@ def test_failed_auto_join_keeps_session_for_manual_membership_check(page: Page, 
     expect(guest.get_by_role("button", name="Отменить подключение")).to_have_count(0)
     connection = connect(local_app.app.state.database)
     try:
-        assert connection.execute("SELECT status FROM accounts WHERE phone=?", (phone,)).fetchone()[0] == "needs_membership"
+        account = connection.execute(
+            "SELECT id,status,auth_state,ever_authenticated FROM accounts WHERE phone=?", (phone,),
+        ).fetchone()
+        assert account["status"] == "needs_membership"
+        assert account["auth_state"] == "authenticated" and account["ever_authenticated"] == 1
+        attempt = connection.execute(
+            "SELECT state,phone,full_name FROM onboarding_sessions WHERE account_id=?", (account["id"],),
+        ).fetchone()
+        assert tuple(attempt) == ("waiting_membership", phone, "Тестовый пользователь")
     finally:
         connection.close()
     local_app.memberships.add(phone)
     guest.get_by_role("button", name="Проверить вступление").click()
     expect(guest.locator("#flow")).to_contain_text("Номер подключён")
+    connection = connect(local_app.app.state.database)
+    try:
+        attempt = connection.execute(
+            "SELECT state,phone,full_name FROM onboarding_sessions WHERE account_id=?", (account["id"],),
+        ).fetchone()
+        assert tuple(attempt) == ("completed", None, None)
+    finally:
+        connection.close()
 
 
 def test_invalid_group_link_preserves_login_for_owner_repair(page: Page, browser, local_app):
@@ -413,6 +444,36 @@ def test_invalid_group_link_preserves_login_for_owner_repair(page: Page, browser
         assert (local_app.app.state.data_dir / "sessions" / f"account-{account['id']}.session.enc").exists()
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("width", [390, 768, 1440])
+def test_owner_deletes_account_and_sessions_with_keyboard_confirmation(page: Page, local_app, width):
+    page.set_viewport_size({"width": width, "height": 900})
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и IP").click()
+    page.get_by_label("Название", exact=True).fill("Очистка аккаунта")
+    page.get_by_label("Ссылка MAX").fill("https://max.ru/join/delete-test")
+    page.get_by_role("button", name="Добавить", exact=True).click()
+    expect(page.locator("#group-list")).to_contain_text("Очистка аккаунта")
+    connection = connect(local_app.app.state.database)
+    try:
+        group = connection.execute("SELECT id FROM groups ORDER BY id DESC LIMIT 1").fetchone()
+        account_id = connection.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status) VALUES(?, '+79990000123','Тестовый аккаунт','pending')",
+            (group["id"],),
+        ).lastrowid
+    finally:
+        connection.close()
+    page.get_by_role("button", name="Номера", exact=True).click()
+    delete = page.get_by_role("button", name="Удалить номер и сессию")
+    expect(delete).to_be_visible()
+    assert page_has_no_overflow(page)
+    page.on("dialog", lambda dialog: dialog.accept())
+    delete.focus()
+    page.keyboard.press("Enter")
+    expect(page.locator("#notice")).to_have_text("Номер и сессии удалены")
+    expect(page.locator(f'[data-account-delete="{account_id}"]')).to_have_count(0)
+    assert page_has_no_overflow(page)
 
 
 def page_has_no_overflow(page):

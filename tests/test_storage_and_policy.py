@@ -339,3 +339,48 @@ def test_allocator_ignores_old_failed_ip_assignments(tmp_path):
 
     assert selected == '62.109.20.187'
     connection.close()
+
+
+def test_account_lifecycle_schema_tracks_prior_auth_and_safe_attempt_events():
+    connection = connect(":memory:")
+    initialize(connection)
+
+    account_columns = {row[1] for row in connection.execute("PRAGMA table_info(accounts)")}
+    event_columns = {row[1] for row in connection.execute("PRAGMA table_info(onboarding_events)")}
+
+    assert {"lifecycle", "ever_authenticated", "phone_fingerprint"} <= account_columns
+    assert {"attempt_id", "account_id", "ip_id", "stage", "result", "duration_ms", "response_received", "error_class"} <= event_columns
+    assert connection.execute("SELECT sql FROM sqlite_master WHERE name='onboarding_events'").fetchone()
+    connection.close()
+
+
+def test_session_vault_removes_every_generation_for_one_account(tmp_path):
+    box = SecretBox(SecretBox.generate_key())
+    durable = tmp_path / "encrypted"
+    runtime = tmp_path / "runtime"
+    account_zero = EncryptedSessionFile(12, durable_dir=durable, runtime_dir=runtime, box=box)
+    account_one = EncryptedSessionFile(12, generation=1, durable_dir=durable, runtime_dir=runtime, box=box)
+    neighbor = EncryptedSessionFile(120, durable_dir=durable, runtime_dir=runtime, box=box)
+    for vault in (account_zero, account_one, neighbor):
+        vault.open()
+        vault.work_path.write_bytes(b"temporary sqlite")
+        vault.encrypted_path.write_bytes(box.encrypt_bytes(b"encrypted sqlite"))
+
+    account_zero.delete_all_generations()
+
+    assert not account_zero.encrypted_path.exists()
+    assert not account_one.encrypted_path.exists()
+    assert not account_zero.work_dir.exists()
+    assert not account_one.work_dir.exists()
+    assert neighbor.encrypted_path.exists()
+    assert neighbor.work_path.exists()
+
+
+def test_phone_fingerprint_is_stable_keyed_and_does_not_expose_phone():
+    from maxbot_v2.lifecycle import phone_fingerprint
+
+    first = phone_fingerprint("+79991234567", "fixed-test-key-with-enough-bytes")
+    assert len(first) == 64
+    assert first == phone_fingerprint("+79991234567", "fixed-test-key-with-enough-bytes")
+    assert first != phone_fingerprint("+79991234567", "another-test-key-with-enough-bytes")
+    assert "+79991234567" not in first

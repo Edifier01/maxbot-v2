@@ -136,7 +136,7 @@ class GroupWorkerManager:
                 slots = db.execute(
                     "SELECT s.*,a.phone,a.id AS account_id,g.chat_id FROM weekly_slots s JOIN accounts a ON a.id=s.account_id "
                     "JOIN groups g ON g.id=s.group_id WHERE s.group_id=? AND s.scheduled_date=? AND s.status='queued' "
-                    "AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL ORDER BY a.id",
+                    "AND a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL ORDER BY a.id",
                     (group_id, today.isoformat()),
                 ).fetchall()
                 for slot in slots:
@@ -189,14 +189,14 @@ def _dispatch_block(
         return DispatchPaused("run_stopped")
     group = db.execute("SELECT active,chat_id FROM groups WHERE id=?", (slot["group_id"],)).fetchone()
     account = db.execute(
-        "SELECT a.status,a.auth_state,ia.ip_id,p.address,p.enabled,p.available FROM accounts a LEFT JOIN ip_assignments ia ON ia.account_id=a.id "
+        "SELECT a.status,a.auth_state,a.lifecycle,ia.ip_id,p.address,p.enabled,p.available FROM accounts a LEFT JOIN ip_assignments ia ON ia.account_id=a.id "
         "LEFT JOIN server_ips p ON p.id=ia.ip_id WHERE a.id=?",
         (slot["account_id"],),
     ).fetchone()
     current_slot = db.execute("SELECT status,scheduled_date FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],)).fetchone()
     if group is None or not group["active"] or str(group["chat_id"] or "") != str(slot["chat_id"]):
         return DispatchPaused("group_destination_changed")
-    if account is None or account["status"] != "active":
+    if account is None or account["status"] != "active" or account["lifecycle"] != "active":
         return DispatchPaused("account_not_active", blocked=True)
     if account["auth_state"] != "authenticated":
         return DispatchPaused("account_reauthentication_required", blocked=True)

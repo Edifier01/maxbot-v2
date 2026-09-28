@@ -77,6 +77,33 @@ def test_only_provider_ack_counts_as_accepted():
     assert db.execute("SELECT COUNT(*) FROM send_log").fetchone()[0] == 1
 
 
+def test_weekly_limit_follows_phone_fingerprint_after_account_recreation():
+    db = seeded_db()
+    db.execute("UPDATE accounts SET send_weekday=0,phone_fingerprint='stable-private-fingerprint' WHERE id=1")
+    week = "2026-09-21"
+    prior = create_weekly_slot(db, account_id=1, week_start=week, scheduled_date=week, text="prior", message_version_id=1)
+    db.execute(
+        "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,ever_authenticated,phone_fingerprint) "
+        "VALUES(1,'+70000000002','Name','active','authenticated',1,'stable-private-fingerprint')"
+    )
+    current = create_weekly_slot(db, account_id=2, week_start=week, scheduled_date=week, text="new", message_version_id=1)
+    db.execute(
+        "INSERT INTO send_log(account_id,group_id,slot_id,sent_at,provider_message_id,text) "
+        "VALUES(1,1,?,'2026-09-21T10:00:00+00:00','accepted','prior')", (prior["slot_id"],),
+    )
+
+    class Provider:
+        calls = 0
+        async def send_message(self, **_kwargs):
+            self.calls += 1
+            return Ack("must-not-send")
+
+    provider = Provider()
+    assert asyncio.run(Sender(db, provider).send_slot(current["slot_id"], chat_id=10)) == "blocked"
+    assert provider.calls == 0
+    assert db.execute("SELECT error_code FROM weekly_slots WHERE account_id=2").fetchone()[0] == "weekly_limit_reached"
+
+
 def test_process_interruption_marks_in_flight_unknown():
     db = seeded_db()
     db.execute("UPDATE accounts SET send_weekday=0 WHERE id=1")

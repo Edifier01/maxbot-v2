@@ -108,18 +108,20 @@ def assign_ip(connection: sqlite3.Connection, account_id: int) -> str:
         return assigned[1]
     now = datetime.now(timezone.utc).isoformat()
     candidates = connection.execute(
-        "SELECT p.id,p.address,COUNT(DISTINCT CASE WHEN a.auth_state='authenticated' OR EXISTS ("
+        "SELECT p.id,p.address,COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND (a.auth_state='authenticated' OR EXISTS ("
         "SELECT 1 FROM onboarding_sessions s WHERE s.account_id=a.id AND s.state IN "
         "('starting','requesting_code','waiting_code','verifying_code','waiting_password','verifying_password','joining_group') "
-        "AND s.expires_at>?) THEN a.id END) AS load FROM server_ips p "
+        "AND s.expires_at>?)) THEN a.id END) AS load FROM server_ips p "
         "LEFT JOIN ip_assignments ia ON ia.ip_id=p.id LEFT JOIN accounts a ON a.id=ia.account_id "
-        "WHERE p.enabled=1 AND p.available=1 GROUP BY p.id ORDER BY load,p.id",
+        "WHERE p.enabled=1 AND p.available=1 GROUP BY p.id "
+        "ORDER BY load,COALESCE(p.last_assigned_at,''),p.id",
         (now,),
     ).fetchall()
     chosen = next((row for row in candidates if allowed_address(row["address"])), None)
     if chosen is None:
         raise ValueError("ip_assignment_required")
     connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, chosen["id"]))
+    connection.execute("UPDATE server_ips SET last_assigned_at=? WHERE id=?", (now, chosen["id"]))
     return str(chosen["address"])
 
 
@@ -133,7 +135,7 @@ def bootstrap_ips(connection: sqlite3.Connection, *, addresses: set[str] | None 
     if initial is None:
         return
     enable_ip(connection, initial["id"], True)
-    for account in connection.execute("SELECT id FROM accounts ORDER BY id"):
+    for account in connection.execute("SELECT id FROM accounts WHERE lifecycle='active' ORDER BY id"):
         if connection.execute("SELECT 1 FROM ip_assignments WHERE account_id=?", (account["id"],)).fetchone() is None:
             assign_ip(connection, account["id"])
     connection.execute("INSERT INTO settings(key,value) VALUES('max_ip_bootstrap_done','1')")
