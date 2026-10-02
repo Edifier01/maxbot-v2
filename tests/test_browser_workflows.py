@@ -166,6 +166,120 @@ def login(page: Page, local_app):
 
 
 @pytest.mark.parametrize("width", [390, 768, 1440])
+def test_owner_adds_number_from_selected_group(page: Page, local_app, width):
+    page.set_viewport_size({"width": width, "height": 900})
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и IP").click()
+    for name, link in (
+        ("Первая группа", "https://max.ru/join/first-owner-group"),
+        ("Группа администратора", "https://max.ru/join/owner-group"),
+    ):
+        form = page.locator("#new-group")
+        form.get_by_label("Название", exact=True).fill(name)
+        form.get_by_label("Ссылка MAX").fill(link)
+        form.get_by_role("button", name="Добавить", exact=True).click()
+        expect(page.locator(".group-card").filter(has_text=name)).to_be_visible()
+
+    group = page.locator(".group-card").filter(has_text="Группа администратора")
+    add_number = group.get_by_role("link", name="Добавить номер", exact=True)
+    expect(add_number).to_be_visible()
+    assert page_has_no_overflow(page)
+    add_number.focus()
+    with page.expect_popup() as popup:
+        page.keyboard.press("Enter")
+    connection_page = popup.value
+    expect(connection_page.get_by_role("heading", name="Группа администратора")).to_be_visible()
+    assert local_app.code_requests == []
+    connection_page.get_by_label("ФИО").fill("Администратор теста")
+    connection_page.get_by_label("Телефон").fill("8 (999) 000-00-00")
+    connection_page.get_by_role("button", name="Начать подключение").click()
+    expect(connection_page.get_by_role("heading", name="Введите код MAX")).to_be_visible()
+    connection_page.get_by_label("Код").fill("123456")
+    connection_page.get_by_role("button", name="Проверить код").click()
+    expect(connection_page.locator("#flow")).to_contain_text("Номер подключён")
+    assert page_has_no_overflow(connection_page)
+    group.get_by_role("button", name="Номера", exact=True).click()
+    expect(group).to_contain_text("Администратор теста")
+    expect(group).to_contain_text("подключён")
+    assert "79990000000" not in group.inner_text()
+    connection = connect(local_app.app.state.database)
+    try:
+        account = connection.execute(
+            "SELECT a.auth_state,a.status,g.name FROM accounts a JOIN groups g ON g.id=a.group_id"
+        ).fetchone()
+        assert tuple(account) == ("authenticated", "active", "Группа администратора")
+    finally:
+        connection.close()
+        connection_page.close()
+
+
+@pytest.mark.parametrize("width", [390, 768, 1440])
+def test_ip_list_is_compact_and_keyboard_operable(page: Page, local_app, monkeypatch, width):
+    from maxbot_v2.egress import refresh_ips
+    monkeypatch.setattr(
+        "maxbot_v2.app.refresh_ips",
+        lambda connection: refresh_ips(connection, addresses={"62.109.20.186"}, probe=lambda _address: True),
+    )
+    connection = connect(local_app.app.state.database)
+    try:
+        connection.executemany(
+            "INSERT INTO server_ips(address,enabled,available) VALUES(?,0,1)",
+            [(f"62.109.20.{number}",) for number in range(187, 199)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    page.set_viewport_size({"width": width, "height": 900})
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и IP").click()
+    expect(page.locator("#ip-list .row")).to_have_count(13)
+    expect(page.get_by_role("button", name="Обновить IP")).to_be_hidden()
+    expect(page.locator("#ip-list")).to_be_hidden()
+    summary = page.locator("#ip-panel summary")
+    expect(summary).to_contain_text("13")
+    assert page.locator("#ip-panel").bounding_box()["height"] < 130
+    summary.focus()
+    page.keyboard.press("Enter")
+    expect(page.get_by_role("button", name="Обновить IP")).to_be_visible()
+    expect(page.locator("#ip-list")).to_be_visible()
+    assert page.locator("#ip-list").bounding_box()["height"] <= 420
+    assert page.locator("#ip-list").evaluate("element => element.scrollHeight > element.clientHeight")
+    assert page_has_no_overflow(page)
+    row = page.locator("#ip-list .row").filter(has_text="62.109.20.186")
+    row.get_by_role("button", name="Отключить", exact=True).click()
+    expect(row.get_by_role("button", name="Включить", exact=True)).to_be_enabled()
+    expect(page.locator("#ip-list")).to_be_visible()
+    page.get_by_role("button", name="Обновить IP").click()
+    expect(page.locator("#notice")).to_have_text("Список IP обновлён")
+    expect(page.locator("#ip-list")).to_be_visible()
+    expect(page.locator("#ip-list .row")).to_have_count(13)
+    summary.focus()
+    page.keyboard.press("Enter")
+    expect(page.locator("#ip-list")).to_be_hidden()
+    assert page_has_no_overflow(page)
+
+
+def test_owner_add_number_tracks_invite_rotation_and_revocation(page: Page, local_app):
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и IP").click()
+    page.get_by_label("Название", exact=True).fill("Обновление подключения")
+    page.get_by_label("Ссылка MAX").fill("https://max.ru/join/owner-rotate")
+    page.get_by_role("button", name="Добавить", exact=True).click()
+    add_number = page.get_by_role("link", name="Добавить номер", exact=True)
+    expect(add_number).to_be_visible()
+    previous_link = add_number.get_attribute("href")
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.get_by_role("button", name="Заменить ссылку", exact=True).click()
+    expect(add_number).not_to_have_attribute("href", previous_link)
+    page.get_by_role("button", name="Отозвать", exact=True).click()
+    expect(page.get_by_role("button", name="Добавить номер", exact=True)).to_be_disabled()
+    expect(add_number).to_have_count(0)
+    page.get_by_role("button", name="Создать новую ссылку", exact=True).click()
+    expect(add_number).to_be_visible()
+    assert local_app.code_requests == []
+
+
+@pytest.mark.parametrize("width", [390, 768, 1440])
 def test_owner_login_navigation_and_run_controls_at_supported_widths(page: Page, local_app, width):
     page.set_viewport_size({"width": width, "height": 900})
     login(page, local_app)
