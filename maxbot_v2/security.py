@@ -18,6 +18,11 @@ def new_token(size: int = 32) -> str:
     return secrets.token_urlsafe(size)
 
 
+def new_invite_token() -> str:
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
 def password_matches(password: str, encoded_hash: str) -> bool:
     try:
         return bcrypt.checkpw(password.encode("utf-8"), encoded_hash.encode("ascii"))
