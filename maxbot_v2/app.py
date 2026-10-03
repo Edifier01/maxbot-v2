@@ -820,7 +820,8 @@ def create_app(
             status = "active"
         token = SecretBox().decrypt(row["token_ciphertext"]) if status == "active" else None
         base = str(request.base_url).rstrip("/")
-        return {"url": f"{base}/join/{token}" if token else None, "expires_at": row["expires_at"], "max_uses": row["max_uses"], "status": status}
+        path = "j" if token and len(token) == 22 else "join"
+        return {"url": f"{base}/{path}/{token}" if token else None, "expires_at": row["expires_at"], "max_uses": row["max_uses"], "status": status}
 
     @app.post("/api/groups/{group_id}/onboarding-link")
     def issue_onboarding_link(group_id: int, request: Request, response: Response, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
@@ -852,7 +853,7 @@ def create_app(
                 max_uses = current["max_uses"]
             else:
                 cancelled_sessions = cancel_group_onboarding(connection, group_id, "invite_unavailable")
-                token = new_token(32)
+                token = new_token(16)
                 expires_at = (now + timedelta(days=lifetime_days)).isoformat()
                 connection.execute(
                     "INSERT INTO onboarding_invites(group_id,token_hash,token_ciphertext,created_at,expires_at,max_uses,uses_count,active) "
@@ -864,7 +865,8 @@ def create_app(
             connection.commit()
         cancel_onboarding_tasks(cancelled_sessions)
         base = str(request.base_url).rstrip("/")
-        return {"url": f"{base}/join/{token}", "expires_at": expires_at, "max_uses": max_uses}
+        path = "j" if len(token) == 22 else "join"
+        return {"url": f"{base}/{path}/{token}", "expires_at": expires_at, "max_uses": max_uses}
 
     @app.delete("/api/groups/{group_id}/onboarding-link")
     def revoke_onboarding_link(group_id: int, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
@@ -1028,6 +1030,7 @@ def create_app(
         return {"status": "accepted" if body.outcome == "accepted" else "queued_or_missed"}
 
     @app.get("/join/{token}")
+    @app.get("/j/{token}")
     def guest_join(token: str) -> FileResponse:
         with db() as connection:
             row = connection.execute("SELECT 1 FROM onboarding_invites WHERE token_hash=? AND active=1", (digest_token(token),)).fetchone()
@@ -1649,7 +1652,7 @@ def create_app(
         if not _valid_max_invite_link(body.invite_link):
             raise HTTPException(422, "invalid_max_invite_link")
         now = datetime.now(timezone.utc)
-        token = new_token(32)
+        token = new_token(16)
         encrypted_token = SecretBox().encrypt(token)
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")

@@ -12,6 +12,7 @@ from maxbot_v2.crypto import SecretBox
 from maxbot_v2.db import connect
 from maxbot_v2.message_pool import replace_message_pool
 from maxbot_v2.scheduling import create_weekly_slot
+from maxbot_v2.security import digest_token
 
 
 def owner_client(tmp_path, monkeypatch):
@@ -78,6 +79,46 @@ def test_new_group_has_a_guest_link_without_second_admin_action(tmp_path, monkey
     assert first["status"] == "active"
     assert first["url"] == second["url"]
     assert first["max_uses"] is None
+
+
+def test_new_group_link_is_short_and_opens_guest_form(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    group_id = client.post(
+        "/api/groups", headers={"X-CSRF-Token": csrf},
+        json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
+    ).json()["id"]
+
+    url = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"]
+    assert url.startswith("https://test.local/j/")
+    token = url.rsplit("/", 1)[1]
+    assert len(token) == 22
+    assert client.get(f"/j/{token}").status_code == 200
+    assert client.get(f"/join-info/{token}").json()["group"] == "Клуб"
+
+
+def test_existing_long_link_keeps_its_url_and_opens_guest_form(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    group_id = client.post(
+        "/api/groups", headers={"X-CSRF-Token": csrf},
+        json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
+    ).json()["id"]
+    old_token = "a" * 43
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute(
+            "UPDATE onboarding_invites SET token_hash=?, token_ciphertext=? WHERE group_id=?",
+            (digest_token(old_token, "unit-test-app-secret-key-with-32-chars"),
+             SecretBox().encrypt(old_token), group_id),
+        )
+    finally:
+        connection.close()
+
+    expected_url = f"https://test.local/join/{old_token}"
+    assert client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"] == expected_url
+    assert client.post(
+        f"/api/groups/{group_id}/onboarding-link", headers={"X-CSRF-Token": csrf}, json={},
+    ).json()["url"] == expected_url
+    assert client.get(f"/join/{old_token}").status_code == 200
 
 
 def test_start_normalizes_phone_and_reuses_legacy_pending_account(tmp_path, monkeypatch):
@@ -806,6 +847,8 @@ def test_explicit_link_rotation_invalidates_old_link(tmp_path, monkeypatch):
 
     assert second.status_code == 200
     assert second.json()["url"] != first.json()["url"]
+    assert second.json()["url"].startswith("https://test.local/j/")
+    assert len(second.json()["url"].rsplit("/", 1)[1]) == 22
     assert client.get(f"/join-info/{first_token}").status_code == 404
     assert client.get(f"/join-info/{second.json()['url'].rsplit('/', 1)[1]}").status_code == 200
 
