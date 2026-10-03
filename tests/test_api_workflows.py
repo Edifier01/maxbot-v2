@@ -91,18 +91,61 @@ def test_new_group_link_is_short_and_opens_guest_form(tmp_path, monkeypatch):
     url = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"]
     assert url.startswith("https://test.local/j/")
     token = url.rsplit("/", 1)[1]
-    assert len(token) == 22
+    assert len(token) == 8
+    assert all(character in "0123456789ABCDEFGHJKMNPQRSTVWXYZ" for character in token)
     assert client.get(f"/j/{token}").status_code == 200
     assert client.get(f"/join-info/{token}").json()["group"] == "Клуб"
 
 
-def test_existing_long_link_keeps_its_url_and_opens_guest_form(tmp_path, monkeypatch):
+def test_short_link_generation_retries_duplicate_codes(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    codes = iter(("7KMP9TRQ", "7KMP9TRQ", "4VW82JDN"))
+    monkeypatch.setattr("maxbot_v2.app.new_invite_token", lambda: next(codes), raising=False)
+    headers = {"X-CSRF-Token": csrf}
+    first_id = client.post(
+        "/api/groups", headers=headers,
+        json={"name": "Первая", "invite_link": "https://max.ru/join/first"},
+    ).json()["id"]
+    second_id = client.post(
+        "/api/groups", headers=headers,
+        json={"name": "Вторая", "invite_link": "https://max.ru/join/second"},
+    ).json()["id"]
+    assert client.get(f"/api/groups/{first_id}/onboarding-link").json()["url"].endswith("/j/7KMP9TRQ")
+    assert client.get(f"/api/groups/{second_id}/onboarding-link").json()["url"].endswith("/j/4VW82JDN")
+    assert client.get("/join-info/7KMP9TRQ").json()["group"] == "Первая"
+    assert client.get("/join-info/4VW82JDN").json()["group"] == "Вторая"
+
+
+def test_short_guest_link_accepts_lowercase_manual_entry(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     group_id = client.post(
         "/api/groups", headers={"X-CSRF-Token": csrf},
         json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
     ).json()["id"]
-    old_token = "a" * 43
+    token = "7KMP9TRQ"
+    connection = connect(client.app.state.database)
+    try:
+        connection.execute(
+            "UPDATE onboarding_invites SET token_hash=?, token_ciphertext=? WHERE group_id=?",
+            (digest_token(token, "unit-test-app-secret-key-with-32-chars"),
+             SecretBox().encrypt(token), group_id),
+        )
+    finally:
+        connection.close()
+
+    response = client.get(f"/j/{token.lower()}")
+    assert response.status_code == 200
+    assert str(response.url).endswith(f"/j/{token}")
+    assert client.get(f"/join-info/{token}").json()["group"] == "Клуб"
+
+
+@pytest.mark.parametrize("old_token,path", [("a" * 43, "join"), ("a" * 22, "j")])
+def test_existing_link_keeps_its_url_and_opens_guest_form(tmp_path, monkeypatch, old_token, path):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    group_id = client.post(
+        "/api/groups", headers={"X-CSRF-Token": csrf},
+        json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
+    ).json()["id"]
     connection = connect(client.app.state.database)
     try:
         connection.execute(
@@ -113,12 +156,12 @@ def test_existing_long_link_keeps_its_url_and_opens_guest_form(tmp_path, monkeyp
     finally:
         connection.close()
 
-    expected_url = f"https://test.local/join/{old_token}"
+    expected_url = f"https://test.local/{path}/{old_token}"
     assert client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"] == expected_url
     assert client.post(
         f"/api/groups/{group_id}/onboarding-link", headers={"X-CSRF-Token": csrf}, json={},
     ).json()["url"] == expected_url
-    assert client.get(f"/join/{old_token}").status_code == 200
+    assert client.get(f"/{path}/{old_token}").status_code == 200
 
 
 def test_start_normalizes_phone_and_reuses_legacy_pending_account(tmp_path, monkeypatch):
@@ -848,7 +891,7 @@ def test_explicit_link_rotation_invalidates_old_link(tmp_path, monkeypatch):
     assert second.status_code == 200
     assert second.json()["url"] != first.json()["url"]
     assert second.json()["url"].startswith("https://test.local/j/")
-    assert len(second.json()["url"].rsplit("/", 1)[1]) == 22
+    assert len(second.json()["url"].rsplit("/", 1)[1]) == 8
     assert client.get(f"/join-info/{first_token}").status_code == 404
     assert client.get(f"/join-info/{second.json()['url'].rsplit('/', 1)[1]}").status_code == 200
 

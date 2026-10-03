@@ -16,12 +16,12 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import connect, initialize
-from .security import digest_token as _digest_token, new_token, password_matches
+from .security import digest_token as _digest_token, new_invite_token, new_token, password_matches
 from .crypto import SecretBox
 from .message_pool import replace_message_pool
 from .onboarding import WebAuthProviders, attach_group_on_first_account, join_group_and_confirm_membership, member_proof, normalize_russian_phone, prepare_account
@@ -136,6 +136,16 @@ def create_app(
 
     def digest_token(value: str) -> str:
         return _digest_token(value, secret)
+
+    def unique_invite_token(connection: sqlite3.Connection) -> str:
+        for _ in range(10):
+            token = new_invite_token()
+            exists = connection.execute(
+                "SELECT 1 FROM onboarding_invites WHERE token_hash=?", (digest_token(token),)
+            ).fetchone()
+            if exists is None:
+                return token
+        raise RuntimeError("invite_token_unavailable")
 
     @contextmanager
     def db() -> Iterator[sqlite3.Connection]:
@@ -820,7 +830,7 @@ def create_app(
             status = "active"
         token = SecretBox().decrypt(row["token_ciphertext"]) if status == "active" else None
         base = str(request.base_url).rstrip("/")
-        path = "j" if token and len(token) == 22 else "join"
+        path = "j" if token and len(token) in {8, 22} else "join"
         return {"url": f"{base}/{path}/{token}" if token else None, "expires_at": row["expires_at"], "max_uses": row["max_uses"], "status": status}
 
     @app.post("/api/groups/{group_id}/onboarding-link")
@@ -853,7 +863,7 @@ def create_app(
                 max_uses = current["max_uses"]
             else:
                 cancelled_sessions = cancel_group_onboarding(connection, group_id, "invite_unavailable")
-                token = new_token(16)
+                token = unique_invite_token(connection)
                 expires_at = (now + timedelta(days=lifetime_days)).isoformat()
                 connection.execute(
                     "INSERT INTO onboarding_invites(group_id,token_hash,token_ciphertext,created_at,expires_at,max_uses,uses_count,active) "
@@ -865,7 +875,7 @@ def create_app(
             connection.commit()
         cancel_onboarding_tasks(cancelled_sessions)
         base = str(request.base_url).rstrip("/")
-        path = "j" if len(token) == 22 else "join"
+        path = "j" if len(token) in {8, 22} else "join"
         return {"url": f"{base}/{path}/{token}", "expires_at": expires_at, "max_uses": max_uses}
 
     @app.delete("/api/groups/{group_id}/onboarding-link")
@@ -1031,7 +1041,9 @@ def create_app(
 
     @app.get("/join/{token}")
     @app.get("/j/{token}")
-    def guest_join(token: str) -> FileResponse:
+    def guest_join(token: str) -> Response:
+        if len(token) == 8 and token != token.upper():
+            return RedirectResponse(f"/j/{token.upper()}", status_code=307)
         with db() as connection:
             row = connection.execute("SELECT 1 FROM onboarding_invites WHERE token_hash=? AND active=1", (digest_token(token),)).fetchone()
         if row is None:
@@ -1652,15 +1664,14 @@ def create_app(
         if not _valid_max_invite_link(body.invite_link):
             raise HTTPException(422, "invalid_max_invite_link")
         now = datetime.now(timezone.utc)
-        token = new_token(16)
-        encrypted_token = SecretBox().encrypt(token)
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute("INSERT INTO groups(name,invite_link) VALUES(?,?)", (body.name.strip(), body.invite_link.strip()))
+            token = unique_invite_token(connection)
             connection.execute(
                 "INSERT INTO onboarding_invites(group_id,token_hash,token_ciphertext,created_at,expires_at,max_uses,uses_count,active) "
                 "VALUES(?,?,?,?,?,NULL,0,1)",
-                (cursor.lastrowid, digest_token(token), encrypted_token, now.isoformat(), (now + timedelta(days=7)).isoformat()),
+                (cursor.lastrowid, digest_token(token), SecretBox().encrypt(token), now.isoformat(), (now + timedelta(days=7)).isoformat()),
             )
             result = connection.execute("SELECT id,name,chat_id,active FROM groups WHERE id=?", (cursor.lastrowid,)).fetchone()
             connection.execute("INSERT INTO audit_log(created_at,kind,group_id,detail) VALUES(CURRENT_TIMESTAMP,'group_created',?,'{}')", (cursor.lastrowid,))
