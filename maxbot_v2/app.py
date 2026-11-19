@@ -11,7 +11,7 @@ from time import perf_counter
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Annotated, Iterator, Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -29,8 +29,9 @@ from .onboarding import WebAuthProviders, attach_group_on_first_account, join_gr
 from .max_adapter import PyMaxAdapter
 from .egress import assign_ip, assigned_ip, bootstrap_ips, enable_ip, host_addresses, refresh_ips, allowed_address
 from .session_vault import EncryptedSessionFile
-from .workers import GroupWorkerManager, _inside_window
+from .workers import GroupWorkerManager, _dispatch_block, _inside_window
 from .sender import DispatchPaused, recover_in_flight
+from .chat_queue import DEFAULT_CHAT_PAUSE_SECONDS
 from .send_proxies import assigned_or_allocate_proxy, normalize_proxy_url
 from .session_lock import AccountSessionLocks
 from .lifecycle import phone_fingerprint
@@ -73,6 +74,12 @@ class GroupUpdateBody(GroupBody):
     pass
 
 
+class ChatDispatchPolicyBody(BaseModel):
+    chat_id: str = Field(min_length=1, max_length=40)
+    pause_seconds: int = Field(ge=0, le=86400)
+    daily_limit: int = Field(ge=0, le=2147483647)
+
+
 class RunBody(BaseModel):
     enabled: bool
 
@@ -100,7 +107,11 @@ class IPAssignmentBody(BaseModel):
 
 class ProxyPoolBody(BaseModel):
     urls: list[str] = Field(min_length=1, max_length=30)
-    enabled: bool = False
+    enabled: Literal[False] = False
+
+
+class ProxyCheckBody(BaseModel):
+    proxy_ids: list[Annotated[int, Field(gt=0, le=2**63 - 1)]] = Field(min_length=1, max_length=30)
 
 
 class ProxyAssignmentBody(BaseModel):
@@ -176,6 +187,7 @@ def create_app(
     runtime_dir = Path(os.getenv("SESSION_RUNTIME_DIR", "/run/maxbot-sessions"))
     sessions_dir = data / "sessions"
     account_session_locks = AccountSessionLocks()
+    send_proxy_check_lock = asyncio.Lock()
     terminal_onboarding_states = ("completed", "failed", "expired", "cancelled")
 
     def session_vault_for(account_id: int) -> EncryptedSessionFile:
@@ -483,7 +495,7 @@ def create_app(
             proxy = assigned_or_allocate_proxy(connection, slot["account_id"], row["ip_id"])
             if proxy is None:
                 raise DispatchPaused("send_proxy_required", blocked=True)
-            if not proxy["enabled"] or proxy["ip_id"] != row["ip_id"]:
+            if not proxy["enabled"] or proxy["check_status"] != "ok" or proxy["ip_id"] != row["ip_id"]:
                 raise DispatchPaused("send_proxy_unavailable", blocked=True)
             connection.commit()
         if row["address"] not in host_addresses():
@@ -498,26 +510,33 @@ def create_app(
         adapter = None
         try:
             def require_same_route() -> None:
-                if row["address"] not in host_addresses():
+                available_hosts = host_addresses()
+                if row["address"] not in available_hosts:
                     raise DispatchPaused("ip_assignment_changed")
                 with db() as connection:
                     current = connection.execute(
                         "SELECT ia.ip_id,p.address,p.enabled,p.available,a.lifecycle,a.auth_state,"
-                        "sp.id AS proxy_id,sp.ip_id AS proxy_ip_id,sp.enabled AS proxy_enabled FROM ip_assignments ia "
+                        "sp.id AS proxy_id,sp.ip_id AS proxy_ip_id,sp.enabled AS proxy_enabled,sp.check_status AS proxy_check_status "
+                        "FROM ip_assignments ia "
                         "JOIN server_ips p ON p.id=ia.ip_id JOIN accounts a ON a.id=ia.account_id "
                         "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id "
                         "LEFT JOIN send_proxies sp ON sp.id=sa.proxy_id WHERE ia.account_id=?",
                         (slot["account_id"],),
                     ).fetchone()
-                if (current is None or current["lifecycle"] != "active" or not current["enabled"] or not current["available"]
-                        or int(current["ip_id"]) != int(row["ip_id"]) or current["address"] != row["address"]):
-                    raise DispatchPaused("ip_assignment_changed")
-                if current["auth_state"] != "authenticated":
-                    raise DispatchPaused("account_reauthentication_required", blocked=True)
-                if current["proxy_id"] != proxy["id"]:
-                    raise DispatchPaused("send_proxy_changed")
-                if not current["proxy_enabled"] or current["proxy_ip_id"] != row["ip_id"]:
-                    raise DispatchPaused("send_proxy_unavailable", blocked=True)
+                    if (current is None or current["lifecycle"] != "active" or not current["enabled"] or not current["available"]
+                            or int(current["ip_id"]) != int(row["ip_id"]) or current["address"] != row["address"]):
+                        raise DispatchPaused("ip_assignment_changed")
+                    if current["auth_state"] != "authenticated":
+                        raise DispatchPaused("account_reauthentication_required", blocked=True)
+                    if current["proxy_id"] != proxy["id"]:
+                        raise DispatchPaused("send_proxy_changed")
+                    if not current["proxy_enabled"] or current["proxy_check_status"] != "ok" or current["proxy_ip_id"] != row["ip_id"]:
+                        raise DispatchPaused("send_proxy_unavailable", blocked=True)
+                    paused = _dispatch_block(
+                        connection, slot, expected_ip_id=row["ip_id"], expected_address=row["address"], available_hosts=available_hosts,
+                    )
+                    if paused is not None:
+                        raise paused
 
             require_same_route()
             adapter = PyMaxAdapter.create(
@@ -787,7 +806,7 @@ def create_app(
             active_groups = connection.execute("SELECT COUNT(*) FROM groups WHERE active=1").fetchone()[0]
             readiness = connection.execute(
                 "SELECT COUNT(*) AS ready_accounts,COUNT(CASE WHEN EXISTS (SELECT 1 FROM send_proxies sp "
-                "WHERE sp.ip_id=i.ip_id AND sp.enabled=1 AND (sa.proxy_id IS NULL OR sp.id=sa.proxy_id)) "
+                "WHERE sp.ip_id=i.ip_id AND sp.enabled=1 AND sp.check_status='ok' AND (sa.proxy_id IS NULL OR sp.id=sa.proxy_id)) "
                 "THEN 1 END) AS routed_accounts FROM accounts a JOIN groups g ON g.id=a.group_id "
                 "JOIN ip_assignments i ON i.account_id=a.id JOIN server_ips p ON p.id=i.ip_id "
                 "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id "
@@ -801,7 +820,7 @@ def create_app(
         elif not readiness["ready_accounts"]:
             wait_reason = "Нет подключённых аккаунтов с проверенной группой и доступным IP VDS."
         elif not readiness["routed_accounts"]:
-            wait_reason = "У подключённых аккаунтов нет включённых SOCKS5 для отправки."
+            wait_reason = "У подключённых аккаунтов нет проверенных и включённых SOCKS5 для отправки."
         else:
             from zoneinfo import ZoneInfo
             now = datetime.now(ZoneInfo(settings.get("timezone", "Europe/Moscow")))
@@ -819,6 +838,7 @@ def create_app(
         with db() as connection:
             rows = connection.execute(
                 "SELECT g.id,g.name,g.invite_link,g.chat_id,g.active,"
+                "COALESCE(cp.pause_seconds,?) AS chat_pause_seconds,COALESCE(cp.daily_limit,0) AS chat_daily_limit,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.ever_authenticated=1 THEN a.id END) account_count,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' THEN a.id END) connected_account_count,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state='authenticated' THEN a.id END) authenticated_account_count,"
@@ -838,10 +858,32 @@ def create_app(
                 "SELECT 1 FROM ip_assignments ia JOIN server_ips assigned_ip ON assigned_ip.id=ia.ip_id "
                 "WHERE ia.account_id=a.id AND assigned_ip.enabled=1 AND assigned_ip.available=1) THEN a.id END) verifiable_account_count "
                 "FROM groups g LEFT JOIN accounts a ON a.group_id=g.id AND a.lifecycle<>'deleted' "
+                "LEFT JOIN chat_dispatch_policies cp ON cp.chat_id=g.chat_id "
                 "GROUP BY g.id ORDER BY g.id",
-                (now, now, now, now),
+                (DEFAULT_CHAT_PAUSE_SECONDS, now, now, now, now),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    @app.put("/api/groups/{group_id}/chat-dispatch-policy")
+    async def set_chat_dispatch_policy(group_id: int, body: ChatDispatchPolicyBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            group = connection.execute("SELECT chat_id FROM groups WHERE id=?", (group_id,)).fetchone()
+            if group is None:
+                raise HTTPException(404, "group_not_found")
+            if group["chat_id"] != body.chat_id:
+                raise HTTPException(409, "group_destination_changed_during_verification")
+            connection.execute(
+                "INSERT INTO chat_dispatch_policies(chat_id,pause_seconds,daily_limit) VALUES(?,?,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET pause_seconds=excluded.pause_seconds,daily_limit=excluded.daily_limit",
+                (body.chat_id, body.pause_seconds, body.daily_limit),
+            )
+            connection.execute(
+                "INSERT INTO audit_log(created_at,kind,group_id,detail) VALUES(CURRENT_TIMESTAMP,'chat_dispatch_policy_updated',?,'{}')",
+                (group_id,),
+            )
+            connection.commit()
+        return body.model_dump()
 
     @app.get("/api/groups/{group_id}/onboarding-link")
     def get_onboarding_link(group_id: int, request: Request, response: Response, _session: sqlite3.Row = Depends(current_session)) -> dict[str, object]:
@@ -959,7 +1001,7 @@ def create_app(
     def list_send_proxies(ip_id: int, _session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
         with db() as connection:
             rows = connection.execute(
-                "SELECT p.id,p.enabled,COUNT(a.id) AS assigned_count FROM send_proxies p "
+                "SELECT p.id,p.enabled,p.check_status,p.last_checked_at,COUNT(a.id) AS assigned_count FROM send_proxies p "
                 "LEFT JOIN send_proxy_assignments s ON s.proxy_id=p.id "
                 "LEFT JOIN accounts a ON a.id=s.account_id AND a.lifecycle='active' "
                 "WHERE p.ip_id=? GROUP BY p.id ORDER BY p.id", (ip_id,),
@@ -980,22 +1022,83 @@ def create_app(
             if ip is None or not allowed_address(ip["address"]):
                 raise HTTPException(404, "ip_not_found")
             added = connection.executemany(
-                "INSERT INTO send_proxies(ip_id,url_ciphertext,url_fingerprint,enabled) VALUES(?,?,?,?) "
+                "INSERT INTO send_proxies(ip_id,url_ciphertext,url_fingerprint) VALUES(?,?,?) "
                 "ON CONFLICT(ip_id,url_fingerprint) DO NOTHING",
-                [(ip_id, box.encrypt(url), fingerprint, int(body.enabled)) for url, fingerprint in zip(urls, fingerprints, strict=True)],
+                [(ip_id, box.encrypt(url), fingerprint) for url, fingerprint in zip(urls, fingerprints, strict=True)],
             ).rowcount
             ids = dict(connection.execute("SELECT url_fingerprint,id FROM send_proxies WHERE ip_id=?", (ip_id,)).fetchall())
             connection.commit()
         return {"added": added, "duplicates": len(urls) - added, "proxy_ids": [ids[fingerprint] for fingerprint in fingerprints]}
 
+    @app.post("/api/ips/{ip_id}/send-proxies/check")
+    async def check_send_proxies(ip_id: int, body: ProxyCheckBody, _session: sqlite3.Row = Depends(require_csrf)) -> list[dict[str, object]]:
+        if send_proxy_check_lock.locked():
+            raise HTTPException(409, "send_proxy_check_in_progress")
+        async with send_proxy_check_lock:
+            proxy_ids = list(dict.fromkeys(body.proxy_ids))
+            placeholders = ",".join("?" for _ in proxy_ids)
+            with db() as connection:
+                ip = connection.execute("SELECT address,enabled,available FROM server_ips WHERE id=?", (ip_id,)).fetchone()
+                routes = dict(connection.execute(
+                    f"SELECT id,url_ciphertext FROM send_proxies WHERE ip_id=? AND id IN ({placeholders})", (ip_id, *proxy_ids),
+                ).fetchall())
+            if ip is None:
+                raise HTTPException(404, "ip_not_found")
+            if len(routes) != len(proxy_ids):
+                raise HTTPException(404, "send_proxy_not_found")
+            source_ip = ip["address"]
+            if not ip["enabled"] or not ip["available"] or not allowed_address(source_ip):
+                raise HTTPException(409, "ip_unavailable")
+            if source_ip not in await asyncio.to_thread(host_addresses):
+                raise HTTPException(409, "ip_unavailable")
+
+            permits = asyncio.Semaphore(6)
+
+            async def probe(proxy_id: int) -> dict[str, object]:
+                async with permits:
+                    with db() as connection:
+                        current_ip = connection.execute(
+                            "SELECT 1 FROM server_ips WHERE id=? AND address=? AND enabled=1 AND available=1", (ip_id, source_ip),
+                        ).fetchone()
+                    if current_ip is None:
+                        return {"id": proxy_id, "check_status": "source_ip_mismatch", "last_checked_at": datetime.now(timezone.utc).isoformat()}
+                    try:
+                        url = SecretBox().decrypt(routes[proxy_id])
+                    except ValueError:
+                        status = "config_invalid"
+                    else:
+                        status = await PyMaxAdapter.check_send_proxy(source_ip=source_ip, url=url)
+                    return {"id": proxy_id, "check_status": status, "last_checked_at": datetime.now(timezone.utc).isoformat()}
+
+            async with asyncio.TaskGroup() as batch:
+                checks = [batch.create_task(probe(proxy_id)) for proxy_id in proxy_ids]
+            results = [task.result() for task in checks]
+            with db() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM server_ips WHERE id=? AND address=? AND enabled=1 AND available=1", (ip_id, source_ip),
+                ).fetchone() is None:
+                    raise HTTPException(409, "ip_unavailable")
+                connection.executemany(
+                    "UPDATE send_proxies SET check_status=:check_status,last_checked_at=:last_checked_at WHERE id=:id",
+                    results,
+                )
+                connection.commit()
+        return results
+
     @app.patch("/api/ips/{ip_id}/send-proxies/{proxy_id}")
     async def set_send_proxy_state(ip_id: int, proxy_id: int, body: IPStateBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
         with db() as connection:
-            changed = connection.execute(
-                "UPDATE send_proxies SET enabled=? WHERE id=? AND ip_id=?", (int(body.enabled), proxy_id, ip_id),
-            ).rowcount
-            if not changed:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT check_status FROM send_proxies WHERE id=? AND ip_id=?", (proxy_id, ip_id),
+            ).fetchone()
+            if row is None:
                 raise HTTPException(404, "send_proxy_not_found")
+            if body.enabled and row["check_status"] != "ok":
+                raise HTTPException(409, "send_proxy_check_required")
+            connection.execute("UPDATE send_proxies SET enabled=? WHERE id=?", (int(body.enabled), proxy_id))
+            connection.commit()
         return {"enabled": body.enabled}
 
     @app.patch("/api/ips/{ip_id}")
@@ -1050,7 +1153,7 @@ def create_app(
         return {"timezone": values["timezone"], "send_windows_weekday": values["send_windows_weekday"], "send_windows_weekend": values["send_windows_weekend"], "delay_min_sec": int(values["delay_min_sec"]), "delay_max_sec": int(values["delay_max_sec"]), "auto_run": values["auto_run"] == "1", "global_stop": values["global_stop"] == "1"}
 
     @app.put("/api/settings")
-    def update_settings(body: SettingsBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
+    async def update_settings(body: SettingsBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
         if body.delay_max_sec < body.delay_min_sec:
             raise HTTPException(422, "invalid_delay_range")
         try:
@@ -1809,7 +1912,7 @@ def create_app(
             week_start = monday_of(datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date()).isoformat()
             rows = connection.execute(
                 "SELECT a.id,a.full_name,a.status,a.auth_state,a.lifecycle,a.ever_authenticated,a.send_weekday,ia.ip_id,p.address AS ip_address,p.enabled AS ip_enabled,p.available AS ip_available,"
-                "sp.id AS send_proxy_id,sp.enabled AS send_proxy_enabled,"
+                "sp.id AS send_proxy_id,sp.enabled AS send_proxy_enabled,sp.check_status AS send_proxy_check_status,"
                 "s.scheduled_date,s.status AS slot_status,s.error_code,"
                 "(SELECT os.state FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_state,"
                 "(SELECT os.error_code FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_error "
@@ -1834,7 +1937,8 @@ def create_app(
             if current is None:
                 raise HTTPException(409, "send_proxy_account_unavailable")
             proxy = connection.execute(
-                "SELECT url_ciphertext FROM send_proxies WHERE id=? AND ip_id=? AND enabled=1", (body.proxy_id, current["ip_id"]),
+                "SELECT url_ciphertext FROM send_proxies WHERE id=? AND ip_id=? AND enabled=1 AND check_status='ok'",
+                (body.proxy_id, current["ip_id"]),
             ).fetchone()
             if proxy is None:
                 raise HTTPException(409, "send_proxy_unavailable")
@@ -2070,13 +2174,13 @@ def create_app(
         return {"ip_id": ip_row["id"], "ip_address": ip_row["address"]}
 
     @app.post("/api/run/stop")
-    def stop(_session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
+    async def stop(_session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
         with db() as connection:
             connection.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
         return {"stopped": True}
 
     @app.post("/api/run/start")
-    def start(_session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
+    async def start(_session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
         with db() as connection:
             connection.execute("UPDATE settings SET value='0' WHERE key='global_stop'")
         return {"stopped": False}

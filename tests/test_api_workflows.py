@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import bcrypt
@@ -55,6 +56,79 @@ def test_group_invite_and_message_pool_are_owner_scoped(tmp_path, monkeypatch):
     assert saved.status_code == 200
     assert client.get("/api/messages").json()["texts"] == ["Один", "Два"]
     assert client.put("/api/messages", headers=headers, json={"texts": ["same", "same"]}).status_code == 422
+
+
+def test_two_signup_groups_share_dispatch_policy_but_keep_links_and_names(tmp_path, monkeypatch):
+    from maxbot_v2.onboarding import attach_group_on_first_account
+
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_ids = [client.post(
+        "/api/groups", headers=headers, json={"name": name, "invite_link": "https://max.ru/join/campaign"},
+    ).json()["id"] for name in ("Команда А", "Команда Б", "Другая группа")]
+    links = [client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"] for group_id in group_ids]
+    assert len(set(links)) == 3
+    connection = connect(client.app.state.database)
+    try:
+        for group_id, target, name in zip(group_ids, ("100", "100", "200"), ("Анна Фамилия", "Борис Фамилия", "Ирина Фамилия"), strict=True):
+            attach_group_on_first_account(connection, group_id, target)
+            connection.execute(
+                "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,?,?,'active','authenticated')",
+                (group_id, f"+7000000000{group_id}", name),
+            )
+    finally:
+        connection.close()
+
+    endpoint = f"/api/groups/{group_ids[0]}/chat-dispatch-policy"
+    policy = {"chat_id": "100", "pause_seconds": 45, "daily_limit": 3}
+    assert client.put(endpoint, json=policy).status_code == 403
+    assert client.put(endpoint, headers=headers, json={**policy, "chat_id": "200"}).status_code == 409
+    assert client.put(endpoint, headers=headers, json=policy).json() == policy
+    groups = {row["id"]: row for row in client.get("/api/groups").json()}
+    assert [(groups[group_id]["chat_pause_seconds"], groups[group_id]["chat_daily_limit"]) for group_id in group_ids] == [(45, 3), (45, 3), (15, 0)]
+    assert [client.get(f"/api/groups/{group_id}/accounts").json()[0]["full_name"] for group_id in group_ids[:2]] == ["Анна Фамилия", "Борис Фамилия"]
+
+
+def test_confirming_an_old_unknown_operation_does_not_restart_chat_pause(tmp_path, monkeypatch):
+    from maxbot_v2.chat_queue import chat_dispatch_wait
+    from maxbot_v2.sender import Sender
+
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Группа", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    policy = {"chat_id": "100", "pause_seconds": 86400, "daily_limit": 0}
+    clock = datetime.now(timezone.utc)
+    older = clock - timedelta(days=2)
+
+    class OldClock(datetime):
+        @classmethod
+        def now(cls, zone=None):
+            return older.astimezone(zone)
+
+    class UncertainProvider:
+        async def send_message(self, **_kwargs):
+            raise TimeoutError
+
+    db = connect(client.app.state.database)
+    try:
+        db.execute("UPDATE groups SET chat_id='100' WHERE id=?", (group_id,))
+        assert client.put(f"/api/groups/{group_id}/chat-dispatch-policy", headers=headers, json=policy).status_code == 200
+        account_id = db.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,'+70000000001','Fixture','active','authenticated')",
+            (group_id,),
+        ).lastrowid
+        version = replace_message_pool(db, ["fixture"])
+        day = older.date().isoformat()
+        slot = create_weekly_slot(db, account_id=account_id, week_start=day, scheduled_date=day, text="fixture", message_version_id=version)
+        with monkeypatch.context() as frozen:
+            frozen.setattr("maxbot_v2.sender.datetime", OldClock)
+            assert asyncio.run(Sender(db, UncertainProvider()).send_slot(slot["slot_id"], chat_id=100)) == "unknown"
+        op = db.execute("SELECT operation_id FROM operations").fetchone()[0]
+        response = client.post(f"/api/operations/{op}/resolve", headers=headers, json={"outcome": "accepted", "provider_message_id": "confirmed"})
+        assert response.status_code == 200
+        assert chat_dispatch_wait(db, "100", clock) is None
+    finally:
+        db.close()
 
 
 def test_reopening_onboarding_link_returns_the_existing_group_link(tmp_path, monkeypatch):
@@ -825,6 +899,8 @@ def test_owner_manages_external_proxy_pool_without_exposing_credentials(tmp_path
     assert len(rows) == 1
     assert result.json() == {"added": 1, "duplicates": 1, "proxy_ids": [rows[0]["id"], rows[0]["id"]]}
     assert not rows[0]["enabled"]
+    assert rows[0]["check_status"] == "unchecked"
+    assert rows[0]["last_checked_at"] is None
     assert "sample-user" not in str(rows) and "sample-password" not in str(rows)
     db = connect(client.app.state.database)
     try:
@@ -833,12 +909,89 @@ def test_owner_manages_external_proxy_pool_without_exposing_credentials(tmp_path
         assert SecretBox().decrypt(ciphertext) == url
     finally:
         db.close()
-    assert client.patch(f"{endpoint}/{rows[0]['id']}", headers=headers, json={"enabled": True}).status_code == 200
+    proxy_id = rows[0]["id"]
+    other_ip = client.get("/api/ips").json()[0]["id"] + 1
+    change = f"{endpoint}/{proxy_id}"
+    check = f"{endpoint}/check"
+    ids = {"proxy_ids": [proxy_id, proxy_id]}
+    assert client.patch(change, headers=headers, json={"enabled": True}).json()["detail"] == "send_proxy_check_required"
+    assert client.post(endpoint, headers=headers, json={"urls": [url], "enabled": True}).status_code == 422
+
+    probes = []
+    result_status = "auth_failed"
+
+    async def probe(*, source_ip, url):
+        probes.append((source_ip, url))
+        return result_status
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.check_send_proxy", staticmethod(probe))
+    assert client.post(check, json=ids).status_code == 403
+    assert TestClient(client.app, base_url="https://test.local").post(check, json=ids).status_code == 401
+    assert client.post(check, headers=headers, json={"proxy_ids": [proxy_id] * 31}).status_code == 422
+    assert client.post(check, headers=headers, json={"proxy_ids": [proxy_id, proxy_id + 1]}).status_code == 404
+    assert client.post(f"/api/ips/{other_ip}/send-proxies/check", headers=headers, json=ids).status_code == 404
+    assert probes == []
+
+    response = client.post(check, headers=headers, json=ids)
+    assert response.status_code == 200
+    failed, = response.json()
+    assert failed["check_status"] == "auth_failed"
+    assert failed["last_checked_at"]
+    assert set(failed) == {"id", "check_status", "last_checked_at"}
+    assert probes == [("62.109.20.186", url)]
+    assert client.patch(change, headers=headers, json={"enabled": True}).status_code == 409
+
+    result_status = "ok"
+    response = client.post(check, headers=headers, json=ids)
+    assert response.json()[0]["check_status"] == "ok"
+    assert not client.get(endpoint).json()[0]["enabled"]
+    assert client.patch(change, headers=headers, json={"enabled": True}).status_code == 200
     assert client.get(endpoint).json()[0]["enabled"]
+    monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: set())
+    assert client.post(check, headers=headers, json=ids).status_code == 409
+    assert len(probes) == 2
     assert "sample-password" not in client.get("/api/log").text
 
 
+def test_proxy_batch_checks_thirty_saved_routes_with_bounded_concurrency(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    ip_id = client.get("/api/ips").json()[0]["id"]
+    endpoint = f"/api/ips/{ip_id}/send-proxies"
+    urls = [f"socks5://8.8.4.4:{1080 + index}" for index in range(30)]
+    proxy_ids = client.post(endpoint, headers=headers, json={"urls": urls}).json()["proxy_ids"]
+    active = peak = 0
+
+    async def probe(**_route):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return "ok"
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.check_send_proxy", staticmethod(probe))
+    response = client.post(f"{endpoint}/check", headers=headers, json={"proxy_ids": proxy_ids})
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()] == proxy_ids
+    assert {row["check_status"] for row in client.get(endpoint).json()} == {"ok"}
+    assert 1 < peak <= 6
+
+
+def check_and_enable_fake_proxies(client, endpoint, headers, ids, monkeypatch):
+    async def probe(**_route):
+        return "ok"
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.check_send_proxy", staticmethod(probe))
+    assert client.post(f"{endpoint}/check", headers=headers, json={"proxy_ids": ids}).status_code == 200
+    for proxy_id in ids:
+        assert client.patch(f"{endpoint}/{proxy_id}", headers=headers, json={"enabled": True}).status_code == 200
+
+
 def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, monkeypatch):
+    from datetime import date
+
+    from maxbot_v2.send_proxies import resume_proxy_blocked_slots
     from maxbot_v2.sender import DispatchPaused
 
     client, csrf = owner_client(tmp_path, monkeypatch)
@@ -848,8 +1001,18 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
     endpoint = f"/api/ips/{ip_id}/send-proxies"
     url = "socks5://sample-user:sample-password@8.8.4.4:1080"
     alternate = "socks5://1.1.1.1:1080"
+    clock = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, zone=None):
+            return clock.astimezone(zone)
+
+    monkeypatch.setattr("maxbot_v2.workers.datetime", FixedClock)
     db = connect(client.app.state.database)
     try:
+        db.execute("UPDATE groups SET chat_id='10' WHERE id=?", (group_id,))
+        db.execute("UPDATE settings SET value='UTC' WHERE key='timezone'")
         account_id = db.execute(
             "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,'+79990000000','Fixture','active','authenticated')",
             (group_id,),
@@ -860,6 +1023,11 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
             (group_id,),
         ).lastrowid
         db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (second_account, ip_id))
+        version_id = replace_message_pool(db, ["fixture"])
+        for account in (account_id, second_account):
+            create_weekly_slot(db, account_id=account, week_start="2026-09-21", scheduled_date="2026-09-21", text="fixture", message_version_id=version_id)
+        db.execute("UPDATE weekly_slots SET status='in_flight'")
+        slots = {row["account_id"]: row for row in db.execute("SELECT s.*,g.chat_id FROM weekly_slots s JOIN groups g ON g.id=s.group_id")}
     finally:
         db.close()
 
@@ -879,35 +1047,57 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
     monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(create))
     provider = client.app.state.worker_manager.provider_factory
     with pytest.raises(DispatchPaused, match="send_proxy_required"):
-        asyncio.run(provider({"account_id": account_id}))
+        asyncio.run(provider(slots[account_id]))
     assert routes == []
-    assert client.post(endpoint, headers=headers, json={"urls": [url, alternate], "enabled": True}).status_code == 201
+    assert client.post(endpoint, headers=headers, json={"urls": [url, alternate]}).status_code == 201
     proxy_id, alternate_id = [proxy["id"] for proxy in client.get(endpoint).json()]
+    db = connect(client.app.state.database)
+    try:
+        db.execute("UPDATE send_proxies SET enabled=1 WHERE id=?", (proxy_id,))
+        with pytest.raises(DispatchPaused, match="send_proxy_required"):
+            asyncio.run(provider(slots[account_id]))
+        assert db.execute("SELECT COUNT(*) FROM send_proxy_assignments").fetchone()[0] == 0
+    finally:
+        db.close()
+    check_and_enable_fake_proxies(client, endpoint, headers, [proxy_id, alternate_id], monkeypatch)
 
     async def check_route():
-        connected = await provider({"account_id": account_id})
+        connected = await provider(slots[account_id])
         await connected.close()
         assert routes[0]["source_ip"] == "62.109.20.186"
         assert routes[0]["send_proxy_url"] == url
         assert routes[0].get("code_provider") is None
-        second_connected = await provider({"account_id": second_account})
+        second_connected = await provider(slots[second_account])
         await second_connected.close()
         assert routes[1]["send_proxy_url"] == alternate
 
-        def disabling_proxy_during_ip_check():
+        def closed_window_during_ip_check():
             db = connect(client.app.state.database)
             try:
-                db.execute("UPDATE send_proxies SET enabled=0 WHERE id=?", (proxy_id,))
+                db.execute("UPDATE settings SET value='16:00-21:00' WHERE key='send_windows_weekday'")
             finally:
                 db.close()
             return {"62.109.20.186"}
 
         with monkeypatch.context() as race:
-            race.setattr("maxbot_v2.app.host_addresses", disabling_proxy_during_ip_check)
+            race.setattr("maxbot_v2.app.host_addresses", closed_window_during_ip_check)
+            with pytest.raises(DispatchPaused, match="outside_send_window"):
+                routes[0]["before_network_action"]()
+
+        def failed_probe_during_ip_check():
+            db = connect(client.app.state.database)
+            try:
+                db.execute("UPDATE send_proxies SET check_status='tls_failed' WHERE id=?", (proxy_id,))
+            finally:
+                db.close()
+            return {"62.109.20.186"}
+
+        with monkeypatch.context() as race:
+            race.setattr("maxbot_v2.app.host_addresses", failed_probe_during_ip_check)
             with pytest.raises(DispatchPaused, match="send_proxy_unavailable"):
                 routes[0]["before_network_action"]()
         with pytest.raises(DispatchPaused, match="send_proxy_unavailable"):
-            await provider({"account_id": account_id})
+            await provider(slots[account_id])
         assert len(routes) == 2
 
     asyncio.run(check_route())
@@ -915,6 +1105,13 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
     try:
         version_id = replace_message_pool(db, ["fixture"])
         slot = create_weekly_slot(db, account_id=account_id, week_start="2099-01-05", scheduled_date="2099-01-05", text="fixture", message_version_id=version_id)
+        db.execute("UPDATE weekly_slots SET status='blocked',error_code='send_proxy_unavailable' WHERE slot_id=?", (slot["slot_id"],))
+        resume_proxy_blocked_slots(db, group_id, date(2099, 1, 5))
+        assert db.execute("SELECT status FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],)).fetchone()[0] == "blocked"
+        assert db.execute("SELECT proxy_id FROM send_proxy_assignments WHERE account_id=?", (account_id,)).fetchone()[0] == proxy_id
+        assert client.post(f"{endpoint}/check", headers=headers, json={"proxy_ids": [proxy_id]}).json()[0]["check_status"] == "ok"
+        resume_proxy_blocked_slots(db, group_id, date(2099, 1, 5))
+        assert db.execute("SELECT status FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],)).fetchone()[0] == "queued"
         db.execute("UPDATE weekly_slots SET status='blocked',error_code='send_proxy_config_invalid' WHERE slot_id=?", (slot["slot_id"],))
     finally:
         db.close()
@@ -983,9 +1180,11 @@ def test_initial_membership_read_network_error_preserves_authenticated_attempt(t
     token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
     ip_id = client.get("/api/ips").json()[0]["id"]
     proxy_pool = f"/api/ips/{ip_id}/send-proxies"
-    added = client.post(proxy_pool, headers={"X-CSRF-Token": csrf}, json={"urls": ["socks5://8.8.4.4:1080"], "enabled": True})
+    headers = {"X-CSRF-Token": csrf}
+    added = client.post(proxy_pool, headers=headers, json={"urls": ["socks5://8.8.4.4:1080"]})
     assert added.status_code == 201
-    proxy_id = client.get(proxy_pool).json()[0]["id"]
+    proxy_id = added.json()["proxy_ids"][0]
+    check_and_enable_fake_proxies(client, proxy_pool, headers, [proxy_id], monkeypatch)
     reads = 0
 
     class FakeAdapter:

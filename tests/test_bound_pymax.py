@@ -113,8 +113,14 @@ def test_external_proxy_connects_from_assigned_ip_and_keeps_tls_for_max(tmp_path
         def getsockname(self):
             return address, 12345
 
+        def close(self):
+            calls.append("closed")
+
         def get_extra_info(self, name):
             return self.getsockname() if name == "sockname" else None
+
+        async def wait_closed(self):
+            pass
 
     sock = FakeSocket()
     calls = []
@@ -138,13 +144,71 @@ def test_external_proxy_connects_from_assigned_ip_and_keeps_tls_for_max(tmp_path
     assert len(calls) == 1
     assert calls[0]["local_addr"] == (address, 0)
     assert calls[0]["dest_port"] == 443
+    installed_route = calls.pop()
 
+    def unexpected_client(*args, **kwargs):
+        pytest.fail("Route probe must not create a MAX client or send any application data")
+
+    monkeypatch.setattr("pymax.Client", unexpected_client)
+    assert asyncio.run(PyMaxAdapter.check_send_proxy(source_ip=address, url=url)) == "ok"
+    assert calls == [installed_route, "closed"]
     async def unavailable(self, **kwargs):
         raise OSError("synthetic proxy failure")
 
     monkeypatch.setattr(Proxy, "connect", unavailable)
-    with pytest.raises(OSError, match="synthetic proxy failure"):
+    with pytest.raises(AdapterUnavailable, match="tunnel_failed"):
         asyncio.run(adapter.client._build_connection().transport.connect())
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        ("connection", "connection_failed"),
+        ("timeout", "socks_timeout"),
+        ("auth", "auth_failed"),
+        ("tunnel", "tunnel_failed"),
+        ("source", "source_ip_mismatch"),
+        ("tls", "tls_failed"),
+    ],
+)
+def test_proxy_probe_maps_safe_stage_and_closes_socket(monkeypatch, failure, expected_status):
+    from python_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
+    from python_socks._protocols.errors import ReplyError
+    from python_socks.async_.asyncio import Proxy
+
+    address = "62.109.20.186"
+    url = "socks5://sample-user:sample-password@8.8.4.4:1080"
+    closed = []
+    errors = {
+        "connection": ProxyConnectionError("sample-password"),
+        "timeout": ProxyTimeoutError(),
+        "auth": ProxyError(ReplyError("Username and password authentication failure")),
+        "tunnel": ProxyError(ReplyError("Username and password authentication failure (remote error)"), error_code=4),
+    }
+
+    class Socket:
+        def getsockname(self):
+            return ("62.109.20.187" if failure == "source" else address), 1234
+
+        def close(self):
+            closed.append(True)
+
+    async def tunnel(self, **kwargs):
+        assert kwargs["local_addr"] == (address, 0)
+        if failure in errors:
+            raise errors[failure]
+        return Socket()
+
+    async def wrap_tls(*args, **kwargs):
+        assert failure == "tls"
+        assert kwargs["server_hostname"] == "api2.oneme.ru"
+        assert kwargs["ssl"].check_hostname
+        raise OSError("sample-password")
+
+    monkeypatch.setattr(Proxy, "connect", tunnel)
+    monkeypatch.setattr(asyncio, "open_connection", wrap_tls)
+    assert asyncio.run(PyMaxAdapter.check_send_proxy(source_ip=address, url=url)) == expected_status
+    assert closed == ([True] if failure in {"source", "tls"} else [])
 
 
 def test_bound_transport_checks_current_account_route_before_each_write(tmp_path, monkeypatch):

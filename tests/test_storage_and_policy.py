@@ -13,6 +13,32 @@ from scripts.backup import create_backup
 from scripts.restore import restore_backup
 
 
+def test_send_proxy_check_migration_preserves_legacy_proxy_rows(tmp_path):
+    database = tmp_path / "prior-release.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            "CREATE TABLE send_proxies (id INTEGER PRIMARY KEY, ip_id INTEGER NOT NULL REFERENCES server_ips(id), "
+            "url_ciphertext TEXT NOT NULL, url_fingerprint TEXT NOT NULL, "
+            "enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)), UNIQUE(ip_id,url_fingerprint)); "
+            "INSERT INTO send_proxies VALUES(100,1,'encrypted-fixture','fingerprint-fixture',1);"
+        )
+    connection = connect(database)
+    try:
+        initialize(connection)
+        initialize(connection)
+        connection.execute("INSERT INTO server_ips(id,address,enabled,available) VALUES(1,'62.109.20.186',1,1)")
+        proxy = connection.execute("SELECT * FROM send_proxies").fetchone()
+        assert (proxy["id"], proxy["url_ciphertext"], proxy["url_fingerprint"], proxy["enabled"]) == (
+            100, "encrypted-fixture", "fingerprint-fixture", 1,
+        )
+        assert proxy["check_status"] == "unchecked"
+        assert proxy["last_checked_at"] is None
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        connection.close()
+
+
 def test_pymax_adapter_calls_provider_without_local_authorization_file():
     class FakeClient:
         def __init__(self):

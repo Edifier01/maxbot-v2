@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS send_proxies (
     url_ciphertext TEXT NOT NULL,
     url_fingerprint TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    check_status TEXT NOT NULL DEFAULT 'unchecked',
+    last_checked_at TEXT,
     UNIQUE(ip_id, url_fingerprint)
 );
 CREATE TABLE IF NOT EXISTS send_proxy_assignments (
@@ -148,6 +150,11 @@ CREATE TABLE IF NOT EXISTS weekly_slots (
     UNIQUE(account_id, week_start)
 );
 CREATE INDEX IF NOT EXISTS idx_weekly_due ON weekly_slots(group_id, scheduled_date, status);
+CREATE TABLE IF NOT EXISTS chat_dispatch_policies (
+    chat_id TEXT PRIMARY KEY,
+    pause_seconds INTEGER NOT NULL CHECK(pause_seconds >= 0),
+    daily_limit INTEGER NOT NULL CHECK(daily_limit >= 0)
+);
 CREATE TABLE IF NOT EXISTS group_worker_leases (
     group_id INTEGER PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,
     owner_id TEXT NOT NULL,
@@ -159,9 +166,11 @@ CREATE TABLE IF NOT EXISTS operations (
     slot_id TEXT NOT NULL REFERENCES weekly_slots(slot_id),
     account_id INTEGER NOT NULL REFERENCES accounts(id),
     group_id INTEGER NOT NULL REFERENCES groups(id),
+    destination_chat_id TEXT,
     status TEXT NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT,
+    dispatch_finished_at TEXT,
     provider_message_id TEXT,
     error_code TEXT
 );
@@ -249,6 +258,30 @@ def initialize(connection: sqlite3.Connection) -> None:
     ip_columns = {row[1] for row in connection.execute("PRAGMA table_info(server_ips)")}
     if "last_assigned_at" not in ip_columns:
         connection.execute("ALTER TABLE server_ips ADD COLUMN last_assigned_at TEXT")
+    send_proxy_columns = {row[1] for row in connection.execute("PRAGMA table_info(send_proxies)")}
+    if "check_status" not in send_proxy_columns:
+        connection.execute("ALTER TABLE send_proxies ADD COLUMN check_status TEXT NOT NULL DEFAULT 'unchecked'")
+    if "last_checked_at" not in send_proxy_columns:
+        connection.execute("ALTER TABLE send_proxies ADD COLUMN last_checked_at TEXT")
+    operation_columns = {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
+    if "destination_chat_id" not in operation_columns:
+        connection.execute("ALTER TABLE operations ADD COLUMN destination_chat_id TEXT")
+    if "dispatch_finished_at" not in operation_columns:
+        connection.execute("ALTER TABLE operations ADD COLUMN dispatch_finished_at TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_in_flight ON operations(destination_chat_id) "
+        "WHERE destination_chat_id IS NOT NULL AND status='in_flight'"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_daily_operations ON operations(destination_chat_id,status,started_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_dispatch_finishes ON operations(destination_chat_id,status,dispatch_finished_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_group_turn ON operations(destination_chat_id,group_id,id) "
+        "WHERE status IN ('accepted','unknown')"
+    )
     connection.execute(
         "UPDATE onboarding_sessions SET phone=NULL,full_name=NULL WHERE state IN "
         "('completed','failed','expired','cancelled')"

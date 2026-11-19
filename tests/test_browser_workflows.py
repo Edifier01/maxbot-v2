@@ -166,6 +166,41 @@ def login(page: Page, local_app):
 
 
 @pytest.mark.parametrize("width", [390, 768, 1440])
+def test_shared_chat_rules_and_separate_signup_names(page: Page, local_app, width):
+    connection = connect(local_app.app.state.database)
+    try:
+        for number, group, person in ((1, "Первая команда", "Анна Первая"), (2, "Вторая команда", "Борис Второй")):
+            group_id = connection.execute(
+                "INSERT INTO groups(name,invite_link,chat_id) VALUES(?,'https://max.ru/join/fixture','7001')", (group,),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,?,?,'active','authenticated')",
+                (group_id, f"+7000000000{number}", person),
+            )
+    finally:
+        connection.close()
+    page.set_viewport_size({"width": width, "height": 900})
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и IP").click()
+    first = page.locator(".group-card").filter(has_text="Первая команда")
+    second = page.locator(".group-card").filter(has_text="Вторая команда")
+    for card in (first, second):
+        card.get_by_text("Правила отправки в чат MAX", exact=True).press("Enter")
+        expect(card.get_by_label("Пауза между отправками, сек")).to_have_value("15")
+    first.get_by_label("Пауза между отправками, сек").fill("45")
+    first.get_by_label("Лимит сообщений в день").fill("3")
+    first.get_by_role("button", name="Сохранить правила чата").press("Enter")
+    expect(second.get_by_label("Пауза между отправками, сек")).to_have_value("45")
+    expect(second.get_by_label("Лимит сообщений в день")).to_have_value("3")
+    for card in (first, second):
+        card.get_by_role("button", name="Номера", exact=True).click()
+    expect(first).to_contain_text("Анна Первая")
+    expect(second).to_contain_text("Борис Второй")
+    expect(first).not_to_contain_text("Борис Второй")
+    assert page_has_no_overflow(page)
+
+
+@pytest.mark.parametrize("width", [390, 768, 1440])
 def test_owner_adds_number_from_selected_group(page: Page, local_app, width):
     page.set_viewport_size({"width": width, "height": 900})
     login(page, local_app)
@@ -260,7 +295,12 @@ def test_ip_list_is_compact_and_keyboard_operable(page: Page, local_app, monkeyp
 
 
 @pytest.mark.parametrize("width", [390, 768, 1440])
-def test_owner_imports_external_proxies_in_selected_ip_pool(page: Page, local_app, width):
+def test_owner_imports_external_proxies_in_selected_ip_pool(page: Page, local_app, monkeypatch, width):
+    async def probe(*, source_ip, url):
+        assert source_ip == "62.109.20.186"
+        return "auth_failed" if "example-password" in url else "ok"
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.check_send_proxy", staticmethod(probe))
     page.set_viewport_size({"width": width, "height": 900})
     login(page, local_app)
     page.get_by_role("button", name="Группы, номера и IP").click()
@@ -275,10 +315,18 @@ def test_owner_imports_external_proxies_in_selected_ip_pool(page: Page, local_ap
     })
     pool.get_by_role("button", name="Добавить прокси").click()
     expect(pool.get_by_role("button", name="Включить", exact=True)).to_have_count(2)
+    expect(pool.get_by_role("button", name="Включить", exact=True).first).to_be_disabled()
+    expect(pool.get_by_role("button", name="Включить", exact=True).last).to_be_disabled()
     expect(pool).to_contain_text("Номера в порядке импорта: №")
     assert "example-password" not in pool.inner_text()
-    pool.get_by_role("button", name="Включить", exact=True).first.press("Enter")
+    pool.get_by_role("button", name="Проверить импортированные").press("Enter")
+    expect(pool).to_contain_text("SOCKS5 отклонил авторизацию")
+    expect(pool).to_contain_text("TLS до MAX установлен")
+    expect(pool.get_by_role("button", name="Включить", exact=True).first).to_be_disabled()
+    pool.get_by_role("button", name="Включить", exact=True).last.press("Enter")
     expect(pool.get_by_role("button", name="Отключить", exact=True)).to_have_count(1)
+    pool.get_by_role("button", name="Проверить", exact=True).last.press("Enter")
+    expect(pool).to_contain_text("TLS до MAX установлен")
     assert page_has_no_overflow(page)
 
 

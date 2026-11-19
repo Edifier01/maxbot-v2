@@ -52,16 +52,16 @@ def normalize_proxy_url(raw: str) -> str:
 def assigned_or_allocate_proxy(connection: sqlite3.Connection, account_id: int, ip_id: int) -> sqlite3.Row | None:
     """Keep existing assignments; allocate in the caller's write transaction."""
     assigned = connection.execute(
-        "SELECT p.id,p.ip_id,p.enabled,p.url_ciphertext FROM send_proxy_assignments a "
+        "SELECT p.id,p.ip_id,p.enabled,p.check_status,p.url_ciphertext FROM send_proxy_assignments a "
         "JOIN send_proxies p ON p.id=a.proxy_id WHERE a.account_id=?", (account_id,),
     ).fetchone()
     if assigned is not None:
         return assigned
     candidate = connection.execute(
-        "SELECT p.id,p.ip_id,p.enabled,p.url_ciphertext FROM send_proxies p "
+        "SELECT p.id,p.ip_id,p.enabled,p.check_status,p.url_ciphertext FROM send_proxies p "
         "LEFT JOIN send_proxy_assignments s ON s.proxy_id=p.id "
         "LEFT JOIN accounts a ON a.id=s.account_id AND a.lifecycle='active' "
-        "WHERE p.ip_id=? AND p.enabled=1 GROUP BY p.id ORDER BY COUNT(a.id),p.id LIMIT 1",
+        "WHERE p.ip_id=? AND p.enabled=1 AND p.check_status='ok' GROUP BY p.id ORDER BY COUNT(a.id),p.id LIMIT 1",
         (ip_id,),
     ).fetchone()
     if candidate is not None:
@@ -78,7 +78,7 @@ def resume_proxy_blocked_slots(connection: sqlite3.Connection, group_id: int, to
         "error_code=NULL,updated_at=? WHERE group_id=? AND status='blocked' "
         "AND error_code IN ('send_proxy_required','send_proxy_unavailable') AND EXISTS ("
         "SELECT 1 FROM ip_assignments i LEFT JOIN send_proxy_assignments a ON a.account_id=i.account_id "
-        "JOIN send_proxies p ON p.ip_id=i.ip_id AND p.enabled=1 AND (a.proxy_id IS NULL OR a.proxy_id=p.id) "
+        "JOIN send_proxies p ON p.ip_id=i.ip_id AND p.enabled=1 AND p.check_status='ok' AND (a.proxy_id IS NULL OR a.proxy_id=p.id) "
         "WHERE i.account_id=weekly_slots.account_id)",
         (today.isoformat(), datetime.now(timezone.utc).isoformat(), group_id),
     )

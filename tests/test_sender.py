@@ -1,10 +1,10 @@
 import asyncio
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from maxbot_v2.db import initialize
+from maxbot_v2.db import connect, initialize
 from maxbot_v2.message_pool import replace_message_pool
 from maxbot_v2.planning import prepare_week
 from maxbot_v2.scheduling import create_weekly_slot
@@ -129,6 +129,7 @@ def test_weekly_limit_follows_phone_fingerprint_after_account_recreation(prior_w
         "INSERT INTO send_log(account_id,group_id,slot_id,sent_at,provider_message_id,text) "
         "VALUES(1,1,?,?,'accepted','prior')", (prior["slot_id"], logged_at),
     )
+    db.execute("UPDATE weekly_slots SET status='accepted' WHERE slot_id=?", (prior["slot_id"],))
 
     class Provider:
         calls = 0
@@ -183,6 +184,167 @@ def test_concurrent_group_workers_cannot_send_same_queued_slot_twice():
     assert second == "in_flight"
     assert first == "accepted"
     assert provider.calls == 1
+
+
+def add_group_slot(db, phone, chat_id, day="2026-09-21"):
+    group_id = db.execute(
+        "INSERT INTO groups(name,invite_link,chat_id) VALUES('other panel group','https://max.ru/invite',?)", (chat_id,),
+    ).lastrowid
+    account_id = db.execute(
+        "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,?,'Fixture','active','authenticated')",
+        (group_id, phone),
+    ).lastrowid
+    return create_weekly_slot(db, account_id=account_id, week_start="2026-09-21", scheduled_date=day, text="fixture", message_version_id=1)
+
+
+def test_shared_chat_serializes_due_slots_across_panel_groups(tmp_path):
+    path = tmp_path / "queue.db"
+    seed = seeded_db()
+    first_db = connect(path)
+    seed.backup(first_db)
+    seed.close()
+    first_db.execute("UPDATE accounts SET send_weekday=0 WHERE id=1")
+    prepare_week(first_db, date(2026, 9, 21))
+    first_slot = first_db.execute("SELECT slot_id FROM weekly_slots").fetchone()[0]
+    next_slot = add_group_slot(first_db, "+70000000002", "10")["slot_id"]
+    separate_slot = add_group_slot(first_db, "+70000000003", "20")["slot_id"]
+    second_db = connect(path)
+
+    class SlowProvider:
+        async def send_message(self, **_kwargs):
+            entered.set()
+            await release.wait()
+            return Ack("first")
+
+    class FastProvider:
+        calls = 0
+
+        async def send_message(self, **_kwargs):
+            self.calls += 1
+            return Ack("next")
+
+    async def scenario():
+        nonlocal entered, release
+        entered, release = asyncio.Event(), asyncio.Event()
+        fast = FastProvider()
+        other = Sender(second_db, fast)
+        assert await other.send_slot(next_slot, chat_id=10) == "chat_waiting"
+        task = asyncio.create_task(Sender(first_db, SlowProvider()).send_slot(first_slot, chat_id=10))
+        try:
+            await entered.wait()
+            assert await other.send_slot(next_slot, chat_id=10) == "chat_waiting"
+            assert await other.send_slot(separate_slot, chat_id=20) == "accepted"
+        finally:
+            release.set()
+            assert await task == "accepted"
+        finished = datetime.fromisoformat(second_db.execute(
+            "SELECT finished_at FROM operations WHERE slot_id=?", (first_slot,),
+        ).fetchone()[0])
+        assert await other.send_slot(next_slot, chat_id=10, now=finished + timedelta(seconds=14)) == "chat_waiting"
+        assert await other.send_slot(next_slot, chat_id=10, now=finished + timedelta(seconds=15)) == "accepted"
+        assert fast.calls == 2
+
+    entered = release = None
+    try:
+        asyncio.run(scenario())
+        assert [row[0] for row in second_db.execute("SELECT destination_chat_id FROM operations ORDER BY id")] == ["10", "20", "10"]
+    finally:
+        first_db.close()
+        second_db.close()
+
+
+def test_chat_daily_limit_charges_unknown_at_local_day_boundary():
+    db = seeded_db()
+    db.execute("UPDATE accounts SET send_weekday=0 WHERE id=1")
+    prepare_week(db, date(2026, 9, 21))
+    first_slot = db.execute("SELECT slot_id FROM weekly_slots").fetchone()[0]
+    same_day = add_group_slot(db, "+70000000002", "10")["slot_id"]
+    tomorrow = add_group_slot(db, "+70000000003", "10", "2026-09-22")["slot_id"]
+    db.execute("INSERT INTO chat_dispatch_policies(chat_id,pause_seconds,daily_limit) VALUES('10',0,1)")
+
+    class TimedOutProvider:
+        async def send_message(self, **_kwargs):
+            raise TimeoutError
+
+    class AcceptingProvider:
+        calls = 0
+
+        async def send_message(self, **_kwargs):
+            self.calls += 1
+            return Ack("next-day")
+
+    clock = datetime(2026, 9, 21, 20, 59, 30, tzinfo=timezone.utc)
+    assert asyncio.run(Sender(db, TimedOutProvider()).send_slot(first_slot, chat_id=10, now=clock)) == "unknown"
+    fast = AcceptingProvider()
+    sender = Sender(db, fast)
+    assert asyncio.run(sender.send_slot(same_day, chat_id=10, now=clock + timedelta(seconds=1))) == "chat_waiting"
+    assert asyncio.run(sender.send_slot(tomorrow, chat_id=10, now=clock + timedelta(seconds=30))) == "accepted"
+    assert fast.calls == 1
+
+
+def test_same_chat_panel_groups_take_turns_across_weeks_with_a_daily_limit():
+    db = seeded_db()
+    first_day = date(2026, 9, 21)
+    db.execute("UPDATE accounts SET send_weekday=0 WHERE id=1")
+    prepare_week(db, first_day)
+    other = add_group_slot(db, "+70000000002", "10")
+    db.execute("INSERT INTO chat_dispatch_policies(chat_id,pause_seconds,daily_limit) VALUES('10',0,1)")
+
+    class AcceptingProvider:
+        async def send_message(self, **_kwargs):
+            return Ack("confirmed")
+
+    sender = Sender(db, AcceptingProvider())
+    first_time = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
+    assert asyncio.run(sender.send_slot("slot-2026-09-21-1", chat_id=10, now=first_time)) == "accepted"
+    assert asyncio.run(sender.send_slot(other["slot_id"], chat_id=10, now=first_time)) == "chat_waiting"
+
+    db.execute("UPDATE accounts SET send_weekday=0 WHERE id=?", (other["account_id"],))
+    prepare_week(db, first_day + timedelta(days=7))
+    next_time = first_time + timedelta(days=7)
+    assert asyncio.run(sender.send_slot("slot-2026-09-28-1", chat_id=10, now=next_time)) == "chat_waiting"
+    assert asyncio.run(sender.send_slot(f"slot-2026-09-28-{other['account_id']}", chat_id=10, now=next_time)) == "accepted"
+    assert [row[0] for row in db.execute("SELECT group_id FROM operations WHERE status='accepted' ORDER BY id")] == [1, 2]
+
+
+def test_stale_worker_chat_does_not_block_a_slot_after_destination_verification():
+    db = seeded_db()
+    prepare_week(db, date(2026, 9, 21))
+    slot_id = db.execute("SELECT slot_id FROM weekly_slots").fetchone()[0]
+    db.execute("UPDATE groups SET chat_id='20' WHERE id=1")
+
+    class Provider:
+        async def send_message(self, *, chat_id, **_kwargs):
+            assert chat_id == 20
+            return Ack("correct-destination")
+
+    sender = Sender(db, Provider())
+    assert asyncio.run(sender.send_slot(slot_id, chat_id=10)) == "destination_changed"
+    assert db.execute("SELECT status FROM weekly_slots").fetchone()[0] == "queued"
+    assert asyncio.run(sender.send_slot(slot_id, chat_id=20)) == "accepted"
+    assert db.execute("SELECT destination_chat_id FROM operations").fetchone()[0] == "20"
+
+
+def test_ack_write_failure_releases_chat_as_unknown_without_automatic_retry():
+    db = seeded_db()
+    prepare_week(db, date(2026, 9, 21))
+    slot_id = db.execute("SELECT slot_id FROM weekly_slots").fetchone()[0]
+    db.execute("CREATE TEMP TRIGGER reject_ack BEFORE INSERT ON send_log BEGIN SELECT RAISE(ABORT,'fixture'); END")
+
+    class Provider:
+        calls = 0
+
+        async def send_message(self, **_kwargs):
+            self.calls += 1
+            return Ack("confirmed")
+
+    provider = Provider()
+    sender = Sender(db, provider)
+    assert asyncio.run(sender.send_slot(slot_id, chat_id=10)) == "unknown"
+    assert asyncio.run(sender.send_slot(slot_id, chat_id=10)) == "unknown"
+    assert provider.calls == 1
+    assert db.execute("SELECT status FROM operations").fetchone()[0] == "unknown"
+    assert db.execute("SELECT 1 FROM operations WHERE status='in_flight'").fetchone() is None
 
 
 def test_cancelling_a_send_marks_the_slot_unknown_before_propagating():
@@ -250,6 +412,48 @@ def test_session_close_failure_after_send_is_marked_unknown(caplog):
     assert db.execute("SELECT status,error_code FROM operations").fetchone()["status"] == "unknown"
     assert "private proxy detail" not in caplog.text
     assert "error_class=OSError" in caplog.text
+
+
+def test_dispatch_rechecks_chat_limit_after_connect(monkeypatch):
+    db = seeded_db()
+    clock = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, zone=None):
+            return clock.astimezone(zone)
+
+    monkeypatch.setattr("maxbot_v2.workers.datetime", FixedClock)
+    monkeypatch.setattr("maxbot_v2.workers.host_addresses", lambda: {"62.109.20.186"})
+    db.execute("INSERT INTO server_ips(id,address,enabled,available) VALUES(1,'62.109.20.186',1,1)")
+    db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(1,1)")
+    db.execute("UPDATE settings SET value='UTC' WHERE key='timezone'")
+    db.execute("UPDATE accounts SET send_weekday=0 WHERE id=1")
+    day = clock.date().isoformat()
+    prepare_week(db, clock.date())
+    slot = db.execute("SELECT s.*,g.chat_id FROM weekly_slots s JOIN groups g ON g.id=s.group_id").fetchone()
+    previous = add_group_slot(db, "+70000000002", "10", day)
+    db.execute("UPDATE weekly_slots SET status='accepted' WHERE slot_id=?", (previous["slot_id"],))
+    prior_timestamp = (clock - timedelta(minutes=1)).isoformat()
+    db.execute(
+        "INSERT INTO operations(operation_id,slot_id,account_id,group_id,destination_chat_id,status,started_at,finished_at) "
+        "VALUES('previous',?,?,2,'10','accepted',?,?)", (previous["slot_id"], previous["account_id"], prior_timestamp, prior_timestamp),
+    )
+
+    class Provider:
+        async def send_message(self, **kwargs):
+            pytest.fail("The new chat limit must be checked before sending")
+
+        async def close(self):
+            pass
+
+    async def provider_factory(_slot):
+        db.execute("INSERT INTO chat_dispatch_policies(chat_id,pause_seconds,daily_limit) VALUES('10',0,1)")
+        return Provider()
+
+    provider = _RetriedConnectionProvider(provider_factory, slot, lambda *_args: _dispatch_block(db, slot))
+    assert asyncio.run(Sender(db, provider).send_slot(slot["slot_id"], chat_id=10, now=clock)) == "paused"
+    assert tuple(db.execute("SELECT status,error_code FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],)).fetchone()) == ("queued", "chat_daily_limit_reached")
 
 
 def test_manual_run_check_does_not_depend_on_autostart_setting(monkeypatch):
