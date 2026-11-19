@@ -62,6 +62,26 @@ def test_week_uses_three_fixed_pairs_with_five_slots_per_day():
         assert prepare_week(db, date(2026, 11, 22)) == 0
 
 
+def test_days_can_be_assigned_before_the_text_pool_is_configured():
+    with closing(connect(":memory:")) as db:
+        initialize(db)
+        db.execute("INSERT INTO groups(id,name,invite_link) VALUES(1,'G','https://max.ru/join/fixture')")
+        db.execute(
+            "INSERT INTO accounts(id,group_id,phone,full_name,status,auth_state) "
+            "VALUES(1,1,'+70000000001','Fixture','active','authenticated')"
+        )
+
+        monday = date(2026, 11, 16)
+        assert prepare_week(db, monday) == 0
+        assert db.execute("SELECT send_day_pair FROM accounts WHERE id=1").fetchone()[0] == 0
+
+        replace_message_pool(db, ["fixture"])
+        assert prepare_week(db, monday) == 10
+        assert [row[0] for row in db.execute(
+            "SELECT DISTINCT scheduled_date FROM weekly_slots ORDER BY scheduled_date"
+        )] == ["2026-11-16", "2026-11-19"]
+
+
 def test_plan_reuses_existing_day_and_keeps_old_sunday_slot_as_history():
     with closing(connect(":memory:")) as db:
         initialize(db)

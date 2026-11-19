@@ -15,10 +15,7 @@ def prepare_week(connection: sqlite3.Connection, today: date) -> int:
     connection.execute("BEGIN IMMEDIATE")
     try:
         version_row = connection.execute("SELECT value FROM settings WHERE key='message_version_id'").fetchone()
-        if version_row is None:
-            connection.commit()
-            return 0
-        version_id = int(version_row["value"])
+        version_id = int(version_row["value"]) if version_row is not None else None
         pool = MessagePool(connection)
         accounts = connection.execute(
             "SELECT a.id,a.group_id FROM accounts a JOIN groups g ON g.id=a.group_id "
@@ -27,6 +24,8 @@ def prepare_week(connection: sqlite3.Connection, today: date) -> int:
         for row in accounts:
             account_id = int(row["id"])
             pair = assign_day_pair(connection, account_id)
+            if version_id is None:
+                continue
             days = [(week_start + timedelta(days=weekday)).isoformat() for weekday in SEND_DAY_PAIRS[pair]]
             connection.execute(
                 "UPDATE weekly_slots SET status='missed',error_code='schedule_replaced',updated_at=CURRENT_TIMESTAMP "
