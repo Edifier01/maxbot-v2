@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -1020,6 +1021,95 @@ def test_proxy_batch_checks_thirty_saved_routes_with_bounded_concurrency(tmp_pat
     assert [row["id"] for row in response.json()] == proxy_ids
     assert {row["check_status"] for row in client.get(endpoint).json()} == {"ok"}
     assert 1 < peak <= 6
+
+
+def test_daily_proxy_checks_run_with_sending_stopped_and_keep_assignments(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    monkeypatch.setattr("maxbot_v2.app.bootstrap_ips", lambda _db: None)
+    monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: {"62.109.20.186", "62.109.20.187", "62.109.20.188"})
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post(
+        "/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
+    ).json()["id"]
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(hours=25)).isoformat()
+    recent = (now - timedelta(hours=23)).isoformat()
+    box = SecretBox()
+    with closing(connect(client.app.state.database)) as db:
+        db.execute("UPDATE groups SET active=0 WHERE id=?", (group_id,))
+        main_ip = db.execute("SELECT id FROM server_ips").fetchone()[0]
+        other_ip = db.execute(
+            "INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.187',1,1)",
+        ).lastrowid
+        disabled_ip = db.execute(
+            "INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.188',0,1)",
+        ).lastrowid
+        account = db.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) "
+            "VALUES(?,'+79990000000','Fixture','active','authenticated')", (group_id,),
+        ).lastrowid
+        db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account, main_ip))
+        routes = (
+            (1, main_ip, 1080, 1, "ok", old),
+            (2, main_ip, 1081, 1, "ok", recent),
+            (3, main_ip, 1082, 0, "unchecked", None),
+            (4, other_ip, 1083, 1, "tls_failed", old),
+            (5, disabled_ip, 1084, 1, "ok", old),
+            (6, main_ip, 1085, 1, "tls_failed", old),
+        )
+        db.executemany(
+            "INSERT INTO send_proxies(id,ip_id,url_ciphertext,url_fingerprint,enabled,check_status,last_checked_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            [
+                (proxy_id, ip_id, box.encrypt(f"socks5://8.8.4.4:{port}"), str(proxy_id), enabled, status, checked)
+                for proxy_id, ip_id, port, enabled, status, checked in routes
+            ],
+        )
+        db.execute("INSERT INTO send_proxy_assignments(account_id,proxy_id) VALUES(?,1)", (account,))
+
+    probes = []
+    finish_slow_check = asyncio.Event()
+
+    async def probe(*, source_ip, url):
+        probes.append((source_ip, url))
+        if url.endswith(":1085"):
+            await finish_slow_check.wait()
+        return "connection_failed" if url.endswith(":1080") else "ok"
+
+    async def wait_for_results(expected):
+        deadline = asyncio.get_running_loop().time() + 2
+        while asyncio.get_running_loop().time() < deadline:
+            with closing(connect(client.app.state.database)) as db:
+                results = db.execute("SELECT enabled,check_status,last_checked_at FROM send_proxies ORDER BY id").fetchall()
+                if all(results[index]["check_status"] == status for index, status in expected.items()):
+                    return results
+            await asyncio.sleep(0.025)
+        return None
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.check_send_proxy", staticmethod(probe))
+    with TestClient(client.app) as running_client:
+        early_results = running_client.portal.call(wait_for_results, {0: "connection_failed"})
+        assert early_results is not None, "A slow proxy must not delay saving another route's failure"
+        assert tuple(early_results[5]) == (1, "tls_failed", old)
+        running_client.portal.call(finish_slow_check.set)
+        results = running_client.portal.call(wait_for_results, {3: "ok", 5: "ok"})
+        assert results is not None, "The background proxy check did not save its results"
+        assert sorted(probes) == [
+            ("62.109.20.186", "socks5://8.8.4.4:1080"),
+            ("62.109.20.186", "socks5://8.8.4.4:1085"),
+            ("62.109.20.187", "socks5://8.8.4.4:1083"),
+        ]
+        assert [tuple(results[index]) for index in (1, 2, 4)] == [
+            (1, "ok", recent), (0, "unchecked", None), (1, "ok", old),
+        ]
+        for index in (0, 3, 5):
+            assert results[index]["enabled"] == 1
+            assert datetime.fromisoformat(results[index]["last_checked_at"]) >= now
+        with closing(connect(client.app.state.database)) as db:
+            assert tuple(db.execute("SELECT ip_id FROM ip_assignments WHERE account_id=?", (account,)).fetchone()) == (main_ip,)
+            assert tuple(db.execute("SELECT proxy_id FROM send_proxy_assignments WHERE account_id=?", (account,)).fetchone()) == (1,)
+            assert db.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 0
+            assert db.execute("SELECT value FROM settings WHERE key='global_stop'").fetchone()[0] == "1"
 
 
 def check_and_enable_fake_proxies(client, endpoint, headers, ids, monkeypatch):

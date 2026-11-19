@@ -44,6 +44,8 @@ diagnostic_handler = logging.StreamHandler(sys.__stderr__ or sys.stderr)
 diagnostic_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
 project_logger.addHandler(diagnostic_handler)
 project_logger.propagate = False
+SEND_PROXY_BATCH_SIZE = 30
+SEND_PROXY_HEALTH_POLL_SECONDS = 300
 
 
 def _log_timestamp_key(value: object) -> datetime:
@@ -90,12 +92,12 @@ class IPAssignmentBody(BaseModel):
 
 
 class ProxyPoolBody(BaseModel):
-    urls: list[str] = Field(min_length=1, max_length=30)
+    urls: list[str] = Field(min_length=1, max_length=SEND_PROXY_BATCH_SIZE)
     enabled: Literal[False] = False
 
 
 class ProxyCheckBody(BaseModel):
-    proxy_ids: list[Annotated[int, Field(gt=0, le=2**63 - 1)]] = Field(min_length=1, max_length=30)
+    proxy_ids: list[Annotated[int, Field(gt=0, le=2**63 - 1)]] = Field(min_length=1, max_length=SEND_PROXY_BATCH_SIZE)
 
 
 class ProxyAssignmentBody(BaseModel):
@@ -172,6 +174,7 @@ def create_app(
     sessions_dir = data / "sessions"
     account_session_locks = AccountSessionLocks()
     send_proxy_check_lock = asyncio.Lock()
+    manual_proxy_check_lock = asyncio.Lock()
     terminal_onboarding_states = ("completed", "failed", "expired", "cancelled")
 
     def session_vault_for(account_id: int) -> EncryptedSessionFile:
@@ -564,9 +567,12 @@ def create_app(
         for attempt_id, account_id in interrupted_attempts:
             delete_unverified_after_terminal_attempt(attempt_id, account_id)
         await worker_manager.start()
+        proxy_health = asyncio.create_task(check_send_proxies_forever(), name="send-proxy-health")
         try:
             yield
         finally:
+            proxy_health.cancel()
+            await asyncio.gather(proxy_health, return_exceptions=True)
             await worker_manager.stop()
             tasks = list(app.state.onboarding_tasks.items())
             with db() as connection:
@@ -987,61 +993,100 @@ def create_app(
             connection.commit()
         return {"added": added, "duplicates": len(urls) - added, "proxy_ids": [ids[fingerprint] for fingerprint in fingerprints]}
 
+    async def check_proxy_routes(ip_id: int, proxy_ids: list[int]) -> list[dict[str, object]]:
+        """Run a batch while the caller holds the shared proxy check lock."""
+        placeholders = ",".join("?" for _ in proxy_ids)
+        with db() as connection:
+            ip = connection.execute("SELECT address,enabled,available FROM server_ips WHERE id=?", (ip_id,)).fetchone()
+            routes = dict(connection.execute(
+                f"SELECT id,url_ciphertext FROM send_proxies WHERE ip_id=? AND id IN ({placeholders})", (ip_id, *proxy_ids),
+            ).fetchall())
+        if ip is None:
+            raise HTTPException(404, "ip_not_found")
+        if len(routes) != len(proxy_ids):
+            raise HTTPException(404, "send_proxy_not_found")
+        source_ip = ip["address"]
+        if not ip["enabled"] or not ip["available"] or not allowed_address(source_ip):
+            raise HTTPException(409, "ip_unavailable")
+        if source_ip not in await asyncio.to_thread(host_addresses):
+            raise HTTPException(409, "ip_unavailable")
+
+        permits = asyncio.Semaphore(6)
+
+        async def probe(proxy_id: int) -> dict[str, object] | None:
+            async with permits:
+                with db() as connection:
+                    current_ip = connection.execute(
+                        "SELECT 1 FROM server_ips WHERE id=? AND address=? AND enabled=1 AND available=1", (ip_id, source_ip),
+                    ).fetchone()
+                if current_ip is None:
+                    return None
+                try:
+                    url = SecretBox().decrypt(routes[proxy_id])
+                except ValueError:
+                    status = "config_invalid"
+                else:
+                    status = await PyMaxAdapter.check_send_proxy(source_ip=source_ip, url=url)
+                result = {"id": proxy_id, "check_status": status, "last_checked_at": datetime.now(timezone.utc).isoformat()}
+                # Dispatch uses this status before sending. Save it as soon as this route finishes.
+                with db() as connection:
+                    updated = connection.execute(
+                        "UPDATE send_proxies SET check_status=:check_status,last_checked_at=:last_checked_at "
+                        "WHERE id=:id AND ip_id=:ip_id AND EXISTS ("
+                        "SELECT 1 FROM server_ips WHERE id=:ip_id AND address=:source_ip AND enabled=1 AND available=1)",
+                        {**result, "ip_id": ip_id, "source_ip": source_ip},
+                    ).rowcount
+                return result if updated else None
+
+        async with asyncio.TaskGroup() as batch:
+            checks = [batch.create_task(probe(proxy_id)) for proxy_id in proxy_ids]
+        results = []
+        for task in checks:
+            result = task.result()
+            if result is None:
+                raise HTTPException(409, "ip_unavailable")
+            results.append(result)
+        return results
+
+    async def check_due_send_proxies() -> None:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        with db() as connection:
+            ip_ids = [row[0] for row in connection.execute(
+                "SELECT id FROM server_ips WHERE enabled=1 AND available=1 ORDER BY id",
+            )]
+        for ip_id in ip_ids:
+            while True:
+                async with send_proxy_check_lock:
+                    # A manual check may have finished while the background task waited.
+                    with db() as connection:
+                        proxy_ids = [row[0] for row in connection.execute(
+                            "SELECT id FROM send_proxies WHERE ip_id=? AND enabled=1 "
+                            "AND (julianday(last_checked_at) IS NULL OR julianday(last_checked_at)<=julianday(?)) "
+                            "ORDER BY id LIMIT ?", (ip_id, cutoff, SEND_PROXY_BATCH_SIZE),
+                        )]
+                    if not proxy_ids:
+                        break
+                    try:
+                        await check_proxy_routes(ip_id, proxy_ids)
+                    except HTTPException as exc:
+                        if exc.detail not in {"ip_not_found", "ip_unavailable"}:
+                            raise
+                        break
+
+    async def check_send_proxies_forever() -> None:
+        while True:
+            try:
+                await check_due_send_proxies()
+            except Exception as exc:
+                logger.warning("send_proxy_daily_check_failed error_class=%s", type(exc).__name__)
+            await asyncio.sleep(SEND_PROXY_HEALTH_POLL_SECONDS)
+
     @app.post("/api/ips/{ip_id}/send-proxies/check")
     async def check_send_proxies(ip_id: int, body: ProxyCheckBody, _session: sqlite3.Row = Depends(require_csrf)) -> list[dict[str, object]]:
-        if send_proxy_check_lock.locked():
+        if manual_proxy_check_lock.locked():
             raise HTTPException(409, "send_proxy_check_in_progress")
-        async with send_proxy_check_lock:
-            proxy_ids = list(dict.fromkeys(body.proxy_ids))
-            placeholders = ",".join("?" for _ in proxy_ids)
-            with db() as connection:
-                ip = connection.execute("SELECT address,enabled,available FROM server_ips WHERE id=?", (ip_id,)).fetchone()
-                routes = dict(connection.execute(
-                    f"SELECT id,url_ciphertext FROM send_proxies WHERE ip_id=? AND id IN ({placeholders})", (ip_id, *proxy_ids),
-                ).fetchall())
-            if ip is None:
-                raise HTTPException(404, "ip_not_found")
-            if len(routes) != len(proxy_ids):
-                raise HTTPException(404, "send_proxy_not_found")
-            source_ip = ip["address"]
-            if not ip["enabled"] or not ip["available"] or not allowed_address(source_ip):
-                raise HTTPException(409, "ip_unavailable")
-            if source_ip not in await asyncio.to_thread(host_addresses):
-                raise HTTPException(409, "ip_unavailable")
-
-            permits = asyncio.Semaphore(6)
-
-            async def probe(proxy_id: int) -> dict[str, object]:
-                async with permits:
-                    with db() as connection:
-                        current_ip = connection.execute(
-                            "SELECT 1 FROM server_ips WHERE id=? AND address=? AND enabled=1 AND available=1", (ip_id, source_ip),
-                        ).fetchone()
-                    if current_ip is None:
-                        return {"id": proxy_id, "check_status": "source_ip_mismatch", "last_checked_at": datetime.now(timezone.utc).isoformat()}
-                    try:
-                        url = SecretBox().decrypt(routes[proxy_id])
-                    except ValueError:
-                        status = "config_invalid"
-                    else:
-                        status = await PyMaxAdapter.check_send_proxy(source_ip=source_ip, url=url)
-                    return {"id": proxy_id, "check_status": status, "last_checked_at": datetime.now(timezone.utc).isoformat()}
-
-            async with asyncio.TaskGroup() as batch:
-                checks = [batch.create_task(probe(proxy_id)) for proxy_id in proxy_ids]
-            results = [task.result() for task in checks]
-            with db() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                if connection.execute(
-                    "SELECT 1 FROM server_ips WHERE id=? AND address=? AND enabled=1 AND available=1", (ip_id, source_ip),
-                ).fetchone() is None:
-                    raise HTTPException(409, "ip_unavailable")
-                connection.executemany(
-                    "UPDATE send_proxies SET check_status=:check_status,last_checked_at=:last_checked_at WHERE id=:id",
-                    results,
-                )
-                connection.commit()
-        return results
+        async with manual_proxy_check_lock, send_proxy_check_lock:
+            return await check_proxy_routes(ip_id, list(dict.fromkeys(body.proxy_ids)))
 
     @app.patch("/api/ips/{ip_id}/send-proxies/{proxy_id}")
     async def set_send_proxy_state(ip_id: int, proxy_id: int, body: IPStateBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:

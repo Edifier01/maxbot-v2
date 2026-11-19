@@ -201,13 +201,27 @@ def test_fixed_schedule_and_separate_signup_names(page: Page, local_app, width):
     expect(page.get_by_text("По 5 сообщений в каждый назначенный день", exact=False)).to_be_visible()
     expect(page.get_by_text("В воскресенье отправок нет", exact=False)).to_be_visible()
     expect(page.get_by_role("button", name="Настройки", exact=True)).to_have_count(0)
+    pending_ip_list = []
+
+    def delay_first_ip_list(route):
+        if pending_ip_list:
+            route.continue_()
+        else:
+            pending_ip_list.append(route)
+
+    page.route("**/api/ips", delay_first_ip_list)
     page.get_by_role("button", name="Группы, номера и IP").click()
     first = page.locator(".group-card").filter(has_text="Первая команда")
     second = page.locator(".group-card").filter(has_text="Вторая команда")
     for card in (first, second):
         expect(card.get_by_text("Правила отправки в чат MAX", exact=True)).to_have_count(0)
         card.get_by_role("button", name="Номера", exact=True).press("Enter")
-    expect(first.get_by_text("Анна Первая", exact=True)).to_have_count(1)
+    try:
+        expect(first.get_by_text("Анна Первая", exact=True)).to_have_count(1)
+        assert pending_ip_list
+    finally:
+        if pending_ip_list:
+            pending_ip_list[0].continue_()
     expect(second).to_contain_text("Борис Второй")
     expect(first).not_to_contain_text("Борис Второй")
     expect(first.get_by_text("Пн и Чт", exact=True)).to_be_visible()
@@ -296,6 +310,7 @@ def test_ip_list_is_compact_and_keyboard_operable(page: Page, local_app, monkeyp
     page.keyboard.press("Enter")
     expect(page.get_by_role("button", name="Обновить IP")).to_be_visible()
     expect(page.locator("#ip-list")).to_be_visible()
+    expect(page.locator("#ip-panel")).not_to_contain_text("62.109.10.109")
     assert page.locator("#ip-list").bounding_box()["height"] <= 420
     assert page.locator("#ip-list").evaluate("element => element.scrollHeight > element.clientHeight")
     assert page_has_no_overflow(page)
