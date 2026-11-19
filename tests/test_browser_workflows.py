@@ -295,7 +295,12 @@ def test_ip_list_is_compact_and_keyboard_operable(page: Page, local_app, monkeyp
 
 
 @pytest.mark.parametrize("width", [390, 768, 1440])
-def test_owner_imports_external_proxies_in_selected_ip_pool(page: Page, local_app, width):
+def test_owner_imports_external_proxies_in_selected_ip_pool(page: Page, local_app, monkeypatch, width):
+    async def probe(*, source_ip, url):
+        assert source_ip == "62.109.20.186"
+        return "auth_failed" if "example-password" in url else "ok"
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.check_send_proxy", staticmethod(probe))
     page.set_viewport_size({"width": width, "height": 900})
     login(page, local_app)
     page.get_by_role("button", name="Группы, номера и IP").click()
@@ -310,10 +315,18 @@ def test_owner_imports_external_proxies_in_selected_ip_pool(page: Page, local_ap
     })
     pool.get_by_role("button", name="Добавить прокси").click()
     expect(pool.get_by_role("button", name="Включить", exact=True)).to_have_count(2)
+    expect(pool.get_by_role("button", name="Включить", exact=True).first).to_be_disabled()
+    expect(pool.get_by_role("button", name="Включить", exact=True).last).to_be_disabled()
     expect(pool).to_contain_text("Номера в порядке импорта: №")
     assert "example-password" not in pool.inner_text()
-    pool.get_by_role("button", name="Включить", exact=True).first.press("Enter")
+    pool.get_by_role("button", name="Проверить импортированные").press("Enter")
+    expect(pool).to_contain_text("SOCKS5 отклонил авторизацию")
+    expect(pool).to_contain_text("TLS до MAX установлен")
+    expect(pool.get_by_role("button", name="Включить", exact=True).first).to_be_disabled()
+    pool.get_by_role("button", name="Включить", exact=True).last.press("Enter")
     expect(pool.get_by_role("button", name="Отключить", exact=True)).to_have_count(1)
+    pool.get_by_role("button", name="Проверить", exact=True).last.press("Enter")
+    expect(pool).to_contain_text("TLS до MAX установлен")
     assert page_has_no_overflow(page)
 
 

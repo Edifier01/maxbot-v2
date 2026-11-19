@@ -6,6 +6,7 @@ import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import version
+from ssl import SSLContext
 from time import perf_counter
 from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
@@ -16,10 +17,75 @@ from .session_vault import EncryptedSessionFile
 
 
 REQUIRED_PYMAX_VERSION = "2.5.0"
+SEND_PROXY_CONNECT_TIMEOUT = 7
+# python-socks 3.2.2 wraps these SOCKS5 authentication replies without a reply code.
+SOCKS5_AUTH_REJECTIONS = frozenset({
+    "No acceptable authentication methods were offered",
+    "Username and password authentication failure",
+})
 
 
 class AdapterUnavailable(RuntimeError):
     pass
+
+
+async def _open_send_proxy_tunnel(
+    *, url: str, source_ip: str, host: str, port: int, ssl_context: SSLContext,
+    before_network_action: Callable[[], None] | None = None,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    from python_socks import ProxyConnectionError, ProxyError, ProxyType
+    from python_socks._protocols.errors import ReplyError
+    from python_socks.async_.asyncio import Proxy
+
+    endpoint = urlsplit(url)
+    proxy_address = endpoint.hostname
+    failure = "connection_failed"
+    try:
+        async with asyncio.timeout(SEND_PROXY_CONNECT_TIMEOUT):
+            if not allowed_proxy_address(proxy_address):
+                addresses = await asyncio.get_running_loop().getaddrinfo(
+                    proxy_address, endpoint.port, family=socket.AF_INET, type=socket.SOCK_STREAM,
+                )
+                proxy_address = next((address[0] for *_, address in addresses if allowed_proxy_address(address[0])), None)
+                if proxy_address is None:
+                    raise AdapterUnavailable("connection_failed")
+            proxy = Proxy(
+                ProxyType.SOCKS5, proxy_address, endpoint.port,
+                unquote(endpoint.username) if endpoint.username else None,
+                unquote(endpoint.password) if endpoint.password else None,
+                rdns=True,
+            )
+            if before_network_action is not None:
+                before_network_action()
+            failure = "tunnel_failed"
+            sock = await proxy.connect(
+                dest_host=host, dest_port=port, timeout=SEND_PROXY_CONNECT_TIMEOUT, local_addr=(source_ip, 0),
+            )
+            try:
+                failure = "source_ip_mismatch"
+                if sock.getsockname()[0] != source_ip:
+                    raise AdapterUnavailable(failure)
+                failure = "tls_failed"
+                reader, writer = await asyncio.open_connection(sock=sock, ssl=ssl_context, server_hostname=host)
+            except BaseException:
+                sock.close()
+                raise
+            actual = writer.get_extra_info("sockname")
+            if actual is None or actual[0] != source_ip:
+                writer.close()
+                raise AdapterUnavailable("source_ip_mismatch")
+            return reader, writer
+    except ProxyConnectionError:
+        raise AdapterUnavailable("connection_failed") from None
+    except ProxyError as exc:
+        reply = exc.args[0] if exc.args else None
+        if exc.error_code is None and isinstance(reply, ReplyError) and str(reply) in SOCKS5_AUTH_REJECTIONS:
+            raise AdapterUnavailable("auth_failed") from None
+        raise AdapterUnavailable("tunnel_failed") from None
+    except TimeoutError:
+        raise AdapterUnavailable("socks_timeout" if failure == "tunnel_failed" else failure) from None
+    except OSError:
+        raise AdapterUnavailable(failure) from None
 
 
 @dataclass(frozen=True)
@@ -44,6 +110,37 @@ class PyMaxAdapter:
 
     def __init__(self, client: Any):
         self.client = client
+
+    @staticmethod
+    async def check_send_proxy(*, source_ip: str, url: str) -> str:
+        """Check only the same SOCKS5 and verified TLS route used for dispatch."""
+        try:
+            url = normalize_proxy_url(url)
+        except ValueError:
+            return "config_invalid"
+        if not allowed_address(source_ip):
+            return "source_ip_mismatch"
+        try:
+            if version("maxapi-python") != REQUIRED_PYMAX_VERSION:
+                return "check_unavailable"
+            from pymax import ExtraConfig
+            from pymax.transport.tcp import TCPTransport
+
+            config = ExtraConfig()
+            transport = TCPTransport(host=config.host, port=config.port, use_ssl=config.use_ssl, proxy=None)
+            _, writer = await _open_send_proxy_tunnel(
+                url=url, source_ip=source_ip, host=config.host, port=config.port, ssl_context=transport._ssl_ctx,
+            )
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=1)
+            except (OSError, TimeoutError):
+                writer.transport.abort()
+            return "ok"
+        except AdapterUnavailable as exc:
+            return str(exc)
+        except Exception:
+            return "check_unavailable"
 
     @staticmethod
     def auth_stage_for_opcode(opcode: int) -> str | None:
@@ -94,8 +191,6 @@ class PyMaxAdapter:
             from pymax.protocol.tcp import TcpProtocol
             from pymax.protocol.tcp.framing import TcpPacketFramer
             from pymax.transport.tcp import TCPTransport
-            from python_socks import ProxyType
-            from python_socks.async_.asyncio import Proxy
         except AdapterUnavailable:
             raise
         except Exception as exc:
@@ -112,49 +207,21 @@ class PyMaxAdapter:
                             self._host, self._port, ssl=self._ssl_ctx if self._use_ssl else None,
                             family=socket.AF_INET, local_addr=(source_ip, 0),
                         )
+                        actual = self._writer.get_extra_info("sockname")
+                        if actual is None or actual[0] != source_ip:
+                            await self.close()
+                            raise AdapterUnavailable("source_ip_mismatch")
                     else:
-                        self._reader, self._writer = await self._open_proxy_tunnel(send_proxy_url)
-                    actual = self._writer.get_extra_info("sockname")
-                    if actual is None or actual[0] != source_ip:
-                        await self.close()
-                        raise AdapterUnavailable("source_ip_mismatch")
+                        self._reader, self._writer = await _open_send_proxy_tunnel(
+                            url=send_proxy_url, source_ip=source_ip, host=self._host, port=self._port,
+                            ssl_context=self._ssl_ctx, before_network_action=before_network_action,
+                        )
                 except BaseException as exc:
                     if diagnostic_callback is not None and not isinstance(exc, asyncio.CancelledError):
                         diagnostic_callback("connect", "failed", int((perf_counter() - started) * 1000), False, type(exc).__name__)
                     raise
                 if diagnostic_callback is not None:
                     diagnostic_callback("connect", "connected", int((perf_counter() - started) * 1000), False, None)
-
-            async def _open_proxy_tunnel(self, url: str):
-                endpoint = urlsplit(url)
-                proxy_address = endpoint.hostname
-                if not allowed_proxy_address(proxy_address):
-                    loop = asyncio.get_running_loop()
-                    addresses = await asyncio.wait_for(loop.getaddrinfo(
-                        proxy_address, endpoint.port, family=socket.AF_INET, type=socket.SOCK_STREAM,
-                    ), timeout=10)
-                    proxy_address = next((sockaddr[0] for *_, sockaddr in addresses if allowed_proxy_address(sockaddr[0])), None)
-                    if proxy_address is None:
-                        raise AdapterUnavailable("invalid_send_proxy_address")
-                proxy = Proxy(
-                    ProxyType.SOCKS5, proxy_address, endpoint.port,
-                    unquote(endpoint.username) if endpoint.username else None,
-                    unquote(endpoint.password) if endpoint.password else None,
-                    rdns=True,
-                )
-                if before_network_action is not None:
-                    before_network_action()
-                sock = await proxy.connect(dest_host=self._host, dest_port=self._port, timeout=10, local_addr=(source_ip, 0))
-                try:
-                    if sock.getsockname()[0] != source_ip:
-                        raise AdapterUnavailable("source_ip_mismatch")
-                    return await asyncio.open_connection(
-                        sock=sock, ssl=self._ssl_ctx if self._use_ssl else None,
-                        server_hostname=self._host if self._use_ssl else None,
-                    )
-                except BaseException:
-                    sock.close()
-                    raise
 
             async def send(self, data):
                 if before_network_action is not None:

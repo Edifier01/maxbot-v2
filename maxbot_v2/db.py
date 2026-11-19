@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS send_proxies (
     url_ciphertext TEXT NOT NULL,
     url_fingerprint TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    check_status TEXT NOT NULL DEFAULT 'unchecked',
+    last_checked_at TEXT,
     UNIQUE(ip_id, url_fingerprint)
 );
 CREATE TABLE IF NOT EXISTS send_proxy_assignments (
@@ -256,6 +258,11 @@ def initialize(connection: sqlite3.Connection) -> None:
     ip_columns = {row[1] for row in connection.execute("PRAGMA table_info(server_ips)")}
     if "last_assigned_at" not in ip_columns:
         connection.execute("ALTER TABLE server_ips ADD COLUMN last_assigned_at TEXT")
+    send_proxy_columns = {row[1] for row in connection.execute("PRAGMA table_info(send_proxies)")}
+    if "check_status" not in send_proxy_columns:
+        connection.execute("ALTER TABLE send_proxies ADD COLUMN check_status TEXT NOT NULL DEFAULT 'unchecked'")
+    if "last_checked_at" not in send_proxy_columns:
+        connection.execute("ALTER TABLE send_proxies ADD COLUMN last_checked_at TEXT")
     operation_columns = {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
     if "destination_chat_id" not in operation_columns:
         connection.execute("ALTER TABLE operations ADD COLUMN destination_chat_id TEXT")
