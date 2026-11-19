@@ -282,6 +282,71 @@ def test_chat_daily_limit_charges_unknown_at_local_day_boundary():
     assert fast.calls == 1
 
 
+def test_same_chat_panel_groups_take_turns_across_weeks_with_a_daily_limit():
+    db = seeded_db()
+    first_day = date(2026, 9, 21)
+    db.execute("UPDATE accounts SET send_weekday=0 WHERE id=1")
+    prepare_week(db, first_day)
+    other = add_group_slot(db, "+70000000002", "10")
+    db.execute("INSERT INTO chat_dispatch_policies(chat_id,pause_seconds,daily_limit) VALUES('10',0,1)")
+
+    class AcceptingProvider:
+        async def send_message(self, **_kwargs):
+            return Ack("confirmed")
+
+    sender = Sender(db, AcceptingProvider())
+    first_time = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
+    assert asyncio.run(sender.send_slot("slot-2026-09-21-1", chat_id=10, now=first_time)) == "accepted"
+    assert asyncio.run(sender.send_slot(other["slot_id"], chat_id=10, now=first_time)) == "chat_waiting"
+
+    db.execute("UPDATE accounts SET send_weekday=0 WHERE id=?", (other["account_id"],))
+    prepare_week(db, first_day + timedelta(days=7))
+    next_time = first_time + timedelta(days=7)
+    assert asyncio.run(sender.send_slot("slot-2026-09-28-1", chat_id=10, now=next_time)) == "chat_waiting"
+    assert asyncio.run(sender.send_slot(f"slot-2026-09-28-{other['account_id']}", chat_id=10, now=next_time)) == "accepted"
+    assert [row[0] for row in db.execute("SELECT group_id FROM operations WHERE status='accepted' ORDER BY id")] == [1, 2]
+
+
+def test_stale_worker_chat_does_not_block_a_slot_after_destination_verification():
+    db = seeded_db()
+    prepare_week(db, date(2026, 9, 21))
+    slot_id = db.execute("SELECT slot_id FROM weekly_slots").fetchone()[0]
+    db.execute("UPDATE groups SET chat_id='20' WHERE id=1")
+
+    class Provider:
+        async def send_message(self, *, chat_id, **_kwargs):
+            assert chat_id == 20
+            return Ack("correct-destination")
+
+    sender = Sender(db, Provider())
+    assert asyncio.run(sender.send_slot(slot_id, chat_id=10)) == "destination_changed"
+    assert db.execute("SELECT status FROM weekly_slots").fetchone()[0] == "queued"
+    assert asyncio.run(sender.send_slot(slot_id, chat_id=20)) == "accepted"
+    assert db.execute("SELECT destination_chat_id FROM operations").fetchone()[0] == "20"
+
+
+def test_ack_write_failure_releases_chat_as_unknown_without_automatic_retry():
+    db = seeded_db()
+    prepare_week(db, date(2026, 9, 21))
+    slot_id = db.execute("SELECT slot_id FROM weekly_slots").fetchone()[0]
+    db.execute("CREATE TEMP TRIGGER reject_ack BEFORE INSERT ON send_log BEGIN SELECT RAISE(ABORT,'fixture'); END")
+
+    class Provider:
+        calls = 0
+
+        async def send_message(self, **_kwargs):
+            self.calls += 1
+            return Ack("confirmed")
+
+    provider = Provider()
+    sender = Sender(db, provider)
+    assert asyncio.run(sender.send_slot(slot_id, chat_id=10)) == "unknown"
+    assert asyncio.run(sender.send_slot(slot_id, chat_id=10)) == "unknown"
+    assert provider.calls == 1
+    assert db.execute("SELECT status FROM operations").fetchone()[0] == "unknown"
+    assert db.execute("SELECT 1 FROM operations WHERE status='in_flight'").fetchone() is None
+
+
 def test_cancelling_a_send_marks_the_slot_unknown_before_propagating():
     db = seeded_db()
     db.execute("UPDATE accounts SET send_weekday=0 WHERE id=1")

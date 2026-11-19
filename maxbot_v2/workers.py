@@ -159,7 +159,7 @@ class GroupWorkerManager:
                         ),
                     )
                     result = await Sender(db, provider, sleep=self.sleep).send_slot(slot["slot_id"], chat_id=int(slot["chat_id"]))
-                    if result == "chat_waiting":
+                    if result in {"chat_waiting", "destination_changed"}:
                         break
                     delay_min = max(5, int(setting.get("delay_min_sec", 5)))
                     delay_max = max(delay_min, int(setting.get("delay_max_sec", 15)))

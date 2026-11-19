@@ -14,13 +14,16 @@ def chat_dispatch_policy(connection: sqlite3.Connection, chat_id: str) -> tuple[
     return (row[0], row[1]) if row else (DEFAULT_CHAT_PAUSE_SECONDS, 0)
 
 
-def earlier_queued_slot(connection: sqlite3.Connection, slot: sqlite3.Row, chat_id: str) -> bool:
-    return connection.execute(
-        "SELECT 1 FROM weekly_slots s JOIN groups g ON g.id=s.group_id JOIN accounts a ON a.id=s.account_id "
-        "WHERE g.active=1 AND g.chat_id=? AND s.scheduled_date=? AND s.status='queued' AND s.id<? "
-        "AND a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' LIMIT 1",
-        (chat_id, slot["scheduled_date"], slot["id"]),
-    ).fetchone() is not None
+def other_slot_has_priority(connection: sqlite3.Connection, slot: sqlite3.Row, chat_id: str) -> bool:
+    first = connection.execute(
+        "SELECT MIN(s.id) FROM weekly_slots s JOIN groups g ON g.id=s.group_id JOIN accounts a ON a.id=s.account_id "
+        "WHERE g.active=1 AND g.chat_id=? AND s.scheduled_date=? AND s.status='queued' "
+        "AND a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' GROUP BY s.group_id "
+        "ORDER BY COALESCE((SELECT MAX(o.id) FROM operations o WHERE o.destination_chat_id=? "
+        "AND o.group_id=s.group_id AND o.status IN ('accepted','unknown')),0), MIN(s.id) LIMIT 1",
+        (chat_id, slot["scheduled_date"], chat_id),
+    ).fetchone()
+    return first is not None and first[0] != slot["id"]
 
 
 def chat_dispatch_wait(
@@ -50,7 +53,7 @@ def chat_dispatch_wait(
         cutoff = (now.astimezone(timezone.utc) - timedelta(seconds=pause_seconds)).isoformat()
         if connection.execute(
             "SELECT 1 FROM operations WHERE destination_chat_id=? AND status IN ('accepted','unknown') "
-            "AND finished_at>? LIMIT 1", (chat_id, cutoff),
+            "AND dispatch_finished_at>? LIMIT 1", (chat_id, cutoff),
         ).fetchone():
             return "chat_pause"
     return None

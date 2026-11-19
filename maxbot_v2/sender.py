@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
-from .chat_queue import chat_dispatch_wait, earlier_queued_slot
+from .chat_queue import chat_dispatch_wait, other_slot_has_priority
 
 
 class Provider(Protocol):
@@ -59,10 +59,13 @@ class Sender:
             self.db.execute("UPDATE weekly_slots SET status='blocked',error_code='account_not_active',updated_at=? WHERE slot_id=?", (stamp, slot_id))
             self.db.commit()
             return "blocked"
-        if not group["chat_id"] or str(group["chat_id"]) != str(chat_id):
+        if not group["chat_id"]:
             self.db.execute("UPDATE weekly_slots SET status='blocked',error_code='destination_unverified',updated_at=? WHERE slot_id=?", (stamp, slot_id))
             self.db.commit()
             return "blocked"
+        if str(group["chat_id"]) != str(chat_id):
+            self.db.rollback()
+            return "destination_changed"
         if self.db.execute(
             "SELECT 1 FROM send_log prior JOIN accounts prior_account ON prior_account.id=prior.account_id "
             "JOIN weekly_slots prior_slot ON prior_slot.slot_id=prior.slot_id "
@@ -74,7 +77,7 @@ class Sender:
             self.db.commit()
             return "blocked"
         wait_reason = chat_dispatch_wait(self.db, str(chat_id), clock)
-        if wait_reason is None and earlier_queued_slot(self.db, slot, str(chat_id)):
+        if wait_reason is None and other_slot_has_priority(self.db, slot, str(chat_id)):
             wait_reason = "chat_queue_turn"
         if wait_reason is not None:
             self.db.execute(
@@ -103,8 +106,8 @@ class Sender:
                     accepted_at = datetime.now(timezone.utc).isoformat()
                     self.db.execute("BEGIN IMMEDIATE")
                     self.db.execute(
-                        "UPDATE operations SET status='accepted',finished_at=?,provider_message_id=? WHERE operation_id=?",
-                        (accepted_at, message_id, operation_id),
+                        "UPDATE operations SET status='accepted',finished_at=?,dispatch_finished_at=?,provider_message_id=? WHERE operation_id=?",
+                        (accepted_at, accepted_at, message_id, operation_id),
                     )
                     self.db.execute("UPDATE weekly_slots SET status='accepted',error_code=NULL,updated_at=? WHERE slot_id=?", (accepted_at, slot_id))
                     self.db.execute(
@@ -136,6 +139,7 @@ class Sender:
                     return "failed"
                 except Exception as exc:
                     # Once the request may have reached MAX, never repeat it automatically.
+                    self.db.rollback()
                     _mark_unknown(self.db, operation_id, slot_id, _safe_code(exc))
                     return "unknown"
         except asyncio.CancelledError:
@@ -151,7 +155,10 @@ class Sender:
 def recover_in_flight(connection: sqlite3.Connection) -> int:
     stamp = datetime.now(timezone.utc).isoformat()
     connection.execute("BEGIN IMMEDIATE")
-    connection.execute("UPDATE operations SET status='unknown',finished_at=?,error_code='process_interrupted' WHERE status='in_flight'", (stamp,))
+    connection.execute(
+        "UPDATE operations SET status='unknown',finished_at=?,dispatch_finished_at=?,error_code='process_interrupted' WHERE status='in_flight'",
+        (stamp, stamp),
+    )
     cursor = connection.execute("UPDATE weekly_slots SET status='unknown',error_code='process_interrupted',updated_at=? WHERE status='in_flight'", (stamp,))
     connection.commit()
     return cursor.rowcount
@@ -172,8 +179,8 @@ def _mark_unknown(connection: sqlite3.Connection, operation_id: str, slot_id: st
     finished = datetime.now(timezone.utc).isoformat()
     connection.execute("BEGIN IMMEDIATE")
     connection.execute(
-        "UPDATE operations SET status='unknown',finished_at=?,error_code=? WHERE operation_id=? AND status='in_flight'",
-        (finished, code, operation_id),
+        "UPDATE operations SET status='unknown',finished_at=?,dispatch_finished_at=?,error_code=? WHERE operation_id=? AND status='in_flight'",
+        (finished, finished, code, operation_id),
     )
     connection.execute(
         "UPDATE weekly_slots SET status='unknown',error_code=?,updated_at=? WHERE slot_id=? AND status='in_flight'",

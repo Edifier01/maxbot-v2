@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import bcrypt
@@ -86,6 +87,48 @@ def test_two_signup_groups_share_dispatch_policy_but_keep_links_and_names(tmp_pa
     groups = {row["id"]: row for row in client.get("/api/groups").json()}
     assert [(groups[group_id]["chat_pause_seconds"], groups[group_id]["chat_daily_limit"]) for group_id in group_ids] == [(45, 3), (45, 3), (15, 0)]
     assert [client.get(f"/api/groups/{group_id}/accounts").json()[0]["full_name"] for group_id in group_ids[:2]] == ["Анна Фамилия", "Борис Фамилия"]
+
+
+def test_confirming_an_old_unknown_operation_does_not_restart_chat_pause(tmp_path, monkeypatch):
+    from maxbot_v2.chat_queue import chat_dispatch_wait
+    from maxbot_v2.sender import Sender
+
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Группа", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    policy = {"chat_id": "100", "pause_seconds": 86400, "daily_limit": 0}
+    clock = datetime.now(timezone.utc)
+    older = clock - timedelta(days=2)
+
+    class OldClock(datetime):
+        @classmethod
+        def now(cls, zone=None):
+            return older.astimezone(zone)
+
+    class UncertainProvider:
+        async def send_message(self, **_kwargs):
+            raise TimeoutError
+
+    db = connect(client.app.state.database)
+    try:
+        db.execute("UPDATE groups SET chat_id='100' WHERE id=?", (group_id,))
+        assert client.put(f"/api/groups/{group_id}/chat-dispatch-policy", headers=headers, json=policy).status_code == 200
+        account_id = db.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,'+70000000001','Fixture','active','authenticated')",
+            (group_id,),
+        ).lastrowid
+        version = replace_message_pool(db, ["fixture"])
+        day = older.date().isoformat()
+        slot = create_weekly_slot(db, account_id=account_id, week_start=day, scheduled_date=day, text="fixture", message_version_id=version)
+        with monkeypatch.context() as frozen:
+            frozen.setattr("maxbot_v2.sender.datetime", OldClock)
+            assert asyncio.run(Sender(db, UncertainProvider()).send_slot(slot["slot_id"], chat_id=100)) == "unknown"
+        op = db.execute("SELECT operation_id FROM operations").fetchone()[0]
+        response = client.post(f"/api/operations/{op}/resolve", headers=headers, json={"outcome": "accepted", "provider_message_id": "confirmed"})
+        assert response.status_code == 200
+        assert chat_dispatch_wait(db, "100", clock) is None
+    finally:
+        db.close()
 
 
 def test_reopening_onboarding_link_returns_the_existing_group_link(tmp_path, monkeypatch):

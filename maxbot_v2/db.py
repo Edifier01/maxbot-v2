@@ -168,6 +168,7 @@ CREATE TABLE IF NOT EXISTS operations (
     status TEXT NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT,
+    dispatch_finished_at TEXT,
     provider_message_id TEXT,
     error_code TEXT
 );
@@ -258,6 +259,8 @@ def initialize(connection: sqlite3.Connection) -> None:
     operation_columns = {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
     if "destination_chat_id" not in operation_columns:
         connection.execute("ALTER TABLE operations ADD COLUMN destination_chat_id TEXT")
+    if "dispatch_finished_at" not in operation_columns:
+        connection.execute("ALTER TABLE operations ADD COLUMN dispatch_finished_at TEXT")
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_in_flight ON operations(destination_chat_id) "
         "WHERE destination_chat_id IS NOT NULL AND status='in_flight'"
@@ -266,7 +269,11 @@ def initialize(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_chat_daily_operations ON operations(destination_chat_id,status,started_at)"
     )
     connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_chat_pause_operations ON operations(destination_chat_id,status,finished_at)"
+        "CREATE INDEX IF NOT EXISTS idx_chat_dispatch_finishes ON operations(destination_chat_id,status,dispatch_finished_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_group_turn ON operations(destination_chat_id,group_id,id) "
+        "WHERE status IN ('accepted','unknown')"
     )
     connection.execute(
         "UPDATE onboarding_sessions SET phone=NULL,full_name=NULL WHERE state IN "
