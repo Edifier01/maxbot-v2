@@ -3,7 +3,7 @@ from datetime import date
 import pytest
 
 from maxbot_v2.db import connect, initialize
-from maxbot_v2.scheduling import assign_weekday, monday_of
+from maxbot_v2.scheduling import assign_day_pair, monday_of
 from maxbot_v2.message_pool import MessagePool
 
 
@@ -15,25 +15,25 @@ def db(tmp_path):
     connection.close()
 
 
-def test_weekday_assignment_balances_and_is_stable(db):
+def test_day_pair_assignment_balances_and_is_stable(db):
     db.execute("INSERT INTO groups(id, name, invite_link) VALUES (1, 'G', 'https://max.ru/join/a')")
     db.executemany(
         "INSERT INTO accounts(id, group_id, phone, full_name) VALUES (?, 1, ?, 'Name')",
         [(i, f"+700000000{i:02d}") for i in range(1, 9)],
     )
-    assert [assign_weekday(db, i) for i in range(1, 9)] == [0, 1, 2, 3, 4, 5, 6, 0]
-    assert assign_weekday(db, 1) == 0
+    assert [assign_day_pair(db, i) for i in range(1, 9)] == [0, 1, 2, 0, 1, 2, 0, 1]
+    assert assign_day_pair(db, 1) == 0
 
 
-def test_deleted_account_does_not_skew_new_weekday_assignment(db):
+def test_deleted_account_does_not_skew_new_day_pair_assignment(db):
     db.execute("INSERT INTO groups(id, name, invite_link) VALUES (1, 'G', 'https://max.ru/join/a')")
     db.execute(
-        "INSERT INTO accounts(id,group_id,phone,full_name,send_weekday,lifecycle) "
+        "INSERT INTO accounts(id,group_id,phone,full_name,send_day_pair,lifecycle) "
         "VALUES (1,1,'deleted:1','',0,'deleted')"
     )
     db.execute("INSERT INTO accounts(id,group_id,phone,full_name) VALUES (2,1,'+70000000002','Name')")
 
-    assert assign_weekday(db, 2) == 0
+    assert assign_day_pair(db, 2) == 0
 
 
 def test_week_is_monday_based():

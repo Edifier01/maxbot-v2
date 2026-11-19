@@ -13,7 +13,7 @@ from maxbot_v2.app import create_app
 from maxbot_v2.crypto import SecretBox
 from maxbot_v2.db import connect
 from maxbot_v2.message_pool import replace_message_pool
-from maxbot_v2.scheduling import create_weekly_slot
+from maxbot_v2.scheduling import SCHEDULE_TZ, create_weekly_slot, monday_of
 from maxbot_v2.security import digest_token
 
 
@@ -58,7 +58,7 @@ def test_group_invite_and_message_pool_are_owner_scoped(tmp_path, monkeypatch):
     assert client.put("/api/messages", headers=headers, json={"texts": ["same", "same"]}).status_code == 422
 
 
-def test_two_signup_groups_share_dispatch_policy_but_keep_links_and_names(tmp_path, monkeypatch):
+def test_two_signup_groups_keep_separate_links_and_names_without_dispatch_settings(tmp_path, monkeypatch):
     from maxbot_v2.onboarding import attach_group_on_first_account
 
     client, csrf = owner_client(tmp_path, monkeypatch)
@@ -80,53 +80,97 @@ def test_two_signup_groups_share_dispatch_policy_but_keep_links_and_names(tmp_pa
         connection.close()
 
     endpoint = f"/api/groups/{group_ids[0]}/chat-dispatch-policy"
-    policy = {"chat_id": "100", "pause_seconds": 45, "daily_limit": 3}
-    assert client.put(endpoint, json=policy).status_code == 403
-    assert client.put(endpoint, headers=headers, json={**policy, "chat_id": "200"}).status_code == 409
-    assert client.put(endpoint, headers=headers, json=policy).json() == policy
+    assert client.put(endpoint, headers=headers, json={"chat_id": "100", "pause_seconds": 45, "daily_limit": 3}).status_code == 404
     groups = {row["id"]: row for row in client.get("/api/groups").json()}
-    assert [(groups[group_id]["chat_pause_seconds"], groups[group_id]["chat_daily_limit"]) for group_id in group_ids] == [(45, 3), (45, 3), (15, 0)]
+    assert [groups[group_id]["chat_id"] for group_id in group_ids] == ["100", "100", "200"]
+    assert all({"chat_pause_seconds", "chat_daily_limit"}.isdisjoint(group) for group in groups.values())
     assert [client.get(f"/api/groups/{group_id}/accounts").json()[0]["full_name"] for group_id in group_ids[:2]] == ["Анна Фамилия", "Борис Фамилия"]
 
 
-def test_confirming_an_old_unknown_operation_does_not_restart_chat_pause(tmp_path, monkeypatch):
-    from maxbot_v2.chat_queue import chat_dispatch_wait
-    from maxbot_v2.sender import Sender
+def test_account_list_shows_both_days_of_moscow_week_without_duplicate_accounts(tmp_path, monkeypatch):
+    clock = datetime(2026, 9, 20, 22, tzinfo=timezone.utc)
 
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, zone=None):
+            return clock.astimezone(zone)
+
+    monkeypatch.setattr("maxbot_v2.app.datetime", FixedClock)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
+    endpoint = f"/api/groups/{group_id}/accounts"
+    db = connect(client.app.state.database)
+    try:
+        account_id = db.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,'+79990000000','Иван','active','authenticated')",
+            (group_id,),
+        ).lastrowid
+        unassigned = client.get(endpoint).json()[0]
+        assert unassigned["send_day_pair"] is None
+        assert unassigned["send_days"] == []
+        db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('timezone','UTC')")
+        db.execute("UPDATE accounts SET send_day_pair=0 WHERE id=?", (account_id,))
+        version = replace_message_pool(db, ["fixture"])
+        db.executemany(
+            "INSERT INTO weekly_slots(slot_id,account_id,group_id,week_start,scheduled_date,day_position,message_version_id,text,status,error_code,updated_at) "
+            "VALUES(?,?,?,'2026-09-21',?,?,?,'fixture',?,?,CURRENT_TIMESTAMP)",
+            [("monday-2", account_id, group_id, "2026-09-21", 2, version, "unknown", "uncertain_delivery"),
+             ("monday-1", account_id, group_id, "2026-09-21", 1, version, "accepted", None),
+             ("thursday-1", account_id, group_id, "2026-09-24", 1, version, "queued", None),
+             ("legacy-sunday-1", account_id, group_id, "2026-09-27", 1, version, "accepted", None)],
+        )
+    finally:
+        db.close()
+
+    result = client.get(endpoint).json()
+    assert len(result) == 1
+    account = result[0]
+    assert account["id"] == account_id
+    assert account["send_day_pair"] == 0
+    assert account["send_days"] == [
+        {"scheduled_date": "2026-09-21", "slots": [
+            {"day_position": 1, "status": "accepted", "error_code": None},
+            {"day_position": 2, "status": "unknown", "error_code": "uncertain_delivery"},
+        ]},
+        {"scheduled_date": "2026-09-24", "slots": [
+            {"day_position": 1, "status": "queued", "error_code": None},
+        ]},
+    ]
+    assert {"phone", "phone_fingerprint", "send_weekday", "slot_status"}.isdisjoint(account)
+
+
+def test_confirming_an_old_unknown_operation_preserves_the_dispatch_record(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Группа", "invite_link": "https://max.ru/join/test"}).json()["id"]
-    policy = {"chat_id": "100", "pause_seconds": 86400, "daily_limit": 0}
     clock = datetime.now(timezone.utc)
     older = clock - timedelta(days=2)
-
-    class OldClock(datetime):
-        @classmethod
-        def now(cls, zone=None):
-            return older.astimezone(zone)
-
-    class UncertainProvider:
-        async def send_message(self, **_kwargs):
-            raise TimeoutError
 
     db = connect(client.app.state.database)
     try:
         db.execute("UPDATE groups SET chat_id='100' WHERE id=?", (group_id,))
-        assert client.put(f"/api/groups/{group_id}/chat-dispatch-policy", headers=headers, json=policy).status_code == 200
         account_id = db.execute(
             "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,'+70000000001','Fixture','active','authenticated')",
             (group_id,),
         ).lastrowid
         version = replace_message_pool(db, ["fixture"])
-        day = older.date().isoformat()
-        slot = create_weekly_slot(db, account_id=account_id, week_start=day, scheduled_date=day, text="fixture", message_version_id=version)
-        with monkeypatch.context() as frozen:
-            frozen.setattr("maxbot_v2.sender.datetime", OldClock)
-            assert asyncio.run(Sender(db, UncertainProvider()).send_slot(slot["slot_id"], chat_id=100)) == "unknown"
-        op = db.execute("SELECT operation_id FROM operations").fetchone()[0]
-        response = client.post(f"/api/operations/{op}/resolve", headers=headers, json={"outcome": "accepted", "provider_message_id": "confirmed"})
+        day = older.astimezone(SCHEDULE_TZ).date()
+        slot = create_weekly_slot(db, account_id=account_id, week_start=monday_of(day).isoformat(),
+                                  scheduled_date=day.isoformat(), text="fixture", message_version_id=version)
+        db.execute("UPDATE weekly_slots SET status='unknown' WHERE slot_id=?", (slot["slot_id"],))
+        db.execute(
+            "INSERT INTO operations(operation_id,slot_id,account_id,group_id,destination_chat_id,status,started_at,dispatch_finished_at) "
+            "VALUES('legacy-unknown',?,?,?,'100','unknown',?,?)",
+            (slot["slot_id"], account_id, group_id, older.isoformat(), older.isoformat()),
+        )
+        response = client.post("/api/operations/legacy-unknown/resolve", headers=headers,
+                               json={"outcome": "accepted", "provider_message_id": "confirmed"})
         assert response.status_code == 200
-        assert chat_dispatch_wait(db, "100", clock) is None
+        operation = db.execute("SELECT * FROM operations WHERE operation_id='legacy-unknown'").fetchone()
+        assert (operation["status"], operation["destination_chat_id"]) == ("accepted", "100")
+        assert operation["started_at"] == operation["dispatch_finished_at"] == older.isoformat()
+        assert datetime.fromisoformat(operation["finished_at"]) >= clock
     finally:
         db.close()
 
@@ -1012,14 +1056,14 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
     db = connect(client.app.state.database)
     try:
         db.execute("UPDATE groups SET chat_id='10' WHERE id=?", (group_id,))
-        db.execute("UPDATE settings SET value='UTC' WHERE key='timezone'")
+        db.execute("UPDATE settings SET value='0' WHERE key='global_stop'")
         account_id = db.execute(
-            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,'+79990000000','Fixture','active','authenticated')",
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,send_day_pair) VALUES(?,'+79990000000','Fixture','active','authenticated',0)",
             (group_id,),
         ).lastrowid
         db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
         second_account = db.execute(
-            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,'+79990000001','Fixture 2','active','authenticated')",
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,send_day_pair) VALUES(?,'+79990000001','Fixture 2','active','authenticated',0)",
             (group_id,),
         ).lastrowid
         db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (second_account, ip_id))
@@ -1071,18 +1115,19 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
         await second_connected.close()
         assert routes[1]["send_proxy_url"] == alternate
 
-        def closed_window_during_ip_check():
+        def manual_stop_during_ip_check():
             db = connect(client.app.state.database)
             try:
-                db.execute("UPDATE settings SET value='16:00-21:00' WHERE key='send_windows_weekday'")
+                db.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
             finally:
                 db.close()
             return {"62.109.20.186"}
 
         with monkeypatch.context() as race:
-            race.setattr("maxbot_v2.app.host_addresses", closed_window_during_ip_check)
-            with pytest.raises(DispatchPaused, match="outside_send_window"):
+            race.setattr("maxbot_v2.app.host_addresses", manual_stop_during_ip_check)
+            with pytest.raises(DispatchPaused, match="run_stopped"):
                 routes[0]["before_network_action"]()
+        assert client.post("/api/run/start", headers=headers, json={}).status_code == 200
 
         def failed_probe_during_ip_check():
             db = connect(client.app.state.database)
@@ -1613,13 +1658,12 @@ def test_destination_verification_button_requires_an_assigned_enabled_ip(tmp_pat
     assert client.get("/api/groups").json()[0]["verifiable_account_count"] == 0
 
 
-def test_manual_run_control_is_independent_from_restart_autostart(tmp_path, monkeypatch):
+def test_manual_run_control_without_schedule_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("BUILD_REVISION", "test-revision")
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
-    settings = client.get("/api/settings").json()
-    settings["auto_run"] = False
-    assert client.put("/api/settings", headers=headers, json=settings).status_code == 200
+    assert client.get("/api/settings").status_code == 404
+    assert client.put("/api/settings", headers=headers, json={"auto_run": True}).status_code == 404
 
     assert client.post("/api/run/stop", headers=headers, json={}).json()["stopped"] is True
     started = client.post("/api/run/start", headers=headers, json={})
@@ -1627,24 +1671,23 @@ def test_manual_run_control_is_independent_from_restart_autostart(tmp_path, monk
     assert started.json()["stopped"] is False
     overview = client.get("/api/overview").json()
     assert overview["stopped"] is False
-    assert overview["auto_run"] is False
+    assert "auto_run" not in overview
     assert overview["run_wait_reason"]
     assert client.get("/health").json() == {"status": "ok", "revision": "test-revision"}
 
 
-def test_autostart_off_starts_stopped_but_manual_start_works(tmp_path, monkeypatch):
+def test_every_restart_starts_stopped_even_with_legacy_autostart_on(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     connection = connect(client.app.state.database)
     try:
-        connection.execute("UPDATE settings SET value='0' WHERE key='auto_run'")
+        connection.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('auto_run','1')")
         connection.execute("UPDATE settings SET value='0' WHERE key='global_stop'")
     finally:
         connection.close()
 
     with client:
         overview = client.get("/api/overview").json()
-        assert overview["auto_run"] is False
         assert overview["stopped"] is True
         assert client.post("/api/run/start", headers=headers, json={}).json()["stopped"] is False
         assert client.get("/api/overview").json()["stopped"] is False

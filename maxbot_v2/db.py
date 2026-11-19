@@ -4,7 +4,25 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA = """
+WEEKLY_SLOT_DEFINITION = """(
+    id INTEGER PRIMARY KEY,
+    slot_id TEXT NOT NULL UNIQUE,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    week_start TEXT NOT NULL,
+    scheduled_date TEXT NOT NULL,
+    day_position INTEGER NOT NULL DEFAULT 1 CHECK(day_position BETWEEN 1 AND 5),
+    message_version_id INTEGER NOT NULL REFERENCES message_versions(id),
+    text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(account_id, week_start, scheduled_date, day_position)
+)"""
+
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -39,6 +57,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     ever_authenticated INTEGER NOT NULL DEFAULT 0,
     phone_fingerprint TEXT,
     send_weekday INTEGER CHECK(send_weekday BETWEEN 0 AND 6),
+    send_day_pair INTEGER CHECK(send_day_pair BETWEEN 0 AND 2),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS proxy_assignments (
@@ -134,22 +153,7 @@ CREATE TABLE IF NOT EXISTS message_bag (
     UNIQUE(version_id, position),
     UNIQUE(version_id, message_id)
 );
-CREATE TABLE IF NOT EXISTS weekly_slots (
-    id INTEGER PRIMARY KEY,
-    slot_id TEXT NOT NULL UNIQUE,
-    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-    week_start TEXT NOT NULL,
-    scheduled_date TEXT NOT NULL,
-    message_version_id INTEGER NOT NULL REFERENCES message_versions(id),
-    text TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued',
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    error_code TEXT,
-    updated_at TEXT NOT NULL,
-    UNIQUE(account_id, week_start)
-);
-CREATE INDEX IF NOT EXISTS idx_weekly_due ON weekly_slots(group_id, scheduled_date, status);
+CREATE TABLE IF NOT EXISTS weekly_slots {WEEKLY_SLOT_DEFINITION};
 CREATE TABLE IF NOT EXISTS chat_dispatch_policies (
     chat_id TEXT PRIMARY KEY,
     pause_seconds INTEGER NOT NULL CHECK(pause_seconds >= 0),
@@ -208,13 +212,7 @@ CREATE TABLE IF NOT EXISTS onboarding_events (
 """
 
 DEFAULTS = {
-    "timezone": "Europe/Moscow",
-    "send_windows_weekday": "09:00-13:00,16:00-21:00",
-    "send_windows_weekend": "11:00-14:00,17:00-20:00",
-    "delay_min_sec": "5",
-    "delay_max_sec": "15",
-    "auto_run": "1",
-    "global_stop": "0",
+    "global_stop": "1",
 }
 
 
@@ -231,7 +229,12 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate_weekly_slots(connection)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_weekly_due ON weekly_slots(group_id, scheduled_date, status)")
     columns = {row[1] for row in connection.execute("PRAGMA table_info(accounts)")}
+    if "send_day_pair" not in columns:
+        connection.execute("ALTER TABLE accounts ADD COLUMN send_day_pair INTEGER CHECK(send_day_pair BETWEEN 0 AND 2)")
+    connection.execute("UPDATE accounts SET send_day_pair=send_weekday % 3 WHERE send_day_pair IS NULL AND send_weekday BETWEEN 0 AND 5")
     if "session_generation" not in columns:
         connection.execute("ALTER TABLE accounts ADD COLUMN session_generation INTEGER NOT NULL DEFAULT 0")
     if "auth_state" not in columns:
@@ -252,6 +255,10 @@ def initialize(connection: sqlite3.Connection) -> None:
         )
     if "phone_fingerprint" not in columns:
         connection.execute("ALTER TABLE accounts ADD COLUMN phone_fingerprint TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_account_phone_fingerprint ON accounts(phone_fingerprint) "
+        "WHERE phone_fingerprint IS NOT NULL"
+    )
     columns = {row[1] for row in connection.execute("PRAGMA table_info(onboarding_sessions)")}
     if "ip_id" not in columns:
         connection.execute("ALTER TABLE onboarding_sessions ADD COLUMN ip_id INTEGER REFERENCES server_ips(id)")
@@ -289,3 +296,35 @@ def initialize(connection: sqlite3.Connection) -> None:
     connection.executemany(
         "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", DEFAULTS.items()
     )
+
+
+def _migrate_weekly_slots(connection: sqlite3.Connection) -> None:
+    actual_columns = {row[1] for row in connection.execute("PRAGMA table_info(weekly_slots)")}
+    if "day_position" in actual_columns:
+        return
+    columns = (
+        "id", "slot_id", "account_id", "group_id", "week_start", "scheduled_date",
+        "message_version_id", "text", "status", "retry_count", "error_code", "updated_at",
+    )
+    if actual_columns != set(columns):
+        raise sqlite3.DatabaseError("unexpected_weekly_slots_schema")
+
+    # SQLite needs a transactional table swap to replace the old inline UNIQUE constraint.
+    # Existing slot keys stay the same for both operations and send_log.
+    foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(f"CREATE TABLE weekly_slots_upgrade {WEEKLY_SLOT_DEFINITION}")
+        names = ",".join(columns)
+        connection.execute(f"INSERT INTO weekly_slots_upgrade({names}) SELECT {names} FROM weekly_slots")
+        connection.execute("DROP TABLE weekly_slots")
+        connection.execute("ALTER TABLE weekly_slots_upgrade RENAME TO weekly_slots")
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise sqlite3.IntegrityError("weekly_slot_references_invalid")
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute(f"PRAGMA foreign_keys={foreign_keys}")

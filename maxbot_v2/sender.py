@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Protocol
 
 from .chat_queue import chat_dispatch_wait, other_slot_has_priority
+from .scheduling import dispatch_quota_reason
 
 
 class Provider(Protocol):
@@ -66,14 +67,9 @@ class Sender:
         if str(group["chat_id"]) != str(chat_id):
             self.db.rollback()
             return "destination_changed"
-        if self.db.execute(
-            "SELECT 1 FROM send_log prior JOIN accounts prior_account ON prior_account.id=prior.account_id "
-            "JOIN weekly_slots prior_slot ON prior_slot.slot_id=prior.slot_id "
-            "WHERE prior.slot_id<>? AND prior_slot.week_start=? AND (prior.account_id=? OR "
-            "(? IS NOT NULL AND prior_account.phone_fingerprint=?)) LIMIT 1",
-            (slot_id, slot["week_start"], slot["account_id"], account["phone_fingerprint"], account["phone_fingerprint"]),
-        ).fetchone():
-            self.db.execute("UPDATE weekly_slots SET status='blocked',error_code='weekly_limit_reached',updated_at=? WHERE slot_id=?", (stamp, slot_id))
+        quota_reason = dispatch_quota_reason(self.db, slot, account["phone_fingerprint"])
+        if quota_reason is not None:
+            self.db.execute("UPDATE weekly_slots SET status='blocked',error_code=?,updated_at=? WHERE slot_id=?", (quota_reason, stamp, slot_id))
             self.db.commit()
             return "blocked"
         wait_reason = chat_dispatch_wait(self.db, str(chat_id), clock)
