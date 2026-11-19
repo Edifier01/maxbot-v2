@@ -61,7 +61,7 @@ def test_pymax_adapter_joins_and_refreshes_membership_from_provider():
 
 def test_pinned_pymax_client_constructs_with_bound_ip_and_encrypted_session_vault(tmp_path):
     from importlib.metadata import version
-    assert version("maxapi-python") == "2.4.1"
+    assert version("maxapi-python") == "2.5.0"
     vault = EncryptedSessionFile(10, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
     adapter = PyMaxAdapter.create(phone="+70000000000", source_ip="62.109.20.186", session_vault=vault)
     assert adapter.client is not None

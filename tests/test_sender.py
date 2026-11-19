@@ -34,6 +34,34 @@ def test_prepare_week_freezes_slot_and_does_not_replace_text(tmp_path):
     assert db.execute("SELECT text FROM weekly_slots").fetchone()[0] == first["text"]
 
 
+def test_prepare_week_keeps_version_and_text_together_when_pool_changes(tmp_path):
+    path = tmp_path / "planner.db"
+    writer = sqlite3.connect(path, isolation_level=None)
+    writer.row_factory = sqlite3.Row
+    seed = seeded_db()
+    seed.backup(writer)
+    seed.close()
+    new_version = None
+
+    class PlannerConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            nonlocal new_version
+            if sql == "BEGIN IMMEDIATE" and new_version is None:
+                new_version = replace_message_pool(writer, ["updated text"])
+            return super().execute(sql, parameters)
+
+    planner = sqlite3.connect(path, isolation_level=None, factory=PlannerConnection)
+    planner.row_factory = sqlite3.Row
+    try:
+        assert prepare_week(planner, date(2026, 9, 21)) == 1
+        slot = planner.execute("SELECT message_version_id,text FROM weekly_slots").fetchone()
+        assert new_version is not None
+        assert tuple(slot) == (new_version, "updated text")
+    finally:
+        planner.close()
+        writer.close()
+
+
 def test_missed_assigned_day_is_never_caught_up():
     db = seeded_db()
     db.execute("UPDATE accounts SET send_weekday=0 WHERE id=1")
@@ -77,11 +105,21 @@ def test_only_provider_ack_counts_as_accepted():
     assert db.execute("SELECT COUNT(*) FROM send_log").fetchone()[0] == 1
 
 
-def test_weekly_limit_follows_phone_fingerprint_after_account_recreation():
+@pytest.mark.parametrize(
+    ("prior_week", "logged_at", "expected"),
+    [
+        ("2026-09-21", "2026-09-21T10:00:00+00:00", "blocked"),
+        # Monday 00:30 in Europe/Moscow is still Sunday in UTC.
+        ("2026-09-21", "2026-09-20T21:30:00+00:00", "blocked"),
+        # An operator can confirm last week's delivery during the new week.
+        ("2026-09-14", "2026-09-21T10:00:00+00:00", "accepted"),
+    ],
+)
+def test_weekly_limit_follows_phone_fingerprint_after_account_recreation(prior_week, logged_at, expected):
     db = seeded_db()
     db.execute("UPDATE accounts SET send_weekday=0,phone_fingerprint='stable-private-fingerprint' WHERE id=1")
     week = "2026-09-21"
-    prior = create_weekly_slot(db, account_id=1, week_start=week, scheduled_date=week, text="prior", message_version_id=1)
+    prior = create_weekly_slot(db, account_id=1, week_start=prior_week, scheduled_date=prior_week, text="prior", message_version_id=1)
     db.execute(
         "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,ever_authenticated,phone_fingerprint) "
         "VALUES(1,'+70000000002','Name','active','authenticated',1,'stable-private-fingerprint')"
@@ -89,19 +127,21 @@ def test_weekly_limit_follows_phone_fingerprint_after_account_recreation():
     current = create_weekly_slot(db, account_id=2, week_start=week, scheduled_date=week, text="new", message_version_id=1)
     db.execute(
         "INSERT INTO send_log(account_id,group_id,slot_id,sent_at,provider_message_id,text) "
-        "VALUES(1,1,?,'2026-09-21T10:00:00+00:00','accepted','prior')", (prior["slot_id"],),
+        "VALUES(1,1,?,?,'accepted','prior')", (prior["slot_id"], logged_at),
     )
 
     class Provider:
         calls = 0
         async def send_message(self, **_kwargs):
             self.calls += 1
-            return Ack("must-not-send")
+            return Ack("new-message")
 
     provider = Provider()
-    assert asyncio.run(Sender(db, provider).send_slot(current["slot_id"], chat_id=10)) == "blocked"
-    assert provider.calls == 0
-    assert db.execute("SELECT error_code FROM weekly_slots WHERE account_id=2").fetchone()[0] == "weekly_limit_reached"
+    assert asyncio.run(Sender(db, provider).send_slot(current["slot_id"], chat_id=10)) == expected
+    assert provider.calls == int(expected == "accepted")
+    assert db.execute("SELECT error_code FROM weekly_slots WHERE account_id=2").fetchone()[0] == (
+        "weekly_limit_reached" if expected == "blocked" else None
+    )
 
 
 def test_process_interruption_marks_in_flight_unknown():

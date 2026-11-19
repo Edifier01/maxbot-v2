@@ -100,6 +100,8 @@ async def join_group_and_confirm_membership(
     check()
     try:
         existing = await adapter.get_chat(int(chat_id))
+    except (OSError, EOFError):
+        return False, "membership_check_unavailable"
     except Exception as exc:
         if type(exc).__name__ != "PyMaxError":
             raise

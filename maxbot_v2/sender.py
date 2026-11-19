@@ -62,7 +62,8 @@ class Sender:
             return "blocked"
         if self.db.execute(
             "SELECT 1 FROM send_log prior JOIN accounts prior_account ON prior_account.id=prior.account_id "
-            "WHERE prior.slot_id<>? AND prior.sent_at>=? AND (prior.account_id=? OR "
+            "JOIN weekly_slots prior_slot ON prior_slot.slot_id=prior.slot_id "
+            "WHERE prior.slot_id<>? AND prior_slot.week_start=? AND (prior.account_id=? OR "
             "(? IS NOT NULL AND prior_account.phone_fingerprint=?)) LIMIT 1",
             (slot_id, slot["week_start"], slot["account_id"], account["phone_fingerprint"], account["phone_fingerprint"]),
         ).fetchone():
