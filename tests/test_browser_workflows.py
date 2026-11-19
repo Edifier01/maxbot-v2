@@ -201,13 +201,27 @@ def test_fixed_schedule_and_separate_signup_names(page: Page, local_app, width):
     expect(page.get_by_text("По 5 сообщений в каждый назначенный день", exact=False)).to_be_visible()
     expect(page.get_by_text("В воскресенье отправок нет", exact=False)).to_be_visible()
     expect(page.get_by_role("button", name="Настройки", exact=True)).to_have_count(0)
+    pending_ip_list = []
+
+    def delay_first_ip_list(route):
+        if pending_ip_list:
+            route.continue_()
+        else:
+            pending_ip_list.append(route)
+
+    page.route("**/api/ips", delay_first_ip_list)
     page.get_by_role("button", name="Группы, номера и IP").click()
     first = page.locator(".group-card").filter(has_text="Первая команда")
     second = page.locator(".group-card").filter(has_text="Вторая команда")
     for card in (first, second):
         expect(card.get_by_text("Правила отправки в чат MAX", exact=True)).to_have_count(0)
         card.get_by_role("button", name="Номера", exact=True).press("Enter")
-    expect(first.get_by_text("Анна Первая", exact=True)).to_have_count(1)
+    try:
+        expect(first.get_by_text("Анна Первая", exact=True)).to_have_count(1)
+        assert pending_ip_list
+    finally:
+        if pending_ip_list:
+            pending_ip_list[0].continue_()
     expect(second).to_contain_text("Борис Второй")
     expect(first).not_to_contain_text("Борис Второй")
     expect(first.get_by_text("Пн и Чт", exact=True)).to_be_visible()
@@ -296,6 +310,7 @@ def test_ip_list_is_compact_and_keyboard_operable(page: Page, local_app, monkeyp
     page.keyboard.press("Enter")
     expect(page.get_by_role("button", name="Обновить IP")).to_be_visible()
     expect(page.locator("#ip-list")).to_be_visible()
+    expect(page.locator("#ip-panel")).not_to_contain_text("62.109.10.109")
     assert page.locator("#ip-list").bounding_box()["height"] <= 420
     assert page.locator("#ip-list").evaluate("element => element.scrollHeight > element.clientHeight")
     assert page_has_no_overflow(page)
@@ -333,19 +348,25 @@ def test_owner_imports_external_proxies_in_selected_ip_pool(page: Page, local_ap
         "buffer": b"socks5://example-user:example-password@8.8.4.4:1080\nsocks5://1.1.1.1:1080\n",
     })
     pool.get_by_role("button", name="Добавить прокси").click()
-    expect(pool.get_by_role("button", name="Включить", exact=True)).to_have_count(2)
-    expect(pool.get_by_role("button", name="Включить", exact=True).first).to_be_disabled()
-    expect(pool.get_by_role("button", name="Включить", exact=True).last).to_be_disabled()
+    expect(pool.get_by_text("Ожидает проверки", exact=False)).to_have_count(2)
     expect(pool).to_contain_text("Номера в порядке импорта: №")
     assert "example-password" not in pool.inner_text()
     pool.get_by_role("button", name="Проверить импортированные").press("Enter")
     expect(pool).to_contain_text("SOCKS5 отклонил авторизацию")
     expect(pool).to_contain_text("TLS до MAX установлен")
-    expect(pool.get_by_role("button", name="Включить", exact=True).first).to_be_disabled()
-    pool.get_by_role("button", name="Включить", exact=True).last.press("Enter")
-    expect(pool.get_by_role("button", name="Отключить", exact=True)).to_have_count(1)
-    pool.get_by_role("button", name="Проверить", exact=True).last.press("Enter")
-    expect(pool).to_contain_text("TLS до MAX установлен")
+    failed = pool.locator(".row").filter(has_text="SOCKS5 отклонил авторизацию")
+    expect(failed).to_contain_text("Приостановлен")
+    healthy = pool.locator(".row").filter(has_text="TLS до MAX установлен")
+    expect(healthy).to_contain_text("Включён")
+    healthy.get_by_role("button", name="Отключить", exact=True).press("Enter")
+    expect(healthy).to_contain_text("Отключён вручную")
+    healthy.get_by_role("button", name="Проверить", exact=True).press("Enter")
+    expect(page.locator("#notice")).to_have_text("Доступно через SOCKS5: 1 из 1")
+    expect(healthy).to_contain_text("Отключён вручную")
+    enable = healthy.get_by_role("button", name="Включить", exact=True)
+    expect(enable).to_be_enabled()
+    enable.press("Enter")
+    expect(healthy).to_contain_text("Включён")
     assert page_has_no_overflow(page)
 
 

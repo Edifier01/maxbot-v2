@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -903,7 +904,7 @@ def test_owner_delete_keeps_retryable_state_when_session_file_removal_fails(tmp_
     assert client.delete(f"/api/accounts/{account_id}", headers=headers).json() == {"deleted": True}
 
 
-def test_refresh_finds_new_ip_disabled_and_owner_can_reassign(tmp_path, monkeypatch):
+def test_refresh_enables_new_ip_and_respects_manual_disable(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
     group_id = client.post("/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"}).json()["id"]
@@ -918,7 +919,10 @@ def test_refresh_finds_new_ip_disabled_and_owner_can_reassign(tmp_path, monkeypa
     monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: {"62.109.20.186", "62.109.20.187"})
     rows = client.post("/api/ips/refresh", headers=headers).json()
     new = next(row for row in rows if row["address"] == "62.109.20.187")
-    assert new["enabled"] == 0 and new["available"] == 1
+    assert new["enabled"] == new["available"] == 1
+    assert client.patch(f"/api/ips/{new['id']}", headers=headers, json={"enabled": False}).status_code == 200
+    refreshed = client.post("/api/ips/refresh", headers=headers).json()
+    assert next(row for row in refreshed if row["id"] == new["id"])["enabled"] == 0
     assert client.post(f"/api/accounts/{account_id}/ip", headers=headers, json={"ip_id": new["id"]}).status_code == 422
     assert client.patch(f"/api/ips/{new['id']}", headers=headers, json={"enabled": True}).status_code == 200
     assert client.post(f"/api/accounts/{account_id}/ip", headers=headers, json={"ip_id": new["id"]}).json() == {"ip_id": new["id"], "ip_address": "62.109.20.187"}
@@ -988,12 +992,15 @@ def test_owner_manages_external_proxy_pool_without_exposing_credentials(tmp_path
     result_status = "ok"
     response = client.post(check, headers=headers, json=ids)
     assert response.json()[0]["check_status"] == "ok"
+    assert client.get(endpoint).json()[0]["enabled"]
+    assert client.patch(change, headers=headers, json={"enabled": False}).status_code == 200
+    assert client.post(check, headers=headers, json=ids).json()[0]["check_status"] == "ok"
     assert not client.get(endpoint).json()[0]["enabled"]
     assert client.patch(change, headers=headers, json={"enabled": True}).status_code == 200
     assert client.get(endpoint).json()[0]["enabled"]
     monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: set())
     assert client.post(check, headers=headers, json=ids).status_code == 409
-    assert len(probes) == 2
+    assert len(probes) == 3
     assert "sample-password" not in client.get("/api/log").text
 
 
@@ -1020,6 +1027,102 @@ def test_proxy_batch_checks_thirty_saved_routes_with_bounded_concurrency(tmp_pat
     assert [row["id"] for row in response.json()] == proxy_ids
     assert {row["check_status"] for row in client.get(endpoint).json()} == {"ok"}
     assert 1 < peak <= 6
+
+
+def test_daily_proxy_checks_run_with_sending_stopped_and_keep_assignments(tmp_path, monkeypatch):
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    monkeypatch.setattr("maxbot_v2.app.bootstrap_ips", lambda _db: None)
+    monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: {"62.109.20.186", "62.109.20.187", "62.109.20.188"})
+    headers = {"X-CSRF-Token": csrf}
+    group_id = client.post(
+        "/api/groups", headers=headers, json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
+    ).json()["id"]
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(hours=25)).isoformat()
+    recent = (now - timedelta(hours=23)).isoformat()
+    box = SecretBox()
+    with closing(connect(client.app.state.database)) as db:
+        db.execute("UPDATE groups SET active=0 WHERE id=?", (group_id,))
+        main_ip = db.execute("SELECT id FROM server_ips").fetchone()[0]
+        other_ip = db.execute(
+            "INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.187',1,1)",
+        ).lastrowid
+        disabled_ip = db.execute(
+            "INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.188',0,1)",
+        ).lastrowid
+        account = db.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) "
+            "VALUES(?,'+79990000000','Fixture','active','authenticated')", (group_id,),
+        ).lastrowid
+        db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account, main_ip))
+        routes = (
+            (1, main_ip, 1080, 1, "ok", old),
+            (2, main_ip, 1081, 1, "ok", recent),
+            (3, main_ip, 1082, 0, "unchecked", None),
+            (4, other_ip, 1083, 0, "tls_failed", old),
+            (5, disabled_ip, 1084, 1, "ok", old),
+            (6, main_ip, 1085, 1, "tls_failed", old),
+            (7, main_ip, 1086, 0, "ok", recent),
+            (8, main_ip, 1087, 0, "ok", old),
+        )
+        db.executemany(
+            "INSERT INTO send_proxies(id,ip_id,url_ciphertext,url_fingerprint,enabled,check_status,last_checked_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            [
+                (proxy_id, ip_id, box.encrypt(f"socks5://8.8.4.4:{port}"), str(proxy_id), enabled, status, checked)
+                for proxy_id, ip_id, port, enabled, status, checked in routes
+            ],
+        )
+        db.execute("INSERT INTO send_proxy_assignments(account_id,proxy_id) VALUES(?,1)", (account,))
+
+    assert client.patch(f"/api/ips/{main_ip}/send-proxies/8", headers=headers, json={"enabled": False}).status_code == 200
+    probes = []
+    finish_slow_check = asyncio.Event()
+
+    async def probe(*, source_ip, url):
+        probes.append((source_ip, url))
+        if url.endswith(":1085"):
+            await finish_slow_check.wait()
+        return "connection_failed" if url.endswith(":1080") else "ok"
+
+    async def wait_for_results(expected):
+        deadline = asyncio.get_running_loop().time() + 2
+        while asyncio.get_running_loop().time() < deadline:
+            with closing(connect(client.app.state.database)) as db:
+                results = db.execute("SELECT enabled,check_status,last_checked_at FROM send_proxies ORDER BY id").fetchall()
+                if all(results[index]["check_status"] == status for index, status in expected.items()):
+                    return results
+            await asyncio.sleep(0.025)
+        return None
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.check_send_proxy", staticmethod(probe))
+    with TestClient(client.app) as running_client:
+        early_results = running_client.portal.call(wait_for_results, {0: "connection_failed"})
+        assert early_results is not None, "A slow proxy must not delay saving another route's failure"
+        assert tuple(early_results[5]) == (1, "tls_failed", old)
+        running_client.portal.call(finish_slow_check.set)
+        results = running_client.portal.call(wait_for_results, {2: "ok", 3: "ok", 5: "ok"})
+        assert results is not None, "The background proxy check did not save its results"
+        assert sorted(probes) == [
+            ("62.109.20.186", "socks5://8.8.4.4:1080"),
+            ("62.109.20.186", "socks5://8.8.4.4:1082"),
+            ("62.109.20.186", "socks5://8.8.4.4:1085"),
+            ("62.109.20.186", "socks5://8.8.4.4:1086"),
+            ("62.109.20.187", "socks5://8.8.4.4:1083"),
+        ]
+        assert [tuple(results[index]) for index in (1, 4, 7)] == [
+            (1, "ok", recent), (1, "ok", old), (0, "ok", old),
+        ]
+        assert results[0]["enabled"] == 0
+        assert datetime.fromisoformat(results[0]["last_checked_at"]) >= now
+        for index in (2, 3, 5, 6):
+            assert results[index]["enabled"] == 1
+            assert datetime.fromisoformat(results[index]["last_checked_at"]) >= now
+        with closing(connect(client.app.state.database)) as db:
+            assert tuple(db.execute("SELECT ip_id FROM ip_assignments WHERE account_id=?", (account,)).fetchone()) == (main_ip,)
+            assert tuple(db.execute("SELECT proxy_id FROM send_proxy_assignments WHERE account_id=?", (account,)).fetchone()) == (1,)
+            assert db.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 0
+            assert db.execute("SELECT value FROM settings WHERE key='global_stop'").fetchone()[0] == "1"
 
 
 def check_and_enable_fake_proxies(client, endpoint, headers, ids, monkeypatch):

@@ -49,34 +49,41 @@ def probe_address(address: str, host: str = MAX_HOST, port: int = 443) -> bool:
 
 
 def refresh_ips(connection: sqlite3.Connection, *, addresses: set[str] | None = None, probe=probe_address) -> list[dict]:
-    """Discover current host IPs; new ones remain disabled until owner action."""
+    """Enable verified host IPs unless the owner has disabled them."""
     addresses = host_addresses() if addresses is None else addresses
     discovered = {address for address in addresses if allowed_address(address)}
     verified = {address for address in discovered if probe(address)}
     now = datetime.now(timezone.utc).isoformat()
-    connection.execute("UPDATE server_ips SET available=0,last_checked_at=?", (now,))
-    for address in sorted(discovered):
-        connection.execute(
-            "INSERT INTO server_ips(address,available,last_checked_at) VALUES(?,?,?) "
-            "ON CONFLICT(address) DO UPDATE SET available=excluded.available,last_checked_at=excluded.last_checked_at",
-            (address, int(address in verified), now),
-        )
-    connection.execute(
-        "UPDATE weekly_slots SET status='blocked',error_code='ip_assignment_unavailable',updated_at=? "
-        "WHERE status='queued' AND account_id IN "
-        "(SELECT ia.account_id FROM ip_assignments ia JOIN server_ips p ON p.id=ia.ip_id "
-        "WHERE p.enabled=0 OR p.available=0)",
-        (now,),
-    )
     today = datetime.now(SCHEDULE_TZ).date().isoformat()
-    connection.execute(
-        "UPDATE weekly_slots SET status=CASE WHEN scheduled_date>=? THEN 'queued' ELSE 'missed' END,"
-        "error_code=NULL,updated_at=? WHERE status='blocked' AND error_code='ip_assignment_unavailable' "
-        "AND account_id IN (SELECT ia.account_id FROM ip_assignments ia JOIN server_ips p ON p.id=ia.ip_id "
-        "WHERE p.enabled=1 AND p.available=1)",
-        (today, now),
-    )
-    return [dict(row) for row in connection.execute("SELECT id,address,enabled,available,last_checked_at FROM server_ips ORDER BY address")]
+    connection.execute("BEGIN IMMEDIATE")
+    with connection:
+        connection.execute("UPDATE server_ips SET enabled=0,available=0,last_checked_at=?", (now,))
+        for address in sorted(discovered):
+            available = int(address in verified)
+            connection.execute(
+                "INSERT INTO server_ips(address,enabled,available,last_checked_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(address) DO UPDATE SET available=excluded.available,last_checked_at=excluded.last_checked_at,"
+                "enabled=(excluded.available=1 AND server_ips.manual_disabled=0)",
+                (address, available, available, now),
+            )
+        connection.execute(
+            "UPDATE weekly_slots SET status='blocked',error_code='ip_assignment_unavailable',updated_at=? "
+            "WHERE status='queued' AND account_id IN "
+            "(SELECT ia.account_id FROM ip_assignments ia JOIN server_ips p ON p.id=ia.ip_id "
+            "WHERE p.enabled=0 OR p.available=0)",
+            (now,),
+        )
+        connection.execute(
+            "UPDATE weekly_slots SET status=CASE WHEN scheduled_date>=? THEN 'queued' ELSE 'missed' END,"
+            "error_code=NULL,updated_at=? WHERE status='blocked' AND error_code='ip_assignment_unavailable' "
+            "AND account_id IN (SELECT ia.account_id FROM ip_assignments ia JOIN server_ips p ON p.id=ia.ip_id "
+            "WHERE p.enabled=1 AND p.available=1)",
+            (today, now),
+        )
+        rows = connection.execute(
+            "SELECT id,address,enabled,manual_disabled,available,last_checked_at FROM server_ips ORDER BY address"
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def enable_ip(connection: sqlite3.Connection, ip_id: int, enabled: bool) -> None:
@@ -85,7 +92,9 @@ def enable_ip(connection: sqlite3.Connection, ip_id: int, enabled: bool) -> None
         raise ValueError("ip_not_found")
     if enabled and (not allowed_address(row["address"]) or not row["available"]):
         raise ValueError("ip_unavailable")
-    connection.execute("UPDATE server_ips SET enabled=? WHERE id=?", (int(enabled), ip_id))
+    connection.execute(
+        "UPDATE server_ips SET enabled=?,manual_disabled=? WHERE id=?", (int(enabled), int(not enabled), ip_id),
+    )
 
 
 def assigned_ip(connection: sqlite3.Connection, account_id: int) -> tuple[int, str] | None:
@@ -125,15 +134,13 @@ def assign_ip(connection: sqlite3.Connection, account_id: int) -> str:
 
 
 def bootstrap_ips(connection: sqlite3.Connection, *, addresses: set[str] | None = None, probe=probe_address) -> None:
-    """Idempotently activate the user's already approved IP and migrate assignments."""
+    """Refresh host IPs and complete the one-time migration of legacy assignments."""
     rows = refresh_ips(connection, addresses=addresses, probe=probe)
     done = connection.execute("SELECT 1 FROM settings WHERE key='max_ip_bootstrap_done'").fetchone()
     if done:
         return
-    initial = next((row for row in rows if row["address"] == INITIAL_MAX_IP and row["available"]), None)
-    if initial is None:
+    if not any(row["address"] == INITIAL_MAX_IP and row["enabled"] for row in rows):
         return
-    enable_ip(connection, initial["id"], True)
     for account in connection.execute("SELECT id FROM accounts WHERE lifecycle='active' ORDER BY id"):
         if connection.execute("SELECT 1 FROM ip_assignments WHERE account_id=?", (account["id"],)).fetchone() is None:
             assign_ip(connection, account["id"])

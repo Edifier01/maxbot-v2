@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 
 from maxbot_v2.db import connect, initialize
-from maxbot_v2.egress import assign_ip, bootstrap_ips, probe_address, refresh_ips
+from maxbot_v2.egress import assign_ip, bootstrap_ips, enable_ip, probe_address, refresh_ips
 from maxbot_v2.message_pool import replace_message_pool
 from maxbot_v2.scheduling import create_weekly_slot
 
@@ -88,11 +88,11 @@ def test_concurrent_transactions_keep_new_ip_assignments_balanced(tmp_path):
     db.close()
 
 
-def test_refresh_excludes_legacy_ip_and_leaves_new_ip_disabled():
+def test_refresh_excludes_legacy_ip_and_enables_verified_ip():
     db = connect(":memory:")
     initialize(db)
     rows = refresh_ips(db, addresses={"62.109.10.109", "62.109.20.186", "172.18.0.1"}, probe=lambda _: True)
-    assert [(row["address"], row["enabled"]) for row in rows] == [("62.109.20.186", 0)]
+    assert [(row["address"], row["enabled"]) for row in rows] == [("62.109.20.186", 1)]
 
 
 def test_refresh_shows_discovered_ip_with_failed_egress_as_unavailable():
@@ -131,7 +131,7 @@ def test_bootstrap_preserves_owner_disable_on_restart():
     db.execute("INSERT INTO accounts(id,group_id,phone,full_name) VALUES(1,1,'+79990000001','A')")
     bootstrap_ips(db, addresses={"62.109.20.186"}, probe=lambda _: True)
     assert db.execute("SELECT COUNT(*) FROM ip_assignments").fetchone()[0] == 1
-    db.execute("UPDATE server_ips SET enabled=0")
+    enable_ip(db, db.execute("SELECT id FROM server_ips").fetchone()[0], False)
     bootstrap_ips(db, addresses={"62.109.20.186"}, probe=lambda _: True)
     assert db.execute("SELECT enabled FROM server_ips").fetchone()[0] == 0
 
@@ -161,6 +161,8 @@ def test_disappeared_ip_blocks_slot_and_restoration_requeues_it():
     version = replace_message_pool(db, ["test"])
     create_weekly_slot(db, account_id=1, week_start="2099-01-05", scheduled_date="2099-01-05", text="test", message_version_id=version)
     refresh_ips(db, addresses=set(), probe=lambda _address: True)
+    assert db.execute("SELECT enabled,available FROM server_ips").fetchone()[:] == (0, 0)
     assert db.execute("SELECT status,error_code FROM weekly_slots").fetchone()[:] == ("blocked", "ip_assignment_unavailable")
     refresh_ips(db, addresses={"62.109.20.186"}, probe=lambda _address: True)
+    assert db.execute("SELECT enabled,available FROM server_ips").fetchone()[:] == (1, 1)
     assert db.execute("SELECT status,error_code FROM weekly_slots").fetchone()[:] == ("queued", None)
