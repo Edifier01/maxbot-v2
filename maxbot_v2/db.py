@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS server_ips (
     id INTEGER PRIMARY KEY,
     address TEXT NOT NULL UNIQUE,
     enabled INTEGER NOT NULL DEFAULT 0,
+    manual_disabled INTEGER NOT NULL DEFAULT 0 CHECK(manual_disabled IN (0,1)),
     available INTEGER NOT NULL DEFAULT 0,
     last_checked_at TEXT,
     last_assigned_at TEXT
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS send_proxies (
     url_ciphertext TEXT NOT NULL,
     url_fingerprint TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    manual_disabled INTEGER NOT NULL DEFAULT 0 CHECK(manual_disabled IN (0,1)),
     check_status TEXT NOT NULL DEFAULT 'unchecked',
     last_checked_at TEXT,
     UNIQUE(ip_id, url_fingerprint)
@@ -265,11 +267,19 @@ def initialize(connection: sqlite3.Connection) -> None:
     ip_columns = {row[1] for row in connection.execute("PRAGMA table_info(server_ips)")}
     if "last_assigned_at" not in ip_columns:
         connection.execute("ALTER TABLE server_ips ADD COLUMN last_assigned_at TEXT")
+    if "manual_disabled" not in ip_columns:
+        connection.execute(
+            "ALTER TABLE server_ips ADD COLUMN manual_disabled INTEGER NOT NULL DEFAULT 0 CHECK(manual_disabled IN (0,1))"
+        )
     send_proxy_columns = {row[1] for row in connection.execute("PRAGMA table_info(send_proxies)")}
     if "check_status" not in send_proxy_columns:
         connection.execute("ALTER TABLE send_proxies ADD COLUMN check_status TEXT NOT NULL DEFAULT 'unchecked'")
     if "last_checked_at" not in send_proxy_columns:
         connection.execute("ALTER TABLE send_proxies ADD COLUMN last_checked_at TEXT")
+    if "manual_disabled" not in send_proxy_columns:
+        connection.execute(
+            "ALTER TABLE send_proxies ADD COLUMN manual_disabled INTEGER NOT NULL DEFAULT 0 CHECK(manual_disabled IN (0,1))"
+        )
     operation_columns = {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
     if "destination_chat_id" not in operation_columns:
         connection.execute("ALTER TABLE operations ADD COLUMN destination_chat_id TEXT")

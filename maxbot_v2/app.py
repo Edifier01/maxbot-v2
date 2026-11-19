@@ -46,6 +46,7 @@ project_logger.addHandler(diagnostic_handler)
 project_logger.propagate = False
 SEND_PROXY_BATCH_SIZE = 30
 SEND_PROXY_HEALTH_POLL_SECONDS = 300
+ROUTE_CHECK_INTERVAL = timedelta(days=1)
 
 
 def _log_timestamp_key(value: object) -> datetime:
@@ -173,6 +174,7 @@ def create_app(
     runtime_dir = Path(os.getenv("SESSION_RUNTIME_DIR", "/run/maxbot-sessions"))
     sessions_dir = data / "sessions"
     account_session_locks = AccountSessionLocks()
+    ip_refresh_lock = asyncio.Lock()
     send_proxy_check_lock = asyncio.Lock()
     manual_proxy_check_lock = asyncio.Lock()
     terminal_onboarding_states = ("completed", "failed", "expired", "cancelled")
@@ -938,7 +940,7 @@ def create_app(
         now = datetime.now(timezone.utc).isoformat()
         with db() as connection:
             rows = connection.execute(
-                "SELECT p.id,p.address,p.enabled,p.available,p.last_checked_at,COUNT(DISTINCT a.id) AS assigned_count,"
+                "SELECT p.id,p.address,p.enabled,p.manual_disabled,p.available,p.last_checked_at,COUNT(DISTINCT a.id) AS assigned_count,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state='authenticated' THEN a.id END) AS authenticated_count,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state<>'authenticated' AND EXISTS ("
                 "SELECT 1 FROM onboarding_sessions s WHERE s.account_id=a.id AND s.state IN "
@@ -954,17 +956,30 @@ def create_app(
             ).fetchall()
         return [dict(row) for row in rows]
 
+    async def refresh_ip_pool() -> list[dict[str, object]]:
+        def refresh() -> list[dict[str, object]]:
+            with db() as connection:
+                return refresh_ips(connection)
+
+        async with ip_refresh_lock:
+            task = asyncio.create_task(asyncio.to_thread(refresh))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # The thread can still publish its result after the coroutine is cancelled.
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+
     @app.post("/api/ips/refresh")
-    def refresh_server_ips(_session: sqlite3.Row = Depends(require_csrf)) -> list[dict[str, object]]:
-        with db() as connection:
-            rows = refresh_ips(connection)
-        return rows
+    async def refresh_server_ips(_session: sqlite3.Row = Depends(require_csrf)) -> list[dict[str, object]]:
+        return await refresh_ip_pool()
 
     @app.get("/api/ips/{ip_id}/send-proxies")
     def list_send_proxies(ip_id: int, _session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
         with db() as connection:
             rows = connection.execute(
-                "SELECT p.id,p.enabled,p.check_status,p.last_checked_at,COUNT(a.id) AS assigned_count FROM send_proxies p "
+                "SELECT p.id,p.enabled,p.manual_disabled,p.check_status,p.last_checked_at,COUNT(a.id) AS assigned_count "
+                "FROM send_proxies p "
                 "LEFT JOIN send_proxy_assignments s ON s.proxy_id=p.id "
                 "LEFT JOIN accounts a ON a.id=s.account_id AND a.lifecycle='active' "
                 "WHERE p.ip_id=? GROUP BY p.id ORDER BY p.id", (ip_id,),
@@ -1031,7 +1046,8 @@ def create_app(
                 # Dispatch uses this status before sending. Save it as soon as this route finishes.
                 with db() as connection:
                     updated = connection.execute(
-                        "UPDATE send_proxies SET check_status=:check_status,last_checked_at=:last_checked_at "
+                        "UPDATE send_proxies SET check_status=:check_status,last_checked_at=:last_checked_at,"
+                        "enabled=(manual_disabled=0 AND :check_status='ok') "
                         "WHERE id=:id AND ip_id=:ip_id AND EXISTS ("
                         "SELECT 1 FROM server_ips WHERE id=:ip_id AND address=:source_ip AND enabled=1 AND available=1)",
                         {**result, "ip_id": ip_id, "source_ip": source_ip},
@@ -1049,7 +1065,7 @@ def create_app(
         return results
 
     async def check_due_send_proxies() -> None:
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - ROUTE_CHECK_INTERVAL).isoformat()
         with db() as connection:
             ip_ids = [row[0] for row in connection.execute(
                 "SELECT id FROM server_ips WHERE enabled=1 AND available=1 ORDER BY id",
@@ -1060,8 +1076,9 @@ def create_app(
                     # A manual check may have finished while the background task waited.
                     with db() as connection:
                         proxy_ids = [row[0] for row in connection.execute(
-                            "SELECT id FROM send_proxies WHERE ip_id=? AND enabled=1 "
-                            "AND (julianday(last_checked_at) IS NULL OR julianday(last_checked_at)<=julianday(?)) "
+                            "SELECT id FROM send_proxies WHERE ip_id=? AND manual_disabled=0 "
+                            "AND (julianday(last_checked_at) IS NULL OR julianday(last_checked_at)<=julianday(?) "
+                            "OR (enabled=0 AND check_status='ok')) "
                             "ORDER BY id LIMIT ?", (ip_id, cutoff, SEND_PROXY_BATCH_SIZE),
                         )]
                     if not proxy_ids:
@@ -1074,7 +1091,17 @@ def create_app(
                         break
 
     async def check_send_proxies_forever() -> None:
+        loop = asyncio.get_running_loop()
+        interval = ROUTE_CHECK_INTERVAL.total_seconds()
+        next_ip_refresh = loop.time() + interval
         while True:
+            if loop.time() >= next_ip_refresh:
+                try:
+                    await refresh_ip_pool()
+                except Exception as exc:
+                    logger.warning("daily_ip_refresh_failed error_class=%s", type(exc).__name__)
+                else:
+                    next_ip_refresh = loop.time() + interval
             try:
                 await check_due_send_proxies()
             except Exception as exc:
@@ -1099,7 +1126,10 @@ def create_app(
                 raise HTTPException(404, "send_proxy_not_found")
             if body.enabled and row["check_status"] != "ok":
                 raise HTTPException(409, "send_proxy_check_required")
-            connection.execute("UPDATE send_proxies SET enabled=? WHERE id=?", (int(body.enabled), proxy_id))
+            connection.execute(
+                "UPDATE send_proxies SET enabled=?,manual_disabled=? WHERE id=?",
+                (int(body.enabled), int(not body.enabled), proxy_id),
+            )
             connection.commit()
         return {"enabled": body.enabled}
 
@@ -1888,7 +1918,8 @@ def create_app(
             rows = connection.execute(
                 "SELECT a.id,a.full_name,a.status,a.auth_state,a.lifecycle,a.ever_authenticated,a.send_day_pair,"
                 "ia.ip_id,p.address AS ip_address,p.enabled AS ip_enabled,p.available AS ip_available,"
-                "sp.id AS send_proxy_id,sp.enabled AS send_proxy_enabled,sp.check_status AS send_proxy_check_status,"
+                "sp.id AS send_proxy_id,sp.enabled AS send_proxy_enabled,sp.manual_disabled AS send_proxy_manual_disabled,"
+                "sp.check_status AS send_proxy_check_status,"
                 "(SELECT os.state FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_state,"
                 "(SELECT os.error_code FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_error "
                 "FROM accounts a "
