@@ -1,9 +1,12 @@
 import asyncio
+import sqlite3
+from contextlib import closing
 from importlib.metadata import version
 
 import pytest
 from pymax.exceptions import ApiError
 from pymax.protocol.enums import Opcode
+from pymax.session import SessionStore
 
 from maxbot_v2.crypto import SecretBox
 from maxbot_v2.max_adapter import AdapterUnavailable, PyMaxAdapter
@@ -11,7 +14,7 @@ from maxbot_v2.session_vault import EncryptedSessionFile
 
 
 def test_pinned_client_uses_standard_sms_flow_and_bound_transport(tmp_path, monkeypatch):
-    assert version("maxapi-python") == "2.4.1"
+    assert version("maxapi-python") == "2.5.0"
     vault = EncryptedSessionFile(10, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
 
     class Provider:
@@ -23,6 +26,9 @@ def test_pinned_client_uses_standard_sms_flow_and_bound_transport(tmp_path, monk
 
     adapter = PyMaxAdapter.create(phone="+70000000000", source_ip="62.109.20.186", session_vault=vault, code_provider=Provider(), password_provider=Provider())
     assert adapter.client.extra_config.proxy is None
+    assert not adapter.client.extra_config.reconnect
+    assert not adapter.client.extra_config.relogin
+    assert adapter.client.extra_config.persist_session
     assert type(adapter.client._auth_flow).__name__ == "SmsAuthFlow"
 
     called = {}
@@ -44,6 +50,33 @@ def test_pinned_client_uses_standard_sms_flow_and_bound_transport(tmp_path, monk
         session_vault=EncryptedSessionFile(34, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key())),
     )
     assert type(saved_session.client._auth_flow).__name__ == "NoInteractiveAuthFlow"
+
+
+def test_pymax_reopens_an_existing_encrypted_session_without_network(tmp_path):
+    vault = EncryptedSessionFile(19, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
+    vault.open()
+    phone = "+70000000019"
+    with closing(sqlite3.connect(vault.work_path)) as database:
+        database.execute("CREATE TABLE sessions(token TEXT NOT NULL PRIMARY KEY,device_id TEXT NOT NULL,phone TEXT NOT NULL)")
+        database.execute("INSERT INTO sessions VALUES(?,?,?)", ("synthetic-token", "synthetic-device", phone))
+        database.commit()
+    vault.seal()
+    assert not vault.work_path.exists()
+
+    async def reopen():
+        work_dir, session_name = vault.open()
+        store = SessionStore(work_dir, session_name)
+        try:
+            session = await store.load_session_by_phone(phone)
+            assert session is not None
+            assert session.token == "synthetic-token"
+        finally:
+            await store.close()
+            vault.seal()
+
+    asyncio.run(reopen())
+    assert vault.has_saved_session_token()
+    assert not vault.work_path.exists()
 
 
 def test_legacy_ip_is_rejected_before_opening_session(tmp_path):

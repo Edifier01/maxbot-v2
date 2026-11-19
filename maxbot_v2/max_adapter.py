@@ -13,7 +13,7 @@ from .egress import allowed_address
 from .session_vault import EncryptedSessionFile
 
 
-REQUIRED_PYMAX_VERSION = "2.4.1"
+REQUIRED_PYMAX_VERSION = "2.5.0"
 
 
 class AdapterUnavailable(RuntimeError):
@@ -45,7 +45,7 @@ class PyMaxAdapter:
 
     @staticmethod
     def auth_stage_for_opcode(opcode: int) -> str | None:
-        """Map PyMax 2.4.1 protocol opcodes to safe authentication stages."""
+        """Map PyMax protocol opcodes to safe authentication stages."""
         try:
             from pymax.protocol.enums import Opcode
             value = int(opcode)
@@ -188,7 +188,7 @@ class PyMaxAdapter:
 
     @staticmethod
     def is_invalid_saved_session_error(exc: Exception) -> bool:
-        """Match PyMax 2.4.1's explicit invalid-login-token condition safely."""
+        """Match PyMax's explicit invalid-login-token condition safely."""
         try:
             from pymax.exceptions import ApiError
             from pymax.protocol.enums import Opcode

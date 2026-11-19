@@ -10,13 +10,14 @@ from .scheduling import assign_weekday, monday_of
 def prepare_week(connection: sqlite3.Connection, today: date) -> int:
     """Create one immutable slot/account/week; missed days stay missed."""
     week_start = monday_of(today)
-    version_row = connection.execute("SELECT value FROM settings WHERE key='message_version_id'").fetchone()
-    if version_row is None:
-        return 0
-    version_id = int(version_row["value"])
     count = 0
     connection.execute("BEGIN IMMEDIATE")
     try:
+        version_row = connection.execute("SELECT value FROM settings WHERE key='message_version_id'").fetchone()
+        if version_row is None:
+            connection.commit()
+            return 0
+        version_id = int(version_row["value"])
         pool = MessagePool(connection)
         accounts = connection.execute(
             "SELECT a.id FROM accounts a JOIN groups g ON g.id=a.group_id WHERE a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 ORDER BY a.group_id,a.id"

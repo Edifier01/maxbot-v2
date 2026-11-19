@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from types import SimpleNamespace
 
 import bcrypt
 import pytest
@@ -838,6 +839,72 @@ def test_reenabling_ip_resumes_future_blocked_slot(tmp_path, monkeypatch):
     db = connect(client.app.state.database)
     assert db.execute("SELECT status FROM weekly_slots WHERE account_id=?", (account_id,)).fetchone()[0] == "queued"
     db.close()
+
+
+@pytest.mark.parametrize("network_error", [TimeoutError, ConnectionResetError])
+def test_initial_membership_read_network_error_preserves_authenticated_attempt(tmp_path, monkeypatch, network_error):
+    coroutines = []
+    real_create_task = asyncio.create_task
+
+    def capture(coro, **kwargs):
+        if coro.cr_code.co_name == "run_onboarding_auth":
+            coroutines.append(coro)
+            return None
+        return real_create_task(coro, **kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", capture)
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    created = client.post(
+        "/api/groups", headers={"X-CSRF-Token": csrf},
+        json={"name": "Клуб", "invite_link": "https://max.ru/join/test"},
+    )
+    group_id = created.json()["id"]
+    token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
+    reads = 0
+
+    class FakeAdapter:
+        client = SimpleNamespace(me=SimpleNamespace(contact=SimpleNamespace(id=123)))
+
+        async def connect(self):
+            pass
+
+        def persist_session_snapshot(self):
+            return True
+
+        async def resolve_group_by_link(self, _link):
+            return SimpleNamespace(id=7001)
+
+        async def get_chat(self, chat_id):
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                raise network_error()
+            return SimpleNamespace(id=chat_id, status="member", join_time=1)
+
+        async def join_group(self, _link):
+            pytest.fail("An unavailable membership check must not trigger an automatic join")
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(lambda _cls, **_kwargs: FakeAdapter()))
+    base = f"/api/public/onboarding/{token}"
+    started = client.post(f"{base}/start", json={"full_name": "Иван", "phone": "+79991234567"})
+    assert started.status_code == 200
+    session_id = started.json()["session_id"]
+    asyncio.run(coroutines.pop())
+
+    status = client.get(f"{base}/{session_id}").json()
+    assert (status["state"], status["error"]) == ("waiting_membership", "membership_check_unavailable")
+    db = connect(client.app.state.database)
+    try:
+        account = db.execute("SELECT auth_state,ever_authenticated,status FROM accounts").fetchone()
+        assert tuple(account) == ("authenticated", 1, "needs_membership")
+    finally:
+        db.close()
+    checked = client.post(f"{base}/{session_id}/check-membership", json={})
+    assert checked.json() == {"joined": True, "completed": True}
+    assert client.get(f"{base}/{session_id}").json()["state"] == "completed"
 
 
 def test_membership_check_stops_when_assigned_ip_changes_during_connect(tmp_path, monkeypatch):

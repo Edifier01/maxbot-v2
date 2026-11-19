@@ -316,6 +316,7 @@ def test_owner_login_navigation_and_run_controls_at_supported_widths(page: Page,
     expect(page.locator("#view")).to_contain_text("2 текстов")
 
     page.get_by_role("button", name="Настройки").click()
+    expect(page.locator("#view")).to_contain_text("Часовой пояс и окна применяются к ближайшей отправке")
     page.get_by_role("button", name="Сохранить", exact=True).click()
     expect(page.locator("#notice")).to_have_text("Настройки сохранены")
 
