@@ -8,8 +8,10 @@ from datetime import datetime, timezone
 from importlib.metadata import version
 from time import perf_counter
 from typing import Any, Callable
+from urllib.parse import unquote, urlsplit
 
 from .egress import allowed_address
+from .send_proxies import allowed_proxy_address, normalize_proxy_url
 from .session_vault import EncryptedSessionFile
 
 
@@ -67,6 +69,7 @@ class PyMaxAdapter:
     def create(
         cls, *, phone: str, source_ip: str, session_vault: EncryptedSessionFile | None = None,
         code_provider: Any = None, password_provider: Any = None,
+        send_proxy_url: str | None = None,
         before_network_action: Callable[[], None] | None = None,
         diagnostic_callback: Callable[[str, str, int, bool, str | None], None] | None = None,
     ):
@@ -74,6 +77,13 @@ class PyMaxAdapter:
             raise AdapterUnavailable("ip_assignment_required")
         if session_vault is None:
             raise AdapterUnavailable("encrypted_session_vault_required")
+        if send_proxy_url is not None:
+            if code_provider is not None or password_provider is not None:
+                raise AdapterUnavailable("interactive_auth_requires_direct_ip")
+            try:
+                send_proxy_url = normalize_proxy_url(send_proxy_url)
+            except ValueError:
+                raise AdapterUnavailable("invalid_send_proxy") from None
         try:
             if version("maxapi-python") != REQUIRED_PYMAX_VERSION:
                 raise AdapterUnavailable("pymax_version_mismatch")
@@ -84,6 +94,8 @@ class PyMaxAdapter:
             from pymax.protocol.tcp import TcpProtocol
             from pymax.protocol.tcp.framing import TcpPacketFramer
             from pymax.transport.tcp import TCPTransport
+            from python_socks import ProxyType
+            from python_socks.async_.asyncio import Proxy
         except AdapterUnavailable:
             raise
         except Exception as exc:
@@ -94,13 +106,14 @@ class PyMaxAdapter:
                 started = perf_counter()
                 if before_network_action is not None:
                     before_network_action()
-                if self._proxy:
-                    raise AdapterUnavailable("proxy_route_forbidden")
                 try:
-                    self._reader, self._writer = await asyncio.open_connection(
-                        self._host, self._port, ssl=self._ssl_ctx if self._use_ssl else None,
-                        family=socket.AF_INET, local_addr=(source_ip, 0),
-                    )
+                    if send_proxy_url is None:
+                        self._reader, self._writer = await asyncio.open_connection(
+                            self._host, self._port, ssl=self._ssl_ctx if self._use_ssl else None,
+                            family=socket.AF_INET, local_addr=(source_ip, 0),
+                        )
+                    else:
+                        self._reader, self._writer = await self._open_proxy_tunnel(send_proxy_url)
                     actual = self._writer.get_extra_info("sockname")
                     if actual is None or actual[0] != source_ip:
                         await self.close()
@@ -111,6 +124,37 @@ class PyMaxAdapter:
                     raise
                 if diagnostic_callback is not None:
                     diagnostic_callback("connect", "connected", int((perf_counter() - started) * 1000), False, None)
+
+            async def _open_proxy_tunnel(self, url: str):
+                endpoint = urlsplit(url)
+                proxy_address = endpoint.hostname
+                if not allowed_proxy_address(proxy_address):
+                    loop = asyncio.get_running_loop()
+                    addresses = await asyncio.wait_for(loop.getaddrinfo(
+                        proxy_address, endpoint.port, family=socket.AF_INET, type=socket.SOCK_STREAM,
+                    ), timeout=10)
+                    proxy_address = next((sockaddr[0] for *_, sockaddr in addresses if allowed_proxy_address(sockaddr[0])), None)
+                    if proxy_address is None:
+                        raise AdapterUnavailable("invalid_send_proxy_address")
+                proxy = Proxy(
+                    ProxyType.SOCKS5, proxy_address, endpoint.port,
+                    unquote(endpoint.username) if endpoint.username else None,
+                    unquote(endpoint.password) if endpoint.password else None,
+                    rdns=True,
+                )
+                if before_network_action is not None:
+                    before_network_action()
+                sock = await proxy.connect(dest_host=self._host, dest_port=self._port, timeout=10, local_addr=(source_ip, 0))
+                try:
+                    if sock.getsockname()[0] != source_ip:
+                        raise AdapterUnavailable("source_ip_mismatch")
+                    return await asyncio.open_connection(
+                        sock=sock, ssl=self._ssl_ctx if self._use_ssl else None,
+                        server_hostname=self._host if self._use_ssl else None,
+                    )
+                except BaseException:
+                    sock.close()
+                    raise
 
             async def send(self, data):
                 if before_network_action is not None:

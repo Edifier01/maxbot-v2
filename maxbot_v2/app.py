@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.exceptions import RequestValidationError
@@ -30,6 +31,7 @@ from .egress import assign_ip, assigned_ip, bootstrap_ips, enable_ip, host_addre
 from .session_vault import EncryptedSessionFile
 from .workers import GroupWorkerManager, _inside_window
 from .sender import DispatchPaused, recover_in_flight
+from .send_proxies import assigned_or_allocate_proxy, normalize_proxy_url
 from .session_lock import AccountSessionLocks
 from .lifecycle import phone_fingerprint
 from .session_vault import SessionDeletionError, SessionSnapshotUnavailable
@@ -94,6 +96,15 @@ class IPStateBody(BaseModel):
 
 class IPAssignmentBody(BaseModel):
     ip_id: int = Field(gt=0)
+
+
+class ProxyPoolBody(BaseModel):
+    urls: list[str] = Field(min_length=1, max_length=30)
+    enabled: bool = False
+
+
+class ProxyAssignmentBody(BaseModel):
+    proxy_id: int = Field(gt=0)
 
 
 class OperationResolutionBody(BaseModel):
@@ -459,36 +470,62 @@ def create_app(
 
     async def scheduled_provider(slot):
         with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT a.phone,a.auth_state,a.lifecycle,p.id AS ip_id,p.address FROM accounts a JOIN ip_assignments ia ON ia.account_id=a.id "
                 "JOIN server_ips p ON p.id=ia.ip_id WHERE a.id=? AND p.enabled=1 AND p.available=1",
                 (slot["account_id"],),
             ).fetchone()
-        if row is not None and (row["auth_state"] != "authenticated" or row["lifecycle"] != "active"):
-            raise DispatchPaused("account_reauthentication_required", blocked=True)
-        if row is None or not allowed_address(row["address"]) or row["address"] not in host_addresses():
+            if row is not None and (row["auth_state"] != "authenticated" or row["lifecycle"] != "active"):
+                raise DispatchPaused("account_reauthentication_required", blocked=True)
+            if row is None or not allowed_address(row["address"]):
+                raise DispatchPaused("ip_assignment_unavailable", blocked=True)
+            proxy = assigned_or_allocate_proxy(connection, slot["account_id"], row["ip_id"])
+            if proxy is None:
+                raise DispatchPaused("send_proxy_required", blocked=True)
+            if not proxy["enabled"] or proxy["ip_id"] != row["ip_id"]:
+                raise DispatchPaused("send_proxy_unavailable", blocked=True)
+            connection.commit()
+        if row["address"] not in host_addresses():
             raise DispatchPaused("ip_assignment_unavailable", blocked=True)
+        try:
+            proxy_url = SecretBox().decrypt(proxy["url_ciphertext"])
+        except ValueError:
+            raise DispatchPaused("send_proxy_config_invalid", blocked=True) from None
         vault = session_vault_for(slot["account_id"])
         lock = account_session_locks.for_account(slot["account_id"])
         await lock.acquire()
         adapter = None
         try:
-            def require_same_ip() -> None:
+            def require_same_route() -> None:
+                if row["address"] not in host_addresses():
+                    raise DispatchPaused("ip_assignment_changed")
                 with db() as connection:
                     current = connection.execute(
-                        "SELECT ia.ip_id,p.address,p.enabled,p.available,a.lifecycle FROM ip_assignments ia "
-                        "JOIN server_ips p ON p.id=ia.ip_id JOIN accounts a ON a.id=ia.account_id WHERE ia.account_id=?",
+                        "SELECT ia.ip_id,p.address,p.enabled,p.available,a.lifecycle,a.auth_state,"
+                        "sp.id AS proxy_id,sp.ip_id AS proxy_ip_id,sp.enabled AS proxy_enabled FROM ip_assignments ia "
+                        "JOIN server_ips p ON p.id=ia.ip_id JOIN accounts a ON a.id=ia.account_id "
+                        "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id "
+                        "LEFT JOIN send_proxies sp ON sp.id=sa.proxy_id WHERE ia.account_id=?",
                         (slot["account_id"],),
                     ).fetchone()
                 if (current is None or current["lifecycle"] != "active" or not current["enabled"] or not current["available"]
-                        or int(current["ip_id"]) != int(row["ip_id"]) or current["address"] != row["address"]
-                        or row["address"] not in host_addresses()):
+                        or int(current["ip_id"]) != int(row["ip_id"]) or current["address"] != row["address"]):
                     raise DispatchPaused("ip_assignment_changed")
+                if current["auth_state"] != "authenticated":
+                    raise DispatchPaused("account_reauthentication_required", blocked=True)
+                if current["proxy_id"] != proxy["id"]:
+                    raise DispatchPaused("send_proxy_changed")
+                if not current["proxy_enabled"] or current["proxy_ip_id"] != row["ip_id"]:
+                    raise DispatchPaused("send_proxy_unavailable", blocked=True)
 
-            require_same_ip()
-            adapter = PyMaxAdapter.create(phone=row["phone"], source_ip=row["address"], session_vault=vault, before_network_action=require_same_ip)
+            require_same_route()
+            adapter = PyMaxAdapter.create(
+                phone=row["phone"], source_ip=row["address"], session_vault=vault,
+                send_proxy_url=proxy_url, before_network_action=require_same_route,
+            )
             await adapter.connect()
-            require_same_ip()
+            require_same_route()
             return LockedAdapter(adapter, lock, int(row["ip_id"]), row["address"])
         except BaseException as exc:
             if isinstance(exc, Exception) and PyMaxAdapter.is_invalid_saved_session_error(exc):
@@ -748,18 +785,23 @@ def create_app(
             }
             settings = dict(connection.execute("SELECT key,value FROM settings").fetchall())
             active_groups = connection.execute("SELECT COUNT(*) FROM groups WHERE active=1").fetchone()[0]
-            ready_accounts = connection.execute(
-                "SELECT COUNT(*) FROM accounts a JOIN groups g ON g.id=a.group_id "
-                "JOIN ip_assignments ia ON ia.account_id=a.id JOIN server_ips p ON p.id=ia.ip_id "
+            readiness = connection.execute(
+                "SELECT COUNT(*) AS ready_accounts,COUNT(CASE WHEN EXISTS (SELECT 1 FROM send_proxies sp "
+                "WHERE sp.ip_id=i.ip_id AND sp.enabled=1 AND (sa.proxy_id IS NULL OR sp.id=sa.proxy_id)) "
+                "THEN 1 END) AS routed_accounts FROM accounts a JOIN groups g ON g.id=a.group_id "
+                "JOIN ip_assignments i ON i.account_id=a.id JOIN server_ips p ON p.id=i.ip_id "
+                "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id "
                 "WHERE a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL AND p.enabled=1 AND p.available=1"
-            ).fetchone()[0]
+            ).fetchone()
         stopped = settings.get("global_stop") == "1"
         if stopped:
             wait_reason = "Работа сейчас остановлена. Запустите её кнопкой вверху панели."
         elif not active_groups:
             wait_reason = "Нет включённых групп. Запуск не отправит сообщения, пока группу не включат."
-        elif not ready_accounts:
+        elif not readiness["ready_accounts"]:
             wait_reason = "Нет подключённых аккаунтов с проверенной группой и доступным IP VDS."
+        elif not readiness["routed_accounts"]:
+            wait_reason = "У подключённых аккаунтов нет включённых SOCKS5 для отправки."
         else:
             from zoneinfo import ZoneInfo
             now = datetime.now(ZoneInfo(settings.get("timezone", "Europe/Moscow")))
@@ -912,6 +954,49 @@ def create_app(
         with db() as connection:
             rows = refresh_ips(connection)
         return rows
+
+    @app.get("/api/ips/{ip_id}/send-proxies")
+    def list_send_proxies(ip_id: int, _session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
+        with db() as connection:
+            rows = connection.execute(
+                "SELECT p.id,p.enabled,COUNT(a.id) AS assigned_count FROM send_proxies p "
+                "LEFT JOIN send_proxy_assignments s ON s.proxy_id=p.id "
+                "LEFT JOIN accounts a ON a.id=s.account_id AND a.lifecycle='active' "
+                "WHERE p.ip_id=? GROUP BY p.id ORDER BY p.id", (ip_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @app.post("/api/ips/{ip_id}/send-proxies", status_code=201)
+    def add_send_proxies(ip_id: int, body: ProxyPoolBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, int | list[int]]:
+        try:
+            urls = [normalize_proxy_url(url) for url in body.urls]
+        except ValueError:
+            raise HTTPException(422, "invalid_send_proxy") from None
+        box = SecretBox()
+        fingerprints = [digest_token(f"send-proxy:{url}") for url in urls]
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            ip = connection.execute("SELECT address FROM server_ips WHERE id=?", (ip_id,)).fetchone()
+            if ip is None or not allowed_address(ip["address"]):
+                raise HTTPException(404, "ip_not_found")
+            added = connection.executemany(
+                "INSERT INTO send_proxies(ip_id,url_ciphertext,url_fingerprint,enabled) VALUES(?,?,?,?) "
+                "ON CONFLICT(ip_id,url_fingerprint) DO NOTHING",
+                [(ip_id, box.encrypt(url), fingerprint, int(body.enabled)) for url, fingerprint in zip(urls, fingerprints, strict=True)],
+            ).rowcount
+            ids = dict(connection.execute("SELECT url_fingerprint,id FROM send_proxies WHERE ip_id=?", (ip_id,)).fetchall())
+            connection.commit()
+        return {"added": added, "duplicates": len(urls) - added, "proxy_ids": [ids[fingerprint] for fingerprint in fingerprints]}
+
+    @app.patch("/api/ips/{ip_id}/send-proxies/{proxy_id}")
+    async def set_send_proxy_state(ip_id: int, proxy_id: int, body: IPStateBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
+        with db() as connection:
+            changed = connection.execute(
+                "UPDATE send_proxies SET enabled=? WHERE id=? AND ip_id=?", (int(body.enabled), proxy_id, ip_id),
+            ).rowcount
+            if not changed:
+                raise HTTPException(404, "send_proxy_not_found")
+        return {"enabled": body.enabled}
 
     @app.patch("/api/ips/{ip_id}")
     def set_ip_state(ip_id: int, body: IPStateBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
@@ -1295,12 +1380,16 @@ def create_app(
             if not adapter.persist_session_snapshot():
                 raise RuntimeError("auth_session_not_saved")
             with db() as connection:
+                connection.execute("BEGIN IMMEDIATE")
                 saved = connection.execute(
                     "UPDATE accounts SET auth_state='authenticated',ever_authenticated=1,max_user_id=? WHERE id=? AND status='pending' AND lifecycle='active'",
                     (max_user_id, runtime["account_id"]),
                 )
                 if saved.rowcount != 1:
                     raise RuntimeError("account_deletion_incomplete")
+                if assigned_ip(connection, runtime["account_id"]) == (runtime["ip_id"], runtime["source_ip"]):
+                    assigned_or_allocate_proxy(connection, runtime["account_id"], runtime["ip_id"])
+                connection.commit()
             record_onboarding_event(
                 attempt_id=session_id, group_id=runtime["group_id"], account_id=runtime["account_id"],
                 ip_id=runtime["ip_id"], stage="authentication", result="authenticated",
@@ -1720,16 +1809,56 @@ def create_app(
             week_start = monday_of(datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date()).isoformat()
             rows = connection.execute(
                 "SELECT a.id,a.full_name,a.status,a.auth_state,a.lifecycle,a.ever_authenticated,a.send_weekday,ia.ip_id,p.address AS ip_address,p.enabled AS ip_enabled,p.available AS ip_available,"
+                "sp.id AS send_proxy_id,sp.enabled AS send_proxy_enabled,"
                 "s.scheduled_date,s.status AS slot_status,s.error_code,"
                 "(SELECT os.state FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_state,"
                 "(SELECT os.error_code FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_error "
                 "FROM accounts a "
                 "LEFT JOIN ip_assignments ia ON ia.account_id=a.id LEFT JOIN server_ips p ON p.id=ia.ip_id "
+                "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id LEFT JOIN send_proxies sp ON sp.id=sa.proxy_id "
                 "LEFT JOIN weekly_slots s ON s.account_id=a.id AND s.week_start=? "
                 "WHERE a.group_id=? AND a.lifecycle<>'deleted' ORDER BY a.id",
                 (week_start, group_id),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    @app.put("/api/accounts/{account_id}/send-proxy")
+    async def reassign_send_proxy(account_id: int, body: ProxyAssignmentBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, int]:
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT i.ip_id,a.group_id,(SELECT value FROM settings WHERE key='timezone') AS timezone "
+                "FROM accounts a JOIN ip_assignments i ON i.account_id=a.id "
+                "WHERE a.id=? AND a.lifecycle='active' AND a.auth_state='authenticated'", (account_id,),
+            ).fetchone()
+            if current is None:
+                raise HTTPException(409, "send_proxy_account_unavailable")
+            proxy = connection.execute(
+                "SELECT url_ciphertext FROM send_proxies WHERE id=? AND ip_id=? AND enabled=1", (body.proxy_id, current["ip_id"]),
+            ).fetchone()
+            if proxy is None:
+                raise HTTPException(409, "send_proxy_unavailable")
+            try:
+                SecretBox().decrypt(proxy["url_ciphertext"])
+            except ValueError:
+                raise HTTPException(409, "send_proxy_config_invalid") from None
+            connection.execute(
+                "INSERT INTO send_proxy_assignments(account_id,proxy_id) VALUES(?,?) "
+                "ON CONFLICT(account_id) DO UPDATE SET proxy_id=excluded.proxy_id,assigned_at=CURRENT_TIMESTAMP",
+                (account_id, body.proxy_id),
+            )
+            today = datetime.now(ZoneInfo(current["timezone"] or "Europe/Moscow")).date().isoformat()
+            connection.execute(
+                "UPDATE weekly_slots SET status=CASE WHEN scheduled_date<? THEN 'missed' ELSE 'queued' END,"
+                "error_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE account_id=? AND status='blocked' "
+                "AND error_code='send_proxy_config_invalid'", (today, account_id),
+            )
+            connection.execute(
+                "INSERT INTO audit_log(created_at,kind,group_id,account_id,detail) VALUES(CURRENT_TIMESTAMP,'send_proxy_reassigned',?,?,?)",
+                (current["group_id"], account_id, "{}"),
+            )
+            connection.commit()
+        return {"proxy_id": body.proxy_id}
 
     @app.delete("/api/accounts/{account_id}")
     async def delete_account(account_id: int, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
@@ -1924,6 +2053,10 @@ def create_app(
                 connection.rollback()
                 raise HTTPException(422, "ip_unavailable")
             connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?) ON CONFLICT(account_id) DO UPDATE SET ip_id=excluded.ip_id,assigned_at=CURRENT_TIMESTAMP", (account_id, body.ip_id))
+            connection.execute(
+                "DELETE FROM send_proxy_assignments WHERE account_id=? AND proxy_id IN "
+                "(SELECT id FROM send_proxies WHERE ip_id<>?)", (account_id, body.ip_id),
+            )
             timezone_row = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
             from zoneinfo import ZoneInfo
             today = datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date().isoformat()

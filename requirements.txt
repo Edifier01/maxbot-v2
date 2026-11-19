@@ -1,6 +1,7 @@
 fastapi==0.141.1
 uvicorn[standard]==0.40.0
 maxapi-python==2.5.0
+python-socks[asyncio]==3.2.2
 cryptography==46.0.3
 bcrypt==5.0.0
 python-multipart==0.0.20

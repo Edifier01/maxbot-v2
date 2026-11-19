@@ -13,6 +13,7 @@ from .db import connect
 from .planning import prepare_week
 from .sender import DispatchPaused, KnownPreSendFailure, Sender
 from .egress import host_addresses, allowed_address
+from .send_proxies import resume_proxy_blocked_slots
 
 
 logger = logging.getLogger(__name__)
@@ -129,6 +130,7 @@ class GroupWorkerManager:
                 tz = ZoneInfo(setting.get("timezone", "Europe/Moscow"))
                 now = datetime.now(tz)
                 today = now.date()
+                resume_proxy_blocked_slots(db, group_id, today)
                 db.execute("UPDATE weekly_slots SET status='missed',updated_at=? WHERE group_id=? AND status='queued' AND scheduled_date<?", (datetime.now(timezone.utc).isoformat(), group_id, today.isoformat()))
                 if not _inside_window(now, setting):
                     await self.sleep(self.poll_seconds)

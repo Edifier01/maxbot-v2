@@ -86,6 +86,67 @@ def test_legacy_ip_is_rejected_before_opening_session(tmp_path):
     assert not vault.work_path.exists()
 
 
+def test_external_proxy_address_normalization_is_idempotent():
+    from maxbot_v2.send_proxies import normalize_proxy_url
+
+    credential = "!" * 180
+    url = f"socks5://{credential}:{credential}@8.8.4.4:1080"
+    canonical = normalize_proxy_url(url)
+    assert normalize_proxy_url(canonical) == canonical
+    for address in ["62.109.10.109.", "127.0.0.1.", "224.0.0.2"]:
+        with pytest.raises(ValueError, match="invalid_send_proxy"):
+            normalize_proxy_url(f"socks5://{address}:1080")
+    with pytest.raises(ValueError, match="invalid_send_proxy"):
+        normalize_proxy_url("socks5://sample:%C3%A9@8.8.4.4:1080")
+
+
+def test_external_proxy_connects_from_assigned_ip_and_keeps_tls_for_max(tmp_path, monkeypatch):
+    from python_socks.async_.asyncio import Proxy
+
+    vault = EncryptedSessionFile(22, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
+    address = "62.109.20.186"
+    url = "socks5://sample-user:sample-password@8.8.4.4:1080"
+    with pytest.raises(AdapterUnavailable):
+        PyMaxAdapter.create(phone="+70000000000", source_ip=address, session_vault=vault, code_provider=object(), send_proxy_url=url)
+
+    class FakeSocket:
+        def getsockname(self):
+            return address, 12345
+
+        def get_extra_info(self, name):
+            return self.getsockname() if name == "sockname" else None
+
+    sock = FakeSocket()
+    calls = []
+
+    async def tunnel(self, **kwargs):
+        calls.append(kwargs)
+        return sock
+
+    async def wrap_tls(*args, **kwargs):
+        assert not args
+        assert kwargs["sock"] is sock
+        assert kwargs["ssl"] is not None
+        assert kwargs["server_hostname"] == calls[0]["dest_host"]
+        return object(), sock
+
+    monkeypatch.setattr(Proxy, "connect", tunnel)
+    monkeypatch.setattr(asyncio, "open_connection", wrap_tls)
+    adapter = PyMaxAdapter.create(phone="+70000000000", source_ip=address, session_vault=vault, send_proxy_url=url)
+    transport = adapter.client._build_connection().transport
+    asyncio.run(transport.connect())
+    assert len(calls) == 1
+    assert calls[0]["local_addr"] == (address, 0)
+    assert calls[0]["dest_port"] == 443
+
+    async def unavailable(self, **kwargs):
+        raise OSError("synthetic proxy failure")
+
+    monkeypatch.setattr(Proxy, "connect", unavailable)
+    with pytest.raises(OSError, match="synthetic proxy failure"):
+        asyncio.run(adapter.client._build_connection().transport.connect())
+
+
 def test_bound_transport_checks_current_account_route_before_each_write(tmp_path, monkeypatch):
     from maxbot_v2.crypto import SecretBox
     from maxbot_v2.max_adapter import PyMaxAdapter
