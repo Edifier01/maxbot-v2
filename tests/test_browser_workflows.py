@@ -4,6 +4,7 @@ import socket
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from urllib.request import urlopen
@@ -12,6 +13,7 @@ import bcrypt
 import pytest
 from pymax.auth.sms import SmsAuthFlow
 from pymax.exceptions import ApiError
+from pymax.protocol.enums import Opcode
 
 playwright = pytest.importorskip("playwright.sync_api")
 from playwright.sync_api import Page, expect
@@ -19,6 +21,7 @@ from playwright.sync_api import Page, expect
 from maxbot_v2.app import create_app
 from maxbot_v2.crypto import SecretBox
 from maxbot_v2.db import connect
+from maxbot_v2.max_adapter import PyMaxAdapter
 from maxbot_v2.message_pool import replace_message_pool
 from maxbot_v2.scheduling import SCHEDULE_TZ, create_weekly_slot, monday_of
 
@@ -52,12 +55,15 @@ def fake_pymax(monkeypatch):
             accepted = password == "correct-two-factor"
             password_attempts.append(accepted)
             if not accepted:
-                raise ApiError(opcode=18, error="wrong_password")
+                raise ApiError(opcode=Opcode.AUTH_LOGIN_CHECK_PASSWORD, error="login.cred", message="FAIL_WRONG_PASSWORD")
             return SimpleNamespace(error=None, login_token="fixture-login-token")
 
     class FakeAdapter:
-        def __init__(self, phone, code_provider, password_provider, session_vault):
+        def __init__(self, phone, code_provider, password_provider, session_vault, cloud_password_result):
             self.auth_flow = SmsAuthFlow(code_provider, password_provider) if code_provider is not None else None
+            self.auth = FakeAuth()
+            if cloud_password_result is not None:
+                self.auth.check_password = PyMaxAdapter.observe_cloud_password(self.auth.check_password, cloud_password_result)
             self.session_vault = session_vault
             self.client = SimpleNamespace(me=SimpleNamespace(contact=SimpleNamespace(id=314159)))
             self.phone = phone
@@ -66,7 +72,7 @@ def fake_pymax(monkeypatch):
         async def connect(self):
             if self.auth_flow is not None:
                 app = SimpleNamespace(
-                    api=SimpleNamespace(auth=FakeAuth()),
+                    api=SimpleNamespace(auth=self.auth),
                     config=SimpleNamespace(phone=self.phone, registration_config=None, password_max_attempts=5),
                 )
                 await self.auth_flow.authenticate(app)
@@ -100,10 +106,11 @@ def fake_pymax(monkeypatch):
         async def close(self):
             self.session_vault.seal()
 
-    monkeypatch.setattr(
-        "maxbot_v2.app.PyMaxAdapter.create",
-        classmethod(lambda _cls, *, phone, code_provider=None, password_provider=None, session_vault, **_kwargs: FakeAdapter(phone, code_provider, password_provider, session_vault)),
-    )
+    def create_adapter(_cls, *, phone, code_provider=None, password_provider=None, session_vault,
+                       cloud_password_result=None, **_kwargs):
+        return FakeAdapter(phone, code_provider, password_provider, session_vault, cloud_password_result)
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(create_adapter))
     return SimpleNamespace(code_requests=code_requests, joined_requests=joined_requests, memberships=memberships, join_should_fail=join_should_fail, resolve_should_fail=resolve_should_fail, auth_error=auth_error, password_attempts=password_attempts)
 
 
@@ -510,6 +517,43 @@ def test_guest_2fa_retries_wrong_password_without_requesting_a_new_otp(page: Pag
 
     assert len(local_app.code_requests) == 1
     assert local_app.password_attempts == [False, True]
+    with closing(connect(local_app.app.state.database)) as connection:
+        assert connection.execute("SELECT count(*) FROM cloud_password_failures").fetchone()[0] == 0
+
+
+def test_guest_is_locked_after_two_rejected_cloud_passwords(page: Page, browser, local_app):
+    local_app.auth_error["value"] = "password_challenge"
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и IP").click()
+    page.get_by_label("Название", exact=True).fill("Двухфакторная группа")
+    page.get_by_label("Ссылка MAX").fill("https://max.ru/join/password-lockout")
+    page.get_by_role("button", name="Добавить", exact=True).click()
+    invite = page.locator(".invite-link a").get_attribute("href")
+    guest = browser.new_page(viewport={"width": 390, "height": 844})
+
+    def start(phone):
+        guest.get_by_label("ФИО").fill("Тестовый пользователь")
+        guest.get_by_label("Телефон").fill(phone)
+        guest.get_by_role("button", name="Начать подключение").click()
+
+    guest.goto(invite)
+    start("+79990000000")
+    guest.get_by_label("Код").fill("123456")
+    guest.get_by_role("button", name="Проверить код").click()
+    guest.get_by_label("Пароль").fill("first-wrong-password")
+    guest.get_by_label("Пароль").press("Enter")
+    expect(guest.locator("#password-hint")).to_contain_text("не принял предыдущий облачный пароль")
+    guest.get_by_label("Пароль").fill("second-wrong-password")
+    guest.get_by_label("Пароль").press("Enter")
+    expect(guest.locator("#flow")).to_contain_text("заблокировано на 24 часа")
+    expect(guest.get_by_role("button", name="Повторить подключение")).to_have_count(0)
+    assert page_has_no_overflow(guest)
+
+    guest.reload()
+    start("8 (999) 000-00-00")
+    expect(guest.locator("#start-error")).to_contain_text("заблокировано на 24 часа")
+    assert local_app.code_requests == [("+79990000000", "62.109.20.186")]
+    assert local_app.password_attempts == [False, False]
 
 
 def test_guest_can_cancel_an_authorization_attempt(page: Page, browser, local_app):

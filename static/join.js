@@ -22,6 +22,7 @@ const errors = {
   onboarding_rate_limited: 'Слишком много попыток. Подождите и попробуйте позже.',
   code_rate_limited: 'Слишком много попыток ввода кода. Подождите и попробуйте позже.',
   password_rate_limited: 'Слишком много попыток ввода пароля. Подождите и попробуйте позже.',
+  cloud_password_locked: 'Подключение номера заблокировано на 24 часа после двух неверных облачных паролей MAX.',
   invalid_code: 'Введите код MAX из 4–8 цифр.',
   invalid_password: 'Введите пароль для входа MAX.',
   network_timeout: 'Не удалось получить ответ от MAX. Проверьте сеть и назначенный IP.',
@@ -244,7 +245,9 @@ async function poll() {
       terminalMessage('Номер подключён. Можно закрыть страницу.');
       return;
     } else if (data.state === 'failed' || data.state === 'expired' || data.state === 'cancelled') {
-      const reason = data.hint || errors[data.error] || 'Подключение не завершилось. Попросите владельца группы проверить состояние.';
+      const reason = data.error === 'cloud_password_locked' && data.retryable
+        ? 'Срок блокировки истёк. Начните подключение заново.'
+        : data.hint || errors[data.error] || 'Подключение не завершилось. Попросите владельца группы проверить состояние.';
       clearSession();
       terminalMessage(reason, { error: data.state !== 'cancelled', retryable: data.retryable });
       return;

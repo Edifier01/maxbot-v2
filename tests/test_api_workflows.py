@@ -1,4 +1,5 @@
 import asyncio
+import os
 import threading
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -13,7 +14,9 @@ from fastapi.testclient import TestClient
 from maxbot_v2.app import create_app
 from maxbot_v2.crypto import SecretBox
 from maxbot_v2.db import connect
+from maxbot_v2.lifecycle import phone_fingerprint
 from maxbot_v2.message_pool import replace_message_pool
+from maxbot_v2.onboarding import record_cloud_password_failure
 from maxbot_v2.scheduling import SCHEDULE_TZ, create_weekly_slot, monday_of
 from maxbot_v2.security import digest_token
 
@@ -1794,6 +1797,80 @@ def test_every_restart_starts_stopped_even_with_legacy_autostart_on(tmp_path, mo
         assert overview["stopped"] is True
         assert client.post("/api/run/start", headers=headers, json={}).json()["stopped"] is False
         assert client.get("/api/overview").json()["stopped"] is False
+
+
+def test_password_lockout_is_shared_across_invites_and_expires_after_restart(tmp_path, monkeypatch):
+    from maxbot_v2.egress import bootstrap_ips
+
+    owner, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    groups = []
+    tokens = []
+    for name in ("Первая группа", "Вторая группа"):
+        group = owner.post("/api/groups", headers=headers, json={"name": name, "invite_link": "https://max.ru/join/test"})
+        assert group.status_code == 201
+        groups.append(group.json()["id"])
+        link = owner.post(f"/api/groups/{groups[-1]}/onboarding-link", headers=headers, json={}).json()["url"]
+        tokens.append(link.rsplit("/", 1)[1])
+
+    database = owner.app.state.database
+    fingerprint = phone_fingerprint("+79990000000", os.environ["DATA_ENCRYPTION_KEY"])
+    with closing(connect(database)) as connection:
+        assert not record_cloud_password_failure(connection, fingerprint, 1_000_000.0)
+    locked_at = 1_001_800.0
+    with closing(connect(database)) as connection:
+        assert record_cloud_password_failure(connection, fingerprint, locked_at)
+
+    clock = SimpleNamespace(time=lambda: locked_at)
+    monkeypatch.setattr("maxbot_v2.app.time", clock)
+    max_requests = []
+
+    def stop_before_network(_cls, *, phone, **_kwargs):
+        max_requests.append(phone)
+        raise RuntimeError("fixture stops before network")
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(stop_before_network))
+    monkeypatch.setattr("maxbot_v2.app.bootstrap_ips", lambda db: bootstrap_ips(db, addresses={"62.109.20.186"}, probe=lambda _address: True))
+    restarted = create_app(db_path=database, data_dir=owner.app.state.data_dir,
+                           secret_key="unit-test-app-secret-key-with-32-chars", secure_cookies=False)
+    restarted.state.worker_manager.poll_seconds = 0.05
+    with TestClient(restarted, base_url="https://test.local", client=("192.0.2.50", 10000)) as guest:
+        for token, number in zip(tokens, ("+79990000000", "8 999 000-00-00"), strict=True):
+            response = guest.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Fixture", "phone": number})
+            assert response.status_code == 429
+            assert response.json() == {"detail": "cloud_password_locked"}
+            assert response.headers["Retry-After"] == "86400"
+        assert max_requests == []
+        with closing(connect(database)) as connection:
+            assert connection.execute("SELECT count(*) FROM accounts").fetchone()[0] == 0
+            assert connection.execute("SELECT count(*) FROM onboarding_sessions").fetchone()[0] == 0
+            pending = connection.execute(
+                "INSERT INTO accounts(group_id,phone,full_name,lifecycle,deletion_reason,phone_fingerprint) "
+                "VALUES(?,'+79990000000','Fixture','delete_pending','failed_attempt',?)",
+                (groups[0], fingerprint),
+            ).lastrowid
+
+        pending_reply = guest.post(f"/api/public/onboarding/{tokens[0]}/start", json={"full_name": "Fixture", "phone": "+79990000000"})
+        assert pending_reply.status_code == 429
+        with closing(connect(database)) as connection:
+            assert connection.execute("SELECT lifecycle FROM accounts WHERE id=?", (pending,)).fetchone()[0] == "delete_pending"
+            connection.execute(
+                "UPDATE accounts SET lifecycle='deleted',phone='deleted:'||id,full_name='' WHERE id=?",
+                (pending,),
+            )
+
+        other = guest.post(f"/api/public/onboarding/{tokens[1]}/start", json={"full_name": "Fixture", "phone": "+79990000001"})
+        assert other.status_code == 200, other.text
+        clock.time = lambda: locked_at + 86399.875
+        still_locked = guest.post(f"/api/public/onboarding/{tokens[1]}/start", json={"full_name": "Fixture", "phone": "+79990000000"})
+        assert still_locked.status_code == 429
+        assert still_locked.headers["Retry-After"] == "1"
+        clock.time = lambda: locked_at + 86400
+        allowed = guest.post(f"/api/public/onboarding/{tokens[0]}/start", json={"full_name": "Fixture", "phone": "+79990000000"})
+        assert allowed.status_code == 200, allowed.text
+
+    with closing(connect(database)) as connection:
+        assert not record_cloud_password_failure(connection, fingerprint, clock.time())
 
 
 def test_api_log_sorts_sqlite_and_iso_timestamps_chronologically(tmp_path, monkeypatch):
