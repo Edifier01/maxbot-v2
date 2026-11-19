@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import sqlite3
 import uuid
-from datetime import date, datetime, time, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Callable, Any
-from zoneinfo import ZoneInfo
 
 from .db import connect
 from .planning import prepare_week
@@ -15,6 +13,7 @@ from .sender import DispatchPaused, KnownPreSendFailure, Sender
 from .egress import host_addresses, allowed_address
 from .send_proxies import resume_proxy_blocked_slots
 from .chat_queue import chat_dispatch_wait
+from .scheduling import SCHEDULE_TZ, SEND_DAY_PAIRS, dispatch_quota_reason
 
 
 logger = logging.getLogger(__name__)
@@ -22,12 +21,11 @@ logger = logging.getLogger(__name__)
 
 class GroupWorkerManager:
     """One asyncio worker task per active group, plus one central planner."""
-    def __init__(self, db_path, provider_factory: Callable[[sqlite3.Row], Any], *, poll_seconds: float = 20, sleep=asyncio.sleep, rng=None):
+    def __init__(self, db_path, provider_factory: Callable[[sqlite3.Row], Any], *, poll_seconds: float = 20, sleep=asyncio.sleep):
         self.db_path = db_path
         self.provider_factory = provider_factory
         self.poll_seconds = poll_seconds
         self.sleep = sleep
-        self.rng = rng or random.SystemRandom()
         self.tasks: dict[int, asyncio.Task] = {}
         self.worker_id = uuid.uuid4().hex
         self.planner: asyncio.Task | None = None
@@ -72,9 +70,7 @@ class GroupWorkerManager:
 
     @staticmethod
     def _prepare(db: sqlite3.Connection) -> None:
-        setting = dict(db.execute("SELECT key,value FROM settings WHERE key IN ('timezone')").fetchall())
-        tz = ZoneInfo(setting.get("timezone", "Europe/Moscow"))
-        prepare_week(db, datetime.now(tz).date())
+        prepare_week(db, datetime.now(SCHEDULE_TZ).date())
 
     async def _sync_group_workers(self) -> None:
         db = connect(self.db_path)
@@ -124,31 +120,28 @@ class GroupWorkerManager:
                 continue
             db = connect(self.db_path)
             try:
-                setting = dict(db.execute("SELECT key,value FROM settings").fetchall())
-                if setting.get("global_stop") == "1":
+                if _sending_stopped(db):
                     await self.sleep(self.poll_seconds)
                     continue
-                tz = ZoneInfo(setting.get("timezone", "Europe/Moscow"))
-                now = datetime.now(tz)
-                today = now.date()
+                today = datetime.now(SCHEDULE_TZ).date()
                 resume_proxy_blocked_slots(db, group_id, today)
                 db.execute("UPDATE weekly_slots SET status='missed',updated_at=? WHERE group_id=? AND status='queued' AND scheduled_date<?", (datetime.now(timezone.utc).isoformat(), group_id, today.isoformat()))
-                if not _inside_window(now, setting):
+                if today.weekday() == 6:
                     await self.sleep(self.poll_seconds)
                     continue
                 slots = db.execute(
                     "SELECT s.*,a.phone,a.id AS account_id,g.chat_id FROM weekly_slots s JOIN accounts a ON a.id=s.account_id "
                     "JOIN groups g ON g.id=s.group_id WHERE s.group_id=? AND s.scheduled_date=? AND s.status='queued' "
-                    "AND a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL ORDER BY s.id",
-                    (group_id, today.isoformat()),
+                    "AND a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' "
+                    "AND a.send_day_pair=? AND g.active=1 AND g.chat_id IS NOT NULL ORDER BY s.id",
+                    (group_id, today.isoformat(), today.weekday() % len(SEND_DAY_PAIRS)),
                 ).fetchall()
                 for slot in slots:
                     if self._stopping.is_set():
                         return
                     if not self._claim_lease(group_id):
                         break
-                    current = dict(db.execute("SELECT key,value FROM settings WHERE key IN ('global_stop','timezone')").fetchall())
-                    if current.get("global_stop") == "1":
+                    if _sending_stopped(db):
                         break
                     provider = _RetriedConnectionProvider(
                         self.provider_factory,
@@ -161,25 +154,14 @@ class GroupWorkerManager:
                     result = await Sender(db, provider, sleep=self.sleep).send_slot(slot["slot_id"], chat_id=int(slot["chat_id"]))
                     if result in {"chat_waiting", "destination_changed"}:
                         break
-                    delay_min = max(5, int(setting.get("delay_min_sec", 5)))
-                    delay_max = max(delay_min, int(setting.get("delay_max_sec", 15)))
-                    await self.sleep(self.rng.randint(delay_min, delay_max))
             finally:
                 db.close()
             await self.sleep(self.poll_seconds)
 
 
-def _inside_window(now: datetime, settings: dict[str, str]) -> bool:
-    raw = settings["send_windows_weekday"] if now.weekday() < 5 else settings["send_windows_weekend"]
-    current = now.time().replace(tzinfo=None)
-    for interval in raw.split(","):
-        try:
-            start, end = (time.fromisoformat(part.strip()) for part in interval.split("-", maxsplit=1))
-        except (ValueError, TypeError):
-            return False
-        if start <= current < end:
-            return True
-    return False
+def _sending_stopped(db: sqlite3.Connection) -> bool:
+    setting = db.execute("SELECT value FROM settings WHERE key='global_stop'").fetchone()
+    return setting is None or setting[0] != "0"
 
 
 def _dispatch_block(
@@ -190,16 +172,18 @@ def _dispatch_block(
     expected_address: str | None = None,
     available_hosts: set[str] | None = None,
 ) -> DispatchPaused | None:
-    settings = dict(db.execute("SELECT key,value FROM settings WHERE key IN ('global_stop','timezone','send_windows_weekday','send_windows_weekend')").fetchall())
-    if settings.get("global_stop") == "1":
+    if _sending_stopped(db):
         return DispatchPaused("run_stopped")
     group = db.execute("SELECT active,chat_id FROM groups WHERE id=?", (slot["group_id"],)).fetchone()
     account = db.execute(
-        "SELECT a.status,a.auth_state,a.lifecycle,ia.ip_id,p.address,p.enabled,p.available FROM accounts a LEFT JOIN ip_assignments ia ON ia.account_id=a.id "
+        "SELECT a.status,a.auth_state,a.lifecycle,a.send_day_pair,a.phone_fingerprint,ia.ip_id,p.address,p.enabled,p.available "
+        "FROM accounts a LEFT JOIN ip_assignments ia ON ia.account_id=a.id "
         "LEFT JOIN server_ips p ON p.id=ia.ip_id WHERE a.id=?",
         (slot["account_id"],),
     ).fetchone()
-    current_slot = db.execute("SELECT status,scheduled_date FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],)).fetchone()
+    current_slot = db.execute(
+        "SELECT slot_id,account_id,status,week_start,scheduled_date FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],),
+    ).fetchone()
     if group is None or not group["active"] or str(group["chat_id"] or "") != str(slot["chat_id"]):
         return DispatchPaused("group_destination_changed")
     if account is None or account["status"] != "active" or account["lifecycle"] != "active":
@@ -216,9 +200,14 @@ def _dispatch_block(
         return DispatchPaused("ip_assignment_changed")
     if current_slot is None or current_slot["status"] != "in_flight":
         return DispatchPaused("slot_no_longer_queued")
-    now = datetime.now(ZoneInfo(settings.get("timezone", "Europe/Moscow")))
-    if current_slot["scheduled_date"] != now.date().isoformat() or not _inside_window(now, settings):
-        return DispatchPaused("outside_send_window")
+    now = datetime.now(SCHEDULE_TZ)
+    pair = account["send_day_pair"]
+    if (current_slot["scheduled_date"] != now.date().isoformat()
+            or pair is None or now.weekday() not in SEND_DAY_PAIRS[pair]):
+        return DispatchPaused("outside_send_day")
+    quota_reason = dispatch_quota_reason(db, current_slot, account["phone_fingerprint"])
+    if quota_reason is not None:
+        return DispatchPaused(quota_reason, blocked=True)
     wait_reason = chat_dispatch_wait(db, str(slot["chat_id"]), now, current_slot_id=slot["slot_id"])
     if wait_reason is not None:
         return DispatchPaused(wait_reason)

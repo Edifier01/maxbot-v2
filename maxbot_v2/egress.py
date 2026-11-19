@@ -8,7 +8,7 @@ import socket
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from .scheduling import SCHEDULE_TZ
 
 
 LEGACY_MAX_IP = "62.109.10.109"
@@ -68,8 +68,7 @@ def refresh_ips(connection: sqlite3.Connection, *, addresses: set[str] | None = 
         "WHERE p.enabled=0 OR p.available=0)",
         (now,),
     )
-    tzrow = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
-    today = datetime.now(ZoneInfo(tzrow[0] if tzrow else "Europe/Moscow")).date().isoformat()
+    today = datetime.now(SCHEDULE_TZ).date().isoformat()
     connection.execute(
         "UPDATE weekly_slots SET status=CASE WHEN scheduled_date>=? THEN 'queued' ELSE 'missed' END,"
         "error_code=NULL,updated_at=? WHERE status='blocked' AND error_code='ip_assignment_unavailable' "
