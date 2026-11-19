@@ -59,6 +59,20 @@ CREATE TABLE IF NOT EXISTS ip_assignments (
     ip_id INTEGER NOT NULL REFERENCES server_ips(id),
     assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS send_proxies (
+    id INTEGER PRIMARY KEY,
+    ip_id INTEGER NOT NULL REFERENCES server_ips(id),
+    url_ciphertext TEXT NOT NULL,
+    url_fingerprint TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    UNIQUE(ip_id, url_fingerprint)
+);
+CREATE TABLE IF NOT EXISTS send_proxy_assignments (
+    account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    proxy_id INTEGER NOT NULL REFERENCES send_proxies(id),
+    assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_send_proxy_assignments_proxy ON send_proxy_assignments(proxy_id);
 CREATE TABLE IF NOT EXISTS owner_sessions (
     token_hash TEXT PRIMARY KEY,
     csrf_hash TEXT NOT NULL,
