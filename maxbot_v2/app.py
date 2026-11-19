@@ -31,6 +31,7 @@ from .egress import assign_ip, assigned_ip, bootstrap_ips, enable_ip, host_addre
 from .session_vault import EncryptedSessionFile
 from .workers import GroupWorkerManager, _inside_window
 from .sender import DispatchPaused, recover_in_flight
+from .chat_queue import DEFAULT_CHAT_PAUSE_SECONDS
 from .send_proxies import assigned_or_allocate_proxy, normalize_proxy_url
 from .session_lock import AccountSessionLocks
 from .lifecycle import phone_fingerprint
@@ -71,6 +72,12 @@ class GroupBody(BaseModel):
 
 class GroupUpdateBody(GroupBody):
     pass
+
+
+class ChatDispatchPolicyBody(BaseModel):
+    chat_id: str = Field(min_length=1, max_length=40)
+    pause_seconds: int = Field(ge=0, le=86400)
+    daily_limit: int = Field(ge=0, le=2147483647)
 
 
 class RunBody(BaseModel):
@@ -819,6 +826,7 @@ def create_app(
         with db() as connection:
             rows = connection.execute(
                 "SELECT g.id,g.name,g.invite_link,g.chat_id,g.active,"
+                "COALESCE(cp.pause_seconds,?) AS chat_pause_seconds,COALESCE(cp.daily_limit,0) AS chat_daily_limit,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.ever_authenticated=1 THEN a.id END) account_count,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' THEN a.id END) connected_account_count,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state='authenticated' THEN a.id END) authenticated_account_count,"
@@ -838,10 +846,32 @@ def create_app(
                 "SELECT 1 FROM ip_assignments ia JOIN server_ips assigned_ip ON assigned_ip.id=ia.ip_id "
                 "WHERE ia.account_id=a.id AND assigned_ip.enabled=1 AND assigned_ip.available=1) THEN a.id END) verifiable_account_count "
                 "FROM groups g LEFT JOIN accounts a ON a.group_id=g.id AND a.lifecycle<>'deleted' "
+                "LEFT JOIN chat_dispatch_policies cp ON cp.chat_id=g.chat_id "
                 "GROUP BY g.id ORDER BY g.id",
-                (now, now, now, now),
+                (DEFAULT_CHAT_PAUSE_SECONDS, now, now, now, now),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    @app.put("/api/groups/{group_id}/chat-dispatch-policy")
+    async def set_chat_dispatch_policy(group_id: int, body: ChatDispatchPolicyBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            group = connection.execute("SELECT chat_id FROM groups WHERE id=?", (group_id,)).fetchone()
+            if group is None:
+                raise HTTPException(404, "group_not_found")
+            if group["chat_id"] != body.chat_id:
+                raise HTTPException(409, "group_destination_changed_during_verification")
+            connection.execute(
+                "INSERT INTO chat_dispatch_policies(chat_id,pause_seconds,daily_limit) VALUES(?,?,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET pause_seconds=excluded.pause_seconds,daily_limit=excluded.daily_limit",
+                (body.chat_id, body.pause_seconds, body.daily_limit),
+            )
+            connection.execute(
+                "INSERT INTO audit_log(created_at,kind,group_id,detail) VALUES(CURRENT_TIMESTAMP,'chat_dispatch_policy_updated',?,'{}')",
+                (group_id,),
+            )
+            connection.commit()
+        return body.model_dump()
 
     @app.get("/api/groups/{group_id}/onboarding-link")
     def get_onboarding_link(group_id: int, request: Request, response: Response, _session: sqlite3.Row = Depends(current_session)) -> dict[str, object]:

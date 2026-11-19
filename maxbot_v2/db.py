@@ -148,6 +148,11 @@ CREATE TABLE IF NOT EXISTS weekly_slots (
     UNIQUE(account_id, week_start)
 );
 CREATE INDEX IF NOT EXISTS idx_weekly_due ON weekly_slots(group_id, scheduled_date, status);
+CREATE TABLE IF NOT EXISTS chat_dispatch_policies (
+    chat_id TEXT PRIMARY KEY,
+    pause_seconds INTEGER NOT NULL CHECK(pause_seconds >= 0),
+    daily_limit INTEGER NOT NULL CHECK(daily_limit >= 0)
+);
 CREATE TABLE IF NOT EXISTS group_worker_leases (
     group_id INTEGER PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,
     owner_id TEXT NOT NULL,
@@ -159,6 +164,7 @@ CREATE TABLE IF NOT EXISTS operations (
     slot_id TEXT NOT NULL REFERENCES weekly_slots(slot_id),
     account_id INTEGER NOT NULL REFERENCES accounts(id),
     group_id INTEGER NOT NULL REFERENCES groups(id),
+    destination_chat_id TEXT,
     status TEXT NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT,
@@ -249,6 +255,19 @@ def initialize(connection: sqlite3.Connection) -> None:
     ip_columns = {row[1] for row in connection.execute("PRAGMA table_info(server_ips)")}
     if "last_assigned_at" not in ip_columns:
         connection.execute("ALTER TABLE server_ips ADD COLUMN last_assigned_at TEXT")
+    operation_columns = {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
+    if "destination_chat_id" not in operation_columns:
+        connection.execute("ALTER TABLE operations ADD COLUMN destination_chat_id TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_in_flight ON operations(destination_chat_id) "
+        "WHERE destination_chat_id IS NOT NULL AND status='in_flight'"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_daily_operations ON operations(destination_chat_id,status,started_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_pause_operations ON operations(destination_chat_id,status,finished_at)"
+    )
     connection.execute(
         "UPDATE onboarding_sessions SET phone=NULL,full_name=NULL WHERE state IN "
         "('completed','failed','expired','cancelled')"

@@ -57,6 +57,37 @@ def test_group_invite_and_message_pool_are_owner_scoped(tmp_path, monkeypatch):
     assert client.put("/api/messages", headers=headers, json={"texts": ["same", "same"]}).status_code == 422
 
 
+def test_two_signup_groups_share_dispatch_policy_but_keep_links_and_names(tmp_path, monkeypatch):
+    from maxbot_v2.onboarding import attach_group_on_first_account
+
+    client, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    group_ids = [client.post(
+        "/api/groups", headers=headers, json={"name": name, "invite_link": "https://max.ru/join/campaign"},
+    ).json()["id"] for name in ("Команда А", "Команда Б", "Другая группа")]
+    links = [client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"] for group_id in group_ids]
+    assert len(set(links)) == 3
+    connection = connect(client.app.state.database)
+    try:
+        for group_id, target, name in zip(group_ids, ("100", "100", "200"), ("Анна Фамилия", "Борис Фамилия", "Ирина Фамилия"), strict=True):
+            attach_group_on_first_account(connection, group_id, target)
+            connection.execute(
+                "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,?,?,'active','authenticated')",
+                (group_id, f"+7000000000{group_id}", name),
+            )
+    finally:
+        connection.close()
+
+    endpoint = f"/api/groups/{group_ids[0]}/chat-dispatch-policy"
+    policy = {"chat_id": "100", "pause_seconds": 45, "daily_limit": 3}
+    assert client.put(endpoint, json=policy).status_code == 403
+    assert client.put(endpoint, headers=headers, json={**policy, "chat_id": "200"}).status_code == 409
+    assert client.put(endpoint, headers=headers, json=policy).json() == policy
+    groups = {row["id"]: row for row in client.get("/api/groups").json()}
+    assert [(groups[group_id]["chat_pause_seconds"], groups[group_id]["chat_daily_limit"]) for group_id in group_ids] == [(45, 3), (45, 3), (15, 0)]
+    assert [client.get(f"/api/groups/{group_id}/accounts").json()[0]["full_name"] for group_id in group_ids[:2]] == ["Анна Фамилия", "Борис Фамилия"]
+
+
 def test_reopening_onboarding_link_returns_the_existing_group_link(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}

@@ -14,6 +14,7 @@ from .planning import prepare_week
 from .sender import DispatchPaused, KnownPreSendFailure, Sender
 from .egress import host_addresses, allowed_address
 from .send_proxies import resume_proxy_blocked_slots
+from .chat_queue import chat_dispatch_wait
 
 
 logger = logging.getLogger(__name__)
@@ -138,7 +139,7 @@ class GroupWorkerManager:
                 slots = db.execute(
                     "SELECT s.*,a.phone,a.id AS account_id,g.chat_id FROM weekly_slots s JOIN accounts a ON a.id=s.account_id "
                     "JOIN groups g ON g.id=s.group_id WHERE s.group_id=? AND s.scheduled_date=? AND s.status='queued' "
-                    "AND a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL ORDER BY a.id",
+                    "AND a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL ORDER BY s.id",
                     (group_id, today.isoformat()),
                 ).fetchall()
                 for slot in slots:
@@ -157,7 +158,9 @@ class GroupWorkerManager:
                             expected_address=getattr(connected, "address", None),
                         ),
                     )
-                    await Sender(db, provider, sleep=self.sleep).send_slot(slot["slot_id"], chat_id=int(slot["chat_id"]))
+                    result = await Sender(db, provider, sleep=self.sleep).send_slot(slot["slot_id"], chat_id=int(slot["chat_id"]))
+                    if result == "chat_waiting":
+                        break
                     delay_min = max(5, int(setting.get("delay_min_sec", 5)))
                     delay_max = max(delay_min, int(setting.get("delay_max_sec", 15)))
                     await self.sleep(self.rng.randint(delay_min, delay_max))
@@ -213,6 +216,9 @@ def _dispatch_block(
     now = datetime.now(ZoneInfo(settings.get("timezone", "Europe/Moscow")))
     if current_slot["scheduled_date"] != now.date().isoformat() or not _inside_window(now, settings):
         return DispatchPaused("outside_send_window")
+    wait_reason = chat_dispatch_wait(db, str(slot["chat_id"]), now, current_slot_id=slot["slot_id"])
+    if wait_reason is not None:
+        return DispatchPaused(wait_reason)
     return None
 
 

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
+from .chat_queue import chat_dispatch_wait, earlier_queued_slot
+
 
 class Provider(Protocol):
     async def send_message(self, *, chat_id: int, text: str): ...
@@ -38,7 +40,8 @@ class Sender:
         self.sleep = sleep
 
     async def send_slot(self, slot_id: str, *, chat_id: int, now: datetime | None = None) -> str:
-        stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
+        clock = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        stamp = clock.isoformat()
         self.db.execute("BEGIN IMMEDIATE")
         slot = self.db.execute("SELECT * FROM weekly_slots WHERE slot_id=?", (slot_id,)).fetchone()
         if slot is None:
@@ -70,12 +73,22 @@ class Sender:
             self.db.execute("UPDATE weekly_slots SET status='blocked',error_code='weekly_limit_reached',updated_at=? WHERE slot_id=?", (stamp, slot_id))
             self.db.commit()
             return "blocked"
+        wait_reason = chat_dispatch_wait(self.db, str(chat_id), clock)
+        if wait_reason is None and earlier_queued_slot(self.db, slot, str(chat_id)):
+            wait_reason = "chat_queue_turn"
+        if wait_reason is not None:
+            self.db.execute(
+                "UPDATE weekly_slots SET error_code=?,updated_at=? WHERE slot_id=? AND error_code IS NOT ?",
+                (wait_reason, stamp, slot_id, wait_reason),
+            )
+            self.db.commit()
+            return "chat_waiting"
         operation_id = f"op-{uuid.uuid4().hex}"
         self.db.execute(
-            "INSERT INTO operations(operation_id,slot_id,account_id,group_id,status,started_at) VALUES(?,?,?,?,?,?)",
-            (operation_id, slot_id, slot["account_id"], slot["group_id"], "in_flight", stamp),
+            "INSERT INTO operations(operation_id,slot_id,account_id,group_id,destination_chat_id,status,started_at) VALUES(?,?,?,?,?,?,?)",
+            (operation_id, slot_id, slot["account_id"], slot["group_id"], str(chat_id), "in_flight", stamp),
         )
-        self.db.execute("UPDATE weekly_slots SET status='in_flight',updated_at=? WHERE slot_id=?", (stamp, slot_id))
+        self.db.execute("UPDATE weekly_slots SET status='in_flight',error_code=NULL,updated_at=? WHERE slot_id=?", (stamp, slot_id))
         self.db.commit()
 
         safe_before_next_attempt = False
