@@ -4,6 +4,7 @@ import socket
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from urllib.request import urlopen
 
@@ -18,6 +19,8 @@ from playwright.sync_api import Page, expect
 from maxbot_v2.app import create_app
 from maxbot_v2.crypto import SecretBox
 from maxbot_v2.db import connect
+from maxbot_v2.message_pool import replace_message_pool
+from maxbot_v2.scheduling import SCHEDULE_TZ, create_weekly_slot, monday_of
 
 
 @pytest.fixture
@@ -166,37 +169,53 @@ def login(page: Page, local_app):
 
 
 @pytest.mark.parametrize("width", [390, 768, 1440])
-def test_shared_chat_rules_and_separate_signup_names(page: Page, local_app, width):
+def test_fixed_schedule_and_separate_signup_names(page: Page, local_app, width):
     connection = connect(local_app.app.state.database)
     try:
-        for number, group, person in ((1, "Первая команда", "Анна Первая"), (2, "Вторая команда", "Борис Второй")):
+        account_ids = []
+        for pair, (group, person) in enumerate((("Первая команда", "Анна Первая"), ("Вторая команда", "Борис Второй"))):
             group_id = connection.execute(
                 "INSERT INTO groups(name,invite_link,chat_id) VALUES(?,'https://max.ru/join/fixture','7001')", (group,),
             ).lastrowid
-            connection.execute(
-                "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,?,?,'active','authenticated')",
-                (group_id, f"+7000000000{number}", person),
+            account_ids.append(connection.execute(
+                "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,ever_authenticated,send_day_pair) "
+                "VALUES(?,?,?,'active','authenticated',1,?)", (group_id, f"+7000000000{pair}", person, pair),
+            ).lastrowid)
+        version = replace_message_pool(connection, ["fixture"])
+        monday = monday_of(datetime.now(SCHEDULE_TZ).date())
+        for position in (1, 2):
+            slot = create_weekly_slot(
+                connection, account_id=account_ids[0], week_start=monday.isoformat(),
+                scheduled_date=monday.isoformat(), day_position=position, text="fixture", message_version_id=version,
             )
+            connection.execute("UPDATE weekly_slots SET status=? WHERE slot_id=?", ("accepted" if position == 1 else "unknown", slot["slot_id"]))
+        create_weekly_slot(
+            connection, account_id=account_ids[0], week_start=monday.isoformat(),
+            scheduled_date=(monday + timedelta(days=3)).isoformat(), text="fixture", message_version_id=version,
+        )
     finally:
         connection.close()
+
     page.set_viewport_size({"width": width, "height": 900})
     login(page, local_app)
+    expect(page.get_by_text("По 5 сообщений в каждый назначенный день", exact=False)).to_be_visible()
+    expect(page.get_by_text("В воскресенье отправок нет", exact=False)).to_be_visible()
+    expect(page.get_by_role("button", name="Настройки", exact=True)).to_have_count(0)
     page.get_by_role("button", name="Группы, номера и IP").click()
     first = page.locator(".group-card").filter(has_text="Первая команда")
     second = page.locator(".group-card").filter(has_text="Вторая команда")
     for card in (first, second):
-        card.get_by_text("Правила отправки в чат MAX", exact=True).press("Enter")
-        expect(card.get_by_label("Пауза между отправками, сек")).to_have_value("15")
-    first.get_by_label("Пауза между отправками, сек").fill("45")
-    first.get_by_label("Лимит сообщений в день").fill("3")
-    first.get_by_role("button", name="Сохранить правила чата").press("Enter")
-    expect(second.get_by_label("Пауза между отправками, сек")).to_have_value("45")
-    expect(second.get_by_label("Лимит сообщений в день")).to_have_value("3")
-    for card in (first, second):
-        card.get_by_role("button", name="Номера", exact=True).click()
-    expect(first).to_contain_text("Анна Первая")
+        expect(card.get_by_text("Правила отправки в чат MAX", exact=True)).to_have_count(0)
+        card.get_by_role("button", name="Номера", exact=True).press("Enter")
+    expect(first.get_by_text("Анна Первая", exact=True)).to_have_count(1)
     expect(second).to_contain_text("Борис Второй")
     expect(first).not_to_contain_text("Борис Второй")
+    expect(first.get_by_text("Пн и Чт", exact=True)).to_be_visible()
+    expect(second.get_by_text("Вт и Пт", exact=True)).to_be_visible()
+    expect(first.get_by_text("1 из 5 отправлено", exact=True)).to_be_visible()
+    expect(first.get_by_text("Неизвестный результат", exact=False)).to_be_visible()
+    expect(first.get_by_text("0 из 5 отправлено", exact=True)).to_be_visible()
+    expect(second.get_by_text("Слоты ещё не созданы", exact=True)).to_have_count(2)
     assert page_has_no_overflow(page)
 
 
@@ -356,17 +375,21 @@ def test_owner_login_navigation_and_run_controls_at_supported_widths(page: Page,
     login(page, local_app)
 
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
-    assert page.get_by_role("button", name="Остановить").is_enabled()
-    page.get_by_role("button", name="Остановить").focus()
-    page.keyboard.press("Enter")
+    run_toggle = page.locator("#run-toggle")
     expect(page.locator("#run-state")).to_have_text("Остановлено")
-    page.get_by_role("button", name="Запустить").click()
+    expect(run_toggle).to_have_text("Запустить")
+    run_toggle.focus()
+    page.keyboard.press("Enter")
     expect(page.locator("#run-state")).to_have_text("Работа сейчас включена")
+    expect(page.locator("#view")).to_contain_text("Нет включённых групп")
+    expect(run_toggle).to_have_text("Остановить")
+    run_toggle.press("Enter")
+    expect(page.locator("#run-state")).to_have_text("Остановлено")
+    expect(page.locator("#view")).to_contain_text("Работа сейчас остановлена")
 
     for name, heading in (
         ("Группы, номера и IP", "Группы, номера и IP"),
         ("Пул сообщений", "Пул сообщений"),
-        ("Настройки", "Настройки"),
         ("Журнал", "Журнал"),
         ("Обзор", "Обзор"),
     ):
@@ -385,11 +408,6 @@ def test_owner_login_navigation_and_run_controls_at_supported_widths(page: Page,
     page.locator("#texts").fill("Первый тестовый текст\nВторой тестовый текст")
     page.get_by_role("button", name="Сохранить новый цикл").click()
     expect(page.locator("#view")).to_contain_text("2 текстов")
-
-    page.get_by_role("button", name="Настройки").click()
-    expect(page.locator("#view")).to_contain_text("Часовой пояс и окна применяются к ближайшей отправке")
-    page.get_by_role("button", name="Сохранить", exact=True).click()
-    expect(page.locator("#notice")).to_have_text("Настройки сохранены")
 
 
 def test_guest_connect_survives_reload_and_verifies_membership(page: Page, browser, local_app):

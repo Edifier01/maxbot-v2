@@ -13,7 +13,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Iterator, Literal
 from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
 from fastapi.exceptions import RequestValidationError
@@ -29,9 +28,9 @@ from .onboarding import WebAuthProviders, attach_group_on_first_account, join_gr
 from .max_adapter import PyMaxAdapter
 from .egress import assign_ip, assigned_ip, bootstrap_ips, enable_ip, host_addresses, refresh_ips, allowed_address
 from .session_vault import EncryptedSessionFile
-from .workers import GroupWorkerManager, _dispatch_block, _inside_window
+from .scheduling import SCHEDULE_TZ, SEND_DAY_PAIRS, monday_of
+from .workers import GroupWorkerManager, _dispatch_block
 from .sender import DispatchPaused, recover_in_flight
-from .chat_queue import DEFAULT_CHAT_PAUSE_SECONDS
 from .send_proxies import assigned_or_allocate_proxy, normalize_proxy_url
 from .session_lock import AccountSessionLocks
 from .lifecycle import phone_fingerprint
@@ -74,27 +73,12 @@ class GroupUpdateBody(GroupBody):
     pass
 
 
-class ChatDispatchPolicyBody(BaseModel):
-    chat_id: str = Field(min_length=1, max_length=40)
-    pause_seconds: int = Field(ge=0, le=86400)
-    daily_limit: int = Field(ge=0, le=2147483647)
-
-
 class RunBody(BaseModel):
     enabled: bool
 
 
 class TextsBody(BaseModel):
     texts: list[str] = Field(min_length=1, max_length=5000)
-
-
-class SettingsBody(BaseModel):
-    timezone: str = Field(min_length=1, max_length=64)
-    send_windows_weekday: str = Field(min_length=1, max_length=100)
-    send_windows_weekend: str = Field(min_length=1, max_length=100)
-    delay_min_sec: int = Field(ge=5, le=300)
-    delay_max_sec: int = Field(ge=5, le=300)
-    auto_run: bool
 
 
 class IPStateBody(BaseModel):
@@ -567,9 +551,7 @@ def create_app(
             bootstrap_ips(connection)
             recover_in_flight(connection)
             connection.execute("UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=?,phone=NULL,full_name=NULL WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership')", (datetime.now(timezone.utc).isoformat(),))
-            settings = dict(connection.execute("SELECT key,value FROM settings WHERE key IN ('auto_run','global_stop')").fetchall())
-            if settings.get("auto_run") != "1":
-                connection.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
+            connection.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
             pending_deletions = [(int(row[0]), row[1] or "owner_requested") for row in connection.execute("SELECT id,deletion_reason FROM accounts WHERE lifecycle='delete_pending'")]
             interrupted_attempts = [
                 (str(row[0]), int(row[1])) for row in connection.execute(
@@ -802,7 +784,7 @@ def create_app(
                     "'waiting_password','verifying_password','joining_group') AND s.expires_at>?", (now,),
                 ).fetchone()[0],
             }
-            settings = dict(connection.execute("SELECT key,value FROM settings").fetchall())
+            stopped = connection.execute("SELECT value FROM settings WHERE key='global_stop'").fetchone()[0] == "1"
             active_groups = connection.execute("SELECT COUNT(*) FROM groups WHERE active=1").fetchone()[0]
             readiness = connection.execute(
                 "SELECT COUNT(*) AS ready_accounts,COUNT(CASE WHEN EXISTS (SELECT 1 FROM send_proxies sp "
@@ -812,7 +794,6 @@ def create_app(
                 "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id "
                 "WHERE a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL AND p.enabled=1 AND p.available=1"
             ).fetchone()
-        stopped = settings.get("global_stop") == "1"
         if stopped:
             wait_reason = "Работа сейчас остановлена. Запустите её кнопкой вверху панели."
         elif not active_groups:
@@ -821,13 +802,12 @@ def create_app(
             wait_reason = "Нет подключённых аккаунтов с проверенной группой и доступным IP VDS."
         elif not readiness["routed_accounts"]:
             wait_reason = "У подключённых аккаунтов нет проверенных и включённых SOCKS5 для отправки."
+        elif datetime.now(SCHEDULE_TZ).weekday() == 6:
+            wait_reason = "Работа включена. В воскресенье отправок нет."
         else:
-            from zoneinfo import ZoneInfo
-            now = datetime.now(ZoneInfo(settings.get("timezone", "Europe/Moscow")))
-            wait_reason = "Ожидание разрешённого окна отправки." if not _inside_window(now, settings) else "Работа включена; сообщения ждут назначенного дня и окна."
+            wait_reason = "Работа включена. Отправки выполняются в назначенные дни по московскому времени."
         return {
             "counts": counts,
-            "auto_run": settings.get("auto_run") == "1",
             "stopped": stopped,
             "run_wait_reason": wait_reason,
         }
@@ -838,7 +818,6 @@ def create_app(
         with db() as connection:
             rows = connection.execute(
                 "SELECT g.id,g.name,g.invite_link,g.chat_id,g.active,"
-                "COALESCE(cp.pause_seconds,?) AS chat_pause_seconds,COALESCE(cp.daily_limit,0) AS chat_daily_limit,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.ever_authenticated=1 THEN a.id END) account_count,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' THEN a.id END) connected_account_count,"
                 "COUNT(DISTINCT CASE WHEN a.lifecycle='active' AND a.auth_state='authenticated' THEN a.id END) authenticated_account_count,"
@@ -858,32 +837,10 @@ def create_app(
                 "SELECT 1 FROM ip_assignments ia JOIN server_ips assigned_ip ON assigned_ip.id=ia.ip_id "
                 "WHERE ia.account_id=a.id AND assigned_ip.enabled=1 AND assigned_ip.available=1) THEN a.id END) verifiable_account_count "
                 "FROM groups g LEFT JOIN accounts a ON a.group_id=g.id AND a.lifecycle<>'deleted' "
-                "LEFT JOIN chat_dispatch_policies cp ON cp.chat_id=g.chat_id "
                 "GROUP BY g.id ORDER BY g.id",
-                (DEFAULT_CHAT_PAUSE_SECONDS, now, now, now, now),
+                (now, now, now, now),
             ).fetchall()
         return [dict(row) for row in rows]
-
-    @app.put("/api/groups/{group_id}/chat-dispatch-policy")
-    async def set_chat_dispatch_policy(group_id: int, body: ChatDispatchPolicyBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, object]:
-        with db() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            group = connection.execute("SELECT chat_id FROM groups WHERE id=?", (group_id,)).fetchone()
-            if group is None:
-                raise HTTPException(404, "group_not_found")
-            if group["chat_id"] != body.chat_id:
-                raise HTTPException(409, "group_destination_changed_during_verification")
-            connection.execute(
-                "INSERT INTO chat_dispatch_policies(chat_id,pause_seconds,daily_limit) VALUES(?,?,?) "
-                "ON CONFLICT(chat_id) DO UPDATE SET pause_seconds=excluded.pause_seconds,daily_limit=excluded.daily_limit",
-                (body.chat_id, body.pause_seconds, body.daily_limit),
-            )
-            connection.execute(
-                "INSERT INTO audit_log(created_at,kind,group_id,detail) VALUES(CURRENT_TIMESTAMP,'chat_dispatch_policy_updated',?,'{}')",
-                (group_id,),
-            )
-            connection.commit()
-        return body.model_dump()
 
     @app.get("/api/groups/{group_id}/onboarding-link")
     def get_onboarding_link(group_id: int, request: Request, response: Response, _session: sqlite3.Row = Depends(current_session)) -> dict[str, object]:
@@ -1117,9 +1074,7 @@ def create_app(
                     (datetime.now(timezone.utc).isoformat(), ip_id),
                 )
             else:
-                from zoneinfo import ZoneInfo
-                tzrow = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
-                today = datetime.now(ZoneInfo(tzrow[0] if tzrow else "Europe/Moscow")).date().isoformat()
+                today = datetime.now(SCHEDULE_TZ).date().isoformat()
                 connection.execute(
                     "UPDATE weekly_slots SET status=CASE WHEN scheduled_date>=? THEN 'queued' ELSE 'missed' END,"
                     "error_code=NULL,updated_at=? WHERE account_id IN "
@@ -1145,28 +1100,6 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
         return {"version": version, "count": len(body.texts)}
-
-    @app.get("/api/settings")
-    def settings(_session: sqlite3.Row = Depends(current_session)) -> dict[str, object]:
-        with db() as connection:
-            values = dict(connection.execute("SELECT key,value FROM settings").fetchall())
-        return {"timezone": values["timezone"], "send_windows_weekday": values["send_windows_weekday"], "send_windows_weekend": values["send_windows_weekend"], "delay_min_sec": int(values["delay_min_sec"]), "delay_max_sec": int(values["delay_max_sec"]), "auto_run": values["auto_run"] == "1", "global_stop": values["global_stop"] == "1"}
-
-    @app.put("/api/settings")
-    async def update_settings(body: SettingsBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
-        if body.delay_max_sec < body.delay_min_sec:
-            raise HTTPException(422, "invalid_delay_range")
-        try:
-            from zoneinfo import ZoneInfo
-            ZoneInfo(body.timezone)
-            _validate_windows(body.send_windows_weekday)
-            _validate_windows(body.send_windows_weekend)
-        except Exception as exc:
-            raise HTTPException(422, "invalid_schedule_settings") from exc
-        values = {"timezone": body.timezone, "send_windows_weekday": body.send_windows_weekday, "send_windows_weekend": body.send_windows_weekend, "delay_min_sec": str(body.delay_min_sec), "delay_max_sec": str(body.delay_max_sec), "auto_run": "1" if body.auto_run else "0"}
-        with db() as connection:
-            connection.executemany("UPDATE settings SET value=? WHERE key=?", [(v, k) for k, v in values.items()])
-        return {"ok": True}
 
     @app.get("/api/log")
     def log(_session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
@@ -1216,10 +1149,7 @@ def create_app(
                 connection.execute("UPDATE operations SET status='accepted',finished_at=?,provider_message_id=?,error_code='manually_verified' WHERE operation_id=?", (now, message_id, operation_id))
                 connection.execute("UPDATE weekly_slots SET status='accepted',error_code=NULL,updated_at=? WHERE slot_id=?", (now, operation["slot_id"]))
             else:
-                tzrow = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
-                from zoneinfo import ZoneInfo
-                from datetime import datetime as dt
-                today = dt.now(ZoneInfo(tzrow[0] if tzrow else "Europe/Moscow")).date().isoformat()
+                today = datetime.now(SCHEDULE_TZ).date().isoformat()
                 next_status = "queued" if operation["scheduled_date"] >= today else "missed"
                 connection.execute("UPDATE operations SET status='rejected',finished_at=?,error_code='manually_confirmed_not_sent' WHERE operation_id=?", (now, operation_id))
                 connection.execute("UPDATE weekly_slots SET status=?,error_code='manually_confirmed_not_sent',updated_at=? WHERE slot_id=?", (next_status, now, operation["slot_id"]))
@@ -1905,32 +1835,50 @@ def create_app(
 
     @app.get("/api/groups/{group_id}/accounts")
     def list_accounts(group_id: int, _session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
+        monday = monday_of(datetime.now(SCHEDULE_TZ).date())
+        week_start = monday.isoformat()
+        saturday = (monday + timedelta(days=5)).isoformat()
         with db() as connection:
-            from zoneinfo import ZoneInfo
-            from .scheduling import monday_of
-            timezone_row = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
-            week_start = monday_of(datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date()).isoformat()
+            connection.execute("BEGIN")
             rows = connection.execute(
-                "SELECT a.id,a.full_name,a.status,a.auth_state,a.lifecycle,a.ever_authenticated,a.send_weekday,ia.ip_id,p.address AS ip_address,p.enabled AS ip_enabled,p.available AS ip_available,"
+                "SELECT a.id,a.full_name,a.status,a.auth_state,a.lifecycle,a.ever_authenticated,a.send_day_pair,"
+                "ia.ip_id,p.address AS ip_address,p.enabled AS ip_enabled,p.available AS ip_available,"
                 "sp.id AS send_proxy_id,sp.enabled AS send_proxy_enabled,sp.check_status AS send_proxy_check_status,"
-                "s.scheduled_date,s.status AS slot_status,s.error_code,"
                 "(SELECT os.state FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_state,"
                 "(SELECT os.error_code FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_error "
                 "FROM accounts a "
                 "LEFT JOIN ip_assignments ia ON ia.account_id=a.id LEFT JOIN server_ips p ON p.id=ia.ip_id "
                 "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id LEFT JOIN send_proxies sp ON sp.id=sa.proxy_id "
-                "LEFT JOIN weekly_slots s ON s.account_id=a.id AND s.week_start=? "
                 "WHERE a.group_id=? AND a.lifecycle<>'deleted' ORDER BY a.id",
-                (week_start, group_id),
+                (group_id,),
             ).fetchall()
-        return [dict(row) for row in rows]
+            slots = connection.execute(
+                "SELECT account_id,scheduled_date,day_position,status,error_code FROM weekly_slots "
+                "WHERE group_id=? AND scheduled_date BETWEEN ? AND ? AND week_start=? "
+                "ORDER BY scheduled_date,day_position",
+                (group_id, week_start, saturday, week_start),
+            ).fetchall()
+        slots_by_day: dict[tuple[int, str], list[dict[str, object]]] = {}
+        for slot in slots:
+            key = (slot["account_id"], slot["scheduled_date"])
+            slots_by_day.setdefault(key, []).append({
+                "day_position": slot["day_position"], "status": slot["status"], "error_code": slot["error_code"],
+            })
+        accounts = []
+        for row in rows:
+            pair = row["send_day_pair"]
+            dates = [] if pair is None else [(monday + timedelta(days=day)).isoformat() for day in SEND_DAY_PAIRS[pair]]
+            accounts.append({**dict(row), "send_days": [
+                {"scheduled_date": day, "slots": slots_by_day.get((row["id"], day), [])} for day in dates
+            ]})
+        return accounts
 
     @app.put("/api/accounts/{account_id}/send-proxy")
     async def reassign_send_proxy(account_id: int, body: ProxyAssignmentBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, int]:
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
-                "SELECT i.ip_id,a.group_id,(SELECT value FROM settings WHERE key='timezone') AS timezone "
+                "SELECT i.ip_id,a.group_id "
                 "FROM accounts a JOIN ip_assignments i ON i.account_id=a.id "
                 "WHERE a.id=? AND a.lifecycle='active' AND a.auth_state='authenticated'", (account_id,),
             ).fetchone()
@@ -1951,7 +1899,7 @@ def create_app(
                 "ON CONFLICT(account_id) DO UPDATE SET proxy_id=excluded.proxy_id,assigned_at=CURRENT_TIMESTAMP",
                 (account_id, body.proxy_id),
             )
-            today = datetime.now(ZoneInfo(current["timezone"] or "Europe/Moscow")).date().isoformat()
+            today = datetime.now(SCHEDULE_TZ).date().isoformat()
             connection.execute(
                 "UPDATE weekly_slots SET status=CASE WHEN scheduled_date<? THEN 'missed' ELSE 'queued' END,"
                 "error_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE account_id=? AND status='blocked' "
@@ -2128,11 +2076,9 @@ def create_app(
                     connection.rollback()
                     raise HTTPException(409, "account_assignment_changed_during_verification")
             connection.execute("UPDATE groups SET chat_id=? WHERE id=?", (chat_id, group_id))
+            today = datetime.now(SCHEDULE_TZ).date().isoformat()
             for account_id, joined in states.items():
                 connection.execute("UPDATE accounts SET auth_state='authenticated',status=? WHERE id=?", ("active" if joined else "needs_membership", account_id))
-                tzrow = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
-                from zoneinfo import ZoneInfo
-                today = datetime.now(ZoneInfo(tzrow[0] if tzrow else "Europe/Moscow")).date().isoformat()
                 next_status = "queued" if joined else "blocked"
                 connection.execute(
                     "UPDATE weekly_slots SET status=CASE WHEN scheduled_date>=? THEN ? ELSE 'missed' END,"
@@ -2161,9 +2107,7 @@ def create_app(
                 "DELETE FROM send_proxy_assignments WHERE account_id=? AND proxy_id IN "
                 "(SELECT id FROM send_proxies WHERE ip_id<>?)", (account_id, body.ip_id),
             )
-            timezone_row = connection.execute("SELECT value FROM settings WHERE key='timezone'").fetchone()
-            from zoneinfo import ZoneInfo
-            today = datetime.now(ZoneInfo(timezone_row[0] if timezone_row else "Europe/Moscow")).date().isoformat()
+            today = datetime.now(SCHEDULE_TZ).date().isoformat()
             connection.execute(
                 "UPDATE weekly_slots SET status=CASE WHEN scheduled_date>=? THEN 'queued' ELSE 'missed' END,"
                 "error_code=NULL,updated_at=? WHERE account_id=? AND status='blocked' AND error_code='ip_assignment_unavailable'",
@@ -2194,17 +2138,6 @@ def create_app(
             return FileResponse(static_dir / "index.html")
 
     return app
-
-
-def _validate_windows(value: str) -> None:
-    import re
-    intervals = [item.strip() for item in value.split(",")]
-    if not intervals or any(not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d-(?:[01]\d|2[0-3]):[0-5]\d", item) for item in intervals):
-        raise ValueError("invalid_window")
-    for item in intervals:
-        start, end = item.split("-")
-        if start >= end:
-            raise ValueError("invalid_window_order")
 
 
 def _require_same_origin(request: Request) -> None:
