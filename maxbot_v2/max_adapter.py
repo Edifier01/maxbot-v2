@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from importlib.metadata import version
 from ssl import SSLContext
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 from urllib.parse import unquote, urlsplit
 
 from .egress import allowed_address
@@ -22,6 +22,10 @@ SEND_PROXY_CONNECT_TIMEOUT = 7
 SOCKS5_AUTH_REJECTIONS = frozenset({
     "No acceptable authentication methods were offered",
     "Username and password authentication failure",
+})
+CLOUD_PASSWORD_REJECTIONS = frozenset({
+    "fail_wrong_password", "wrong_password", "incorrect_password", "invalid_password", "password_rejected",
+    "wrong password", "incorrect password", "invalid password", "неверный пароль", "неправильный пароль",
 })
 
 
@@ -162,6 +166,35 @@ class PyMaxAdapter:
             int(Opcode.CHAT_INFO): "check_membership",
         }.get(value)
 
+    @staticmethod
+    def observe_cloud_password(
+        check_password: Callable[[str, str], Awaitable[Any]], on_result: Callable[[bool], None],
+    ) -> Callable[[str, str], Awaitable[Any]]:
+        """Observe the credential verdict before SmsAuthFlow handles a retry."""
+        from pymax.exceptions import ApiError
+        from pymax.protocol.enums import Opcode
+
+        def rejected(*values: object) -> bool:
+            return any(
+                isinstance(value, str) and value.strip().rstrip(".!").casefold() in CLOUD_PASSWORD_REJECTIONS
+                for value in values
+            )
+
+        async def check(track_id: str, password: str):
+            try:
+                result = await check_password(track_id, password)
+            except ApiError as exc:
+                if exc.opcode == Opcode.AUTH_LOGIN_CHECK_PASSWORD and rejected(exc.error, exc.message, exc.localized_message):
+                    on_result(False)
+                raise
+            if rejected(result.error):
+                on_result(False)
+            elif not result.error and result.login_token:
+                on_result(True)
+            return result
+
+        return check
+
     @classmethod
     def create(
         cls, *, phone: str, source_ip: str, session_vault: EncryptedSessionFile | None = None,
@@ -169,6 +202,7 @@ class PyMaxAdapter:
         send_proxy_url: str | None = None,
         before_network_action: Callable[[], None] | None = None,
         diagnostic_callback: Callable[[str, str, int, bool, str | None], None] | None = None,
+        cloud_password_result: Callable[[bool], None] | None = None,
     ):
         if not allowed_address(source_ip):
             raise AdapterUnavailable("ip_assignment_required")
@@ -229,6 +263,13 @@ class PyMaxAdapter:
                 await super().send(data)
 
         class BoundClient(Client):
+            def _build_app(self):
+                app = super()._build_app()
+                if cloud_password_result is not None:
+                    auth = app.api.auth
+                    auth.check_password = cls.observe_cloud_password(auth.check_password, cloud_password_result)
+                return app
+
             def _build_connection(self):
                 transport = BoundTransport(
                     host=self.extra_config.host, port=self.extra_config.port,

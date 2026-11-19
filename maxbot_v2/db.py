@@ -107,6 +107,10 @@ CREATE TABLE IF NOT EXISTS auth_attempts (
     count INTEGER NOT NULL,
     window_start INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS cloud_password_failures (
+    phone_fingerprint TEXT NOT NULL PRIMARY KEY,
+    locked_until REAL
+);
 CREATE TABLE IF NOT EXISTS onboarding_invites (
     id INTEGER PRIMARY KEY,
     group_id INTEGER NOT NULL UNIQUE REFERENCES groups(id) ON DELETE CASCADE,

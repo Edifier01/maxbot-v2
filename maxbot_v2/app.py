@@ -24,7 +24,11 @@ from .db import connect, initialize
 from .security import digest_token as _digest_token, new_invite_token, new_token, password_matches
 from .crypto import SecretBox
 from .message_pool import replace_message_pool
-from .onboarding import WebAuthProviders, attach_group_on_first_account, join_group_and_confirm_membership, member_proof, normalize_russian_phone, prepare_account
+from .onboarding import (
+    CLOUD_PASSWORD_LOCKED, CloudPasswordLocked, WebAuthProviders, attach_group_on_first_account,
+    join_group_and_confirm_membership, member_proof, normalize_russian_phone,
+    password_lock_retry_after, prepare_account, record_cloud_password_failure,
+)
 from .max_adapter import PyMaxAdapter
 from .egress import assign_ip, assigned_ip, bootstrap_ips, enable_ip, host_addresses, refresh_ips, allowed_address
 from .session_vault import EncryptedSessionFile
@@ -632,8 +636,9 @@ def create_app(
     def guest_onboarding_session(token: str, session_id: str) -> dict[str, object]:
         with db() as connection:
             row = connection.execute(
-                "SELECT s.*,i.active AS invite_active,i.expires_at AS invite_expires_at,i.token_hash AS current_invite_hash "
-                "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id WHERE s.id=?",
+                "SELECT s.*,i.active AS invite_active,i.expires_at AS invite_expires_at,i.token_hash AS current_invite_hash,"
+                "a.phone_fingerprint AS account_fingerprint FROM onboarding_sessions s "
+                "JOIN onboarding_invites i ON i.id=s.invite_id LEFT JOIN accounts a ON a.id=s.account_id WHERE s.id=?",
                 (session_id,),
             ).fetchone()
             if row is None or row["token_hash"] != digest_token(token):
@@ -666,6 +671,10 @@ def create_app(
             result = dict(row)
             result["state"] = state
             result["error_code"] = error
+            retry_after = None
+            if error == CLOUD_PASSWORD_LOCKED and row["account_fingerprint"]:
+                retry_after = password_lock_retry_after(connection, row["account_fingerprint"], time.time())
+            result["retry_after_seconds"] = retry_after
             if row["state"] == "waiting_membership" and state == "waiting_membership":
                 result["expires_at"] = row["invite_expires_at"]
             active_invite = bool(row["invite_active"] and row["current_invite_hash"] == row["token_hash"] and row["invite_expires_at"] > datetime.now(timezone.utc).isoformat())
@@ -680,7 +689,7 @@ def create_app(
                 (row["invite_id"],),
             ).fetchone()
         has_capacity = bool(capacity and (capacity["max_uses"] is None or capacity["uses_count"] < capacity["max_uses"]))
-        result["retryable"] = bool(state in {"failed", "expired", "cancelled"} and active_invite and has_capacity)
+        result["retryable"] = bool(state in {"failed", "expired", "cancelled"} and active_invite and has_capacity and retry_after is None)
         return result
 
     def cancel_onboarding(session_id: str, state: str, reason: str) -> None:
@@ -1263,6 +1272,11 @@ def create_app(
         row = invite_row(None, token, require_capacity=False)
         return {"group": row["name"], "invite_link": row["invite_link"]}
 
+    def require_unlocked_number(connection: sqlite3.Connection, fingerprint: str) -> None:
+        retry_after = password_lock_retry_after(connection, fingerprint, time.time())
+        if retry_after is not None:
+            raise HTTPException(429, CLOUD_PASSWORD_LOCKED, headers={"Retry-After": str(retry_after)})
+
     @app.post("/api/public/onboarding/{token}/start")
     async def onboarding_start(token: str, request: Request) -> dict[str, str]:
         _require_same_origin(request)
@@ -1278,6 +1292,9 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(422, "invalid_russian_phone") from exc
         row = invite_row(None, token, require_capacity=False)
+        fingerprint = fingerprint_for(phone)
+        with db() as connection:
+            require_unlocked_number(connection, fingerprint)
         await clean_previous_unverified_attempt(phone, int(row["group_id"]))
         session_id = new_token(16)
         now = datetime.now(timezone.utc).isoformat()
@@ -1293,6 +1310,7 @@ def create_app(
                         or current_invite["token_hash"] != digest_token(token) or current_invite["expires_at"] <= now):
                     connection.rollback()
                     raise HTTPException(404, "invite_unavailable")
+                require_unlocked_number(connection, fingerprint)
                 expired_session_ids = [old[0] for old in connection.execute(
                     "SELECT id FROM onboarding_sessions WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership') AND expires_at<=?",
                     (now,),
@@ -1326,7 +1344,7 @@ def create_app(
                 reusable_membership_uses = 0
                 if existing is None:
                     account_id, ip_id = prepare_account(connection, group_id=row["group_id"], phone=phone, full_name=full_name)
-                    connection.execute("UPDATE accounts SET phone_fingerprint=? WHERE id=?", (fingerprint_for(phone), account_id))
+                    connection.execute("UPDATE accounts SET phone_fingerprint=? WHERE id=?", (fingerprint, account_id))
                 else:
                     if existing["lifecycle"] != "active":
                         connection.rollback()
@@ -1364,10 +1382,10 @@ def create_app(
                         )
                         connection.execute(
                             "UPDATE accounts SET full_name=?,phone=?,session_generation=?,auth_state='unverified',status='pending',phone_fingerprint=? WHERE id=?",
-                            (full_name, phone, int(existing["session_generation"]) + 1, fingerprint_for(phone), account_id),
+                            (full_name, phone, int(existing["session_generation"]) + 1, fingerprint, account_id),
                         )
                     else:
-                        connection.execute("UPDATE accounts SET full_name=?,phone=?,phone_fingerprint=COALESCE(phone_fingerprint,?) WHERE id=?", (full_name, phone, fingerprint_for(phone), account_id))
+                        connection.execute("UPDATE accounts SET full_name=?,phone=?,phone_fingerprint=COALESCE(phone_fingerprint,?) WHERE id=?", (full_name, phone, fingerprint, account_id))
                 invite_use_count = max(0, active_uses - reusable_membership_uses) + 1
                 if current_invite["max_uses"] is not None and invite_use_count > current_invite["max_uses"]:
                     connection.rollback()
@@ -1401,7 +1419,7 @@ def create_app(
             lambda state, hint: set_onboarding_state(session_id, state, hint),
             account_id=account_id, ip_id=ip_id, session_id=session_id,
         )
-        app.state.onboarding_flows[session_id] = {"flow": flow, "account_id": account_id, "ip_id": ip_id, "group_id": row["group_id"], "phone": phone, "source_ip": source_ip, "validate_ip": validate_onboarding_ip}
+        app.state.onboarding_flows[session_id] = {"flow": flow, "account_id": account_id, "ip_id": ip_id, "group_id": row["group_id"], "phone": phone, "phone_fingerprint": fingerprint, "source_ip": source_ip, "validate_ip": validate_onboarding_ip}
         task = asyncio.create_task(run_onboarding_auth(session_id, row["invite_link"]))
         if task is not None:
             app.state.onboarding_tasks[session_id] = task
@@ -1439,6 +1457,17 @@ def create_app(
                 duration_ms=duration_ms, response_received=response, error_class=error_class,
             )
 
+        def on_cloud_password_result(accepted: bool) -> None:
+            fingerprint = runtime["phone_fingerprint"]
+            with db() as connection:
+                if accepted:
+                    connection.execute(
+                        "DELETE FROM cloud_password_failures WHERE phone_fingerprint=? AND (locked_until IS NULL OR locked_until<=?)",
+                        (fingerprint, time.time()),
+                    )
+                elif record_cloud_password_failure(connection, fingerprint, time.time()):
+                    raise CloudPasswordLocked()
+
         def validate_target(expected_chat_id: str | None = None) -> None:
             runtime["validate_ip"]()
             with db() as connection:
@@ -1468,6 +1497,7 @@ def create_app(
                 code_provider=runtime["flow"], password_provider=runtime["flow"],
                 session_vault=vault, before_network_action=validate_target,
                 diagnostic_callback=diagnostic_callback,
+                cloud_password_result=on_cloud_password_result,
             )
             logger.info("onboarding_stage session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000))
             stage = "connect"
@@ -1589,6 +1619,7 @@ def create_app(
         except Exception as exc:
             waiting_for = getattr(runtime["flow"], "waiting_for", None)
             auth_stage = getattr(runtime["flow"], "current_stage", None)
+            password_locked = isinstance(exc, CloudPasswordLocked)
             if stage == "connect":
                 if auth_stage and auth_stage != "request_code":
                     stage = auth_stage
@@ -1596,6 +1627,8 @@ def create_app(
                     stage = last_diagnostic_stage
             if isinstance(exc, TimeoutError):
                 safe = f"{waiting_for}_entry_timeout" if waiting_for else "network_timeout"
+            elif password_locked:
+                safe = CLOUD_PASSWORD_LOCKED
             elif type(exc).__name__ == "ApiError" and getattr(exc, "error", None) == "error.profile.active.session.no2fa":
                 safe = "max_password_required_on_active_session"
             elif type(exc).__name__ == "ApiError" and auth_stage == "send_code":
@@ -1625,12 +1658,14 @@ def create_app(
                 else:
                     safe = "network_timeout"
             event_stage = str(auth_stage if auth_stage and auth_stage != "request_code" else (last_diagnostic_stage or stage))
-            event_result = "input_timeout" if isinstance(exc, TimeoutError) and auth_stage in {"wait_code_input", "wait_password_input"} else "failed"
+            event_result = "rejected" if password_locked else "failed"
+            if isinstance(exc, TimeoutError) and auth_stage in {"wait_code_input", "wait_password_input"}:
+                event_result = "input_timeout"
             record_onboarding_event(
                 attempt_id=session_id, group_id=runtime["group_id"], account_id=runtime["account_id"],
                 ip_id=runtime["ip_id"], stage=event_stage, result=event_result,
                 duration_ms=int((perf_counter() - stage_started) * 1000),
-                response_received=False, error_class=type(exc).__name__,
+                response_received=password_locked, error_class=type(exc).__name__,
             )
             logger.warning("onboarding_failed session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d error_class=%s", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000), type(exc).__name__)
             try:
@@ -1692,14 +1727,16 @@ def create_app(
         if rate_limited(f"guest-password:{digest_token(remote)}:{digest_token(session_id)}", 8, 900):
             raise HTTPException(429, "password_rate_limited")
         payload = await request.json()
-        password = str(payload.get("password", ""))
+        password = payload.get("password") if isinstance(payload, dict) else None
         attempt = guest_onboarding_session(token, session_id)
+        if attempt["retry_after_seconds"] is not None:
+            raise HTTPException(429, CLOUD_PASSWORD_LOCKED, headers={"Retry-After": str(attempt["retry_after_seconds"])})
         runtime = app.state.onboarding_flows.get(session_id)
         if attempt["state"] in {"expired", "cancelled"}:
             raise HTTPException(410, str(attempt["error_code"] or "onboarding_session_unavailable"))
         if runtime is None or attempt["state"] != "waiting_password":
             raise HTTPException(409, "onboarding_session_not_waiting_for_password")
-        if not password or len(password) > 256:
+        if not isinstance(password, str) or not password or len(password) > 256:
             raise HTTPException(422, "invalid_password")
         if runtime["flow"].passwords.full():
             raise HTTPException(409, "onboarding_session_not_waiting_for_password")
@@ -1713,11 +1750,11 @@ def create_app(
         flow = app.state.onboarding_flows.get(session_id, {}).get("flow")
         return {
             "state": row["state"],
-            "hint": flow_hint(flow),
+            "hint": "" if row["error_code"] == CLOUD_PASSWORD_LOCKED else flow_hint(flow),
             "error": row["error_code"] or "",
             "expires_at": row["expires_at"],
             "retryable": row["retryable"],
-            "retry_after_seconds": None,
+            "retry_after_seconds": row["retry_after_seconds"],
             "request_count_left": getattr(flow, "request_count_left", None),
             "code_length": getattr(flow, "code_length", None),
         }

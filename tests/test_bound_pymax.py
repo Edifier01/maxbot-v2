@@ -5,7 +5,9 @@ from importlib.metadata import version
 
 import pytest
 from pymax.exceptions import ApiError
-from pymax.protocol.enums import Opcode
+from pymax.connection import ConnectionManager
+from pymax.protocol.enums import Command, Opcode
+from pymax.protocol.models import InboundFrame
 from pymax.session import SessionStore
 
 from maxbot_v2.crypto import SecretBox
@@ -77,6 +79,54 @@ def test_pymax_reopens_an_existing_encrypted_session_without_network(tmp_path):
     asyncio.run(reopen())
     assert vault.has_saved_session_token()
     assert not vault.work_path.exists()
+
+
+def test_bound_pymax_reports_only_definite_cloud_password_verdicts(tmp_path, monkeypatch):
+    vault = EncryptedSessionFile(24, durable_dir=tmp_path / "encrypted", runtime_dir=tmp_path / "runtime", box=SecretBox(SecretBox.generate_key()))
+    results = []
+    password_opcode = Opcode.AUTH_LOGIN_CHECK_PASSWORD
+    adapter = PyMaxAdapter.create(
+        phone="+70000000000", source_ip="62.109.20.186", session_vault=vault,
+        code_provider=object(), password_provider=object(), cloud_password_result=results.append,
+    )
+    frames = iter([
+        TimeoutError(),
+        OSError(),
+        InboundFrame(opcode=password_opcode, cmd=Command.ERROR, payload={"error": "login.cred", "message": "FAIL_INVALID_TRACK"}),
+        InboundFrame(opcode=Opcode.LOGIN, cmd=Command.ERROR, payload={"error": "login.cred", "message": "FAIL_WRONG_PASSWORD"}),
+        InboundFrame(opcode=password_opcode, payload={"error": "unknown_error"}),
+        InboundFrame(opcode=password_opcode, payload={"tokenAttrs": {}}),
+        InboundFrame(opcode=password_opcode, cmd=Command.ERROR, payload={"error": "login.cred", "message": "FAIL_WRONG_PASSWORD"}),
+        InboundFrame(opcode=password_opcode, payload={"error": "wrong_password"}),
+        InboundFrame(opcode=password_opcode, payload={"tokenAttrs": {"LOGIN": {"token": "fixture"}}}),
+    ])
+
+    async def request(_manager, frame, **_kwargs):
+        assert frame.opcode == password_opcode
+        result = next(frames)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(ConnectionManager, "request", request)
+
+    async def check():
+        await adapter.client._ensure_runtime()
+        auth = adapter.client._app.api.auth
+        for error in (TimeoutError, OSError, ApiError, ApiError):
+            with pytest.raises(error):
+                await auth.check_password("fixture-track", "fixture-password")
+        await auth.check_password("fixture-track", "fixture-password")
+        await auth.check_password("fixture-track", "fixture-password")
+        assert results == []
+
+        with pytest.raises(ApiError):
+            await auth.check_password("fixture-track", "fixture-password")
+        await auth.check_password("fixture-track", "fixture-password")
+        await auth.check_password("fixture-track", "fixture-password")
+        assert results == [False, False, True]
+
+    asyncio.run(check())
 
 
 def test_legacy_ip_is_rejected_before_opening_session(tmp_path):

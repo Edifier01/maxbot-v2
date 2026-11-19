@@ -4,12 +4,39 @@ import asyncio
 import logging
 import re
 import sqlite3
+from math import ceil
 from typing import Any, Callable
 
 from .egress import assign_ip
 
 
 logger = logging.getLogger(__name__)
+CLOUD_PASSWORD_LOCK_SECONDS = 24 * 60 * 60
+CLOUD_PASSWORD_LOCKED = "cloud_password_locked"
+
+
+class CloudPasswordLocked(RuntimeError):
+    pass
+
+
+def password_lock_retry_after(connection: sqlite3.Connection, fingerprint: str, now: float) -> int | None:
+    row = connection.execute(
+        "SELECT locked_until FROM cloud_password_failures WHERE phone_fingerprint=? AND locked_until>?",
+        (fingerprint, now),
+    ).fetchone()
+    return ceil(row[0] - now) if row else None
+
+
+def record_cloud_password_failure(connection: sqlite3.Connection, fingerprint: str, now: float) -> bool:
+    # An unlocked row records one rejection. An expired lock starts a new streak.
+    locked_until = connection.execute(
+        "INSERT INTO cloud_password_failures(phone_fingerprint) VALUES(?) "
+        "ON CONFLICT(phone_fingerprint) DO UPDATE SET locked_until=CASE "
+        "WHEN locked_until IS NULL THEN ? WHEN locked_until<=? THEN NULL ELSE locked_until END "
+        "RETURNING locked_until",
+        (fingerprint, now + CLOUD_PASSWORD_LOCK_SECONDS, now),
+    ).fetchone()[0]
+    return locked_until is not None
 
 
 class WebAuthProviders:
