@@ -19,18 +19,16 @@ def test_ten_groups_one_hundred_accounts_and_unique_worker_leases(tmp_path):
             db.execute("INSERT INTO accounts(id,group_id,phone,full_name,status,auth_state) VALUES(?,?,?,?, 'active','authenticated')", (account_id, group_id, f"+700000{account_id:05d}", f"Account {account_id}"))
             db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,1)", (account_id,))
     replace_message_pool(db, [f"message-{i}" for i in range(100)])
-    db.execute("UPDATE settings SET value='00:00-00:01' WHERE key='send_windows_weekday'")
-    db.execute("UPDATE settings SET value='00:00-00:01' WHERE key='send_windows_weekend'")
     db.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
-    assert prepare_week(db, date(2026, 9, 21)) == 100
+    assert prepare_week(db, date(2026, 9, 21)) == 1000
     counts = [row[0] for row in db.execute("SELECT COUNT(*) FROM weekly_slots GROUP BY group_id")]
-    weekdays = [row[0] for row in db.execute("SELECT COUNT(*) FROM accounts GROUP BY send_weekday")]
-    assert counts == [10] * 10
-    assert max(weekdays) - min(weekdays) <= 1
+    pairs = [row[0] for row in db.execute("SELECT COUNT(*) FROM accounts GROUP BY send_day_pair")]
+    assert counts == [100] * 10
+    assert len(pairs) == 3 and max(pairs) - min(pairs) <= 1
     db.close()
 
     async def no_send(_slot):
-        raise AssertionError("window prevents test provider use")
+        raise AssertionError("manual stop prevents test provider use")
 
     async def scenario():
         first = GroupWorkerManager(path, no_send, poll_seconds=0.01)

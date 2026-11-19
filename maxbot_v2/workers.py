@@ -13,7 +13,7 @@ from .sender import DispatchPaused, KnownPreSendFailure, Sender
 from .egress import host_addresses, allowed_address
 from .send_proxies import resume_proxy_blocked_slots
 from .chat_queue import chat_dispatch_wait
-from .scheduling import SCHEDULE_TZ, SEND_DAY_PAIRS, dispatch_quota_reason
+from .scheduling import SCHEDULE_TZ, SEND_DAY_PAIRS, dispatch_quota_reason, resume_quota_blocked_slots
 
 
 logger = logging.getLogger(__name__)
@@ -124,11 +124,17 @@ class GroupWorkerManager:
                     await self.sleep(self.poll_seconds)
                     continue
                 today = datetime.now(SCHEDULE_TZ).date()
-                resume_proxy_blocked_slots(db, group_id, today)
-                db.execute("UPDATE weekly_slots SET status='missed',updated_at=? WHERE group_id=? AND status='queued' AND scheduled_date<?", (datetime.now(timezone.utc).isoformat(), group_id, today.isoformat()))
+                db.execute(
+                    "UPDATE weekly_slots SET status='missed',updated_at=CURRENT_TIMESTAMP "
+                    "WHERE group_id=? AND scheduled_date<? AND (status='queued' OR "
+                    "(status='blocked' AND error_code IN ('daily_limit_reached','weekly_limit_reached')))",
+                    (group_id, today.isoformat()),
+                )
                 if today.weekday() == 6:
                     await self.sleep(self.poll_seconds)
                     continue
+                resume_proxy_blocked_slots(db, group_id, today)
+                resume_quota_blocked_slots(db, group_id, today)
                 slots = db.execute(
                     "SELECT s.*,a.phone,a.id AS account_id,g.chat_id FROM weekly_slots s JOIN accounts a ON a.id=s.account_id "
                     "JOIN groups g ON g.id=s.group_id WHERE s.group_id=? AND s.scheduled_date=? AND s.status='queued' "
@@ -200,17 +206,19 @@ def _dispatch_block(
         return DispatchPaused("ip_assignment_changed")
     if current_slot is None or current_slot["status"] != "in_flight":
         return DispatchPaused("slot_no_longer_queued")
+    quota_reason = dispatch_quota_reason(db, current_slot, account["phone_fingerprint"])
+    if quota_reason is not None:
+        return DispatchPaused(quota_reason, blocked=True)
+    wait_reason = chat_dispatch_wait(
+        db, str(slot["chat_id"]), datetime.now(SCHEDULE_TZ), current_slot_id=slot["slot_id"],
+    )
+    if wait_reason is not None:
+        return DispatchPaused(wait_reason)
     now = datetime.now(SCHEDULE_TZ)
     pair = account["send_day_pair"]
     if (current_slot["scheduled_date"] != now.date().isoformat()
             or pair is None or now.weekday() not in SEND_DAY_PAIRS[pair]):
         return DispatchPaused("outside_send_day")
-    quota_reason = dispatch_quota_reason(db, current_slot, account["phone_fingerprint"])
-    if quota_reason is not None:
-        return DispatchPaused(quota_reason, blocked=True)
-    wait_reason = chat_dispatch_wait(db, str(slot["chat_id"]), now, current_slot_id=slot["slot_id"])
-    if wait_reason is not None:
-        return DispatchPaused(wait_reason)
     return None
 
 

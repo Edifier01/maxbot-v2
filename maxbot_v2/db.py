@@ -255,6 +255,10 @@ def initialize(connection: sqlite3.Connection) -> None:
         )
     if "phone_fingerprint" not in columns:
         connection.execute("ALTER TABLE accounts ADD COLUMN phone_fingerprint TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_account_phone_fingerprint ON accounts(phone_fingerprint) "
+        "WHERE phone_fingerprint IS NOT NULL"
+    )
     columns = {row[1] for row in connection.execute("PRAGMA table_info(onboarding_sessions)")}
     if "ip_id" not in columns:
         connection.execute("ALTER TABLE onboarding_sessions ADD COLUMN ip_id INTEGER REFERENCES server_ips(id)")
