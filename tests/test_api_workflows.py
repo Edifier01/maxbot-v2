@@ -1001,8 +1001,18 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
     endpoint = f"/api/ips/{ip_id}/send-proxies"
     url = "socks5://sample-user:sample-password@8.8.4.4:1080"
     alternate = "socks5://1.1.1.1:1080"
+    clock = datetime(2026, 9, 21, 12, tzinfo=timezone.utc)
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, zone=None):
+            return clock.astimezone(zone)
+
+    monkeypatch.setattr("maxbot_v2.workers.datetime", FixedClock)
     db = connect(client.app.state.database)
     try:
+        db.execute("UPDATE groups SET chat_id='10' WHERE id=?", (group_id,))
+        db.execute("UPDATE settings SET value='UTC' WHERE key='timezone'")
         account_id = db.execute(
             "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) VALUES(?,'+79990000000','Fixture','active','authenticated')",
             (group_id,),
@@ -1013,6 +1023,11 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
             (group_id,),
         ).lastrowid
         db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (second_account, ip_id))
+        version_id = replace_message_pool(db, ["fixture"])
+        for account in (account_id, second_account):
+            create_weekly_slot(db, account_id=account, week_start="2026-09-21", scheduled_date="2026-09-21", text="fixture", message_version_id=version_id)
+        db.execute("UPDATE weekly_slots SET status='in_flight'")
+        slots = {row["account_id"]: row for row in db.execute("SELECT s.*,g.chat_id FROM weekly_slots s JOIN groups g ON g.id=s.group_id")}
     finally:
         db.close()
 
@@ -1032,7 +1047,7 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
     monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(create))
     provider = client.app.state.worker_manager.provider_factory
     with pytest.raises(DispatchPaused, match="send_proxy_required"):
-        asyncio.run(provider({"account_id": account_id}))
+        asyncio.run(provider(slots[account_id]))
     assert routes == []
     assert client.post(endpoint, headers=headers, json={"urls": [url, alternate]}).status_code == 201
     proxy_id, alternate_id = [proxy["id"] for proxy in client.get(endpoint).json()]
@@ -1040,21 +1055,34 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
     try:
         db.execute("UPDATE send_proxies SET enabled=1 WHERE id=?", (proxy_id,))
         with pytest.raises(DispatchPaused, match="send_proxy_required"):
-            asyncio.run(provider({"account_id": account_id}))
+            asyncio.run(provider(slots[account_id]))
         assert db.execute("SELECT COUNT(*) FROM send_proxy_assignments").fetchone()[0] == 0
     finally:
         db.close()
     check_and_enable_fake_proxies(client, endpoint, headers, [proxy_id, alternate_id], monkeypatch)
 
     async def check_route():
-        connected = await provider({"account_id": account_id})
+        connected = await provider(slots[account_id])
         await connected.close()
         assert routes[0]["source_ip"] == "62.109.20.186"
         assert routes[0]["send_proxy_url"] == url
         assert routes[0].get("code_provider") is None
-        second_connected = await provider({"account_id": second_account})
+        second_connected = await provider(slots[second_account])
         await second_connected.close()
         assert routes[1]["send_proxy_url"] == alternate
+
+        def closed_window_during_ip_check():
+            db = connect(client.app.state.database)
+            try:
+                db.execute("UPDATE settings SET value='16:00-21:00' WHERE key='send_windows_weekday'")
+            finally:
+                db.close()
+            return {"62.109.20.186"}
+
+        with monkeypatch.context() as race:
+            race.setattr("maxbot_v2.app.host_addresses", closed_window_during_ip_check)
+            with pytest.raises(DispatchPaused, match="outside_send_window"):
+                routes[0]["before_network_action"]()
 
         def failed_probe_during_ip_check():
             db = connect(client.app.state.database)
@@ -1069,7 +1097,7 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
             with pytest.raises(DispatchPaused, match="send_proxy_unavailable"):
                 routes[0]["before_network_action"]()
         with pytest.raises(DispatchPaused, match="send_proxy_unavailable"):
-            await provider({"account_id": account_id})
+            await provider(slots[account_id])
         assert len(routes) == 2
 
     asyncio.run(check_route())

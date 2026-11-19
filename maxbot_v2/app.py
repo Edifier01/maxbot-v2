@@ -29,7 +29,7 @@ from .onboarding import WebAuthProviders, attach_group_on_first_account, join_gr
 from .max_adapter import PyMaxAdapter
 from .egress import assign_ip, assigned_ip, bootstrap_ips, enable_ip, host_addresses, refresh_ips, allowed_address
 from .session_vault import EncryptedSessionFile
-from .workers import GroupWorkerManager, _inside_window
+from .workers import GroupWorkerManager, _dispatch_block, _inside_window
 from .sender import DispatchPaused, recover_in_flight
 from .chat_queue import DEFAULT_CHAT_PAUSE_SECONDS
 from .send_proxies import assigned_or_allocate_proxy, normalize_proxy_url
@@ -510,7 +510,8 @@ def create_app(
         adapter = None
         try:
             def require_same_route() -> None:
-                if row["address"] not in host_addresses():
+                available_hosts = host_addresses()
+                if row["address"] not in available_hosts:
                     raise DispatchPaused("ip_assignment_changed")
                 with db() as connection:
                     current = connection.execute(
@@ -522,15 +523,20 @@ def create_app(
                         "LEFT JOIN send_proxies sp ON sp.id=sa.proxy_id WHERE ia.account_id=?",
                         (slot["account_id"],),
                     ).fetchone()
-                if (current is None or current["lifecycle"] != "active" or not current["enabled"] or not current["available"]
-                        or int(current["ip_id"]) != int(row["ip_id"]) or current["address"] != row["address"]):
-                    raise DispatchPaused("ip_assignment_changed")
-                if current["auth_state"] != "authenticated":
-                    raise DispatchPaused("account_reauthentication_required", blocked=True)
-                if current["proxy_id"] != proxy["id"]:
-                    raise DispatchPaused("send_proxy_changed")
-                if not current["proxy_enabled"] or current["proxy_check_status"] != "ok" or current["proxy_ip_id"] != row["ip_id"]:
-                    raise DispatchPaused("send_proxy_unavailable", blocked=True)
+                    if (current is None or current["lifecycle"] != "active" or not current["enabled"] or not current["available"]
+                            or int(current["ip_id"]) != int(row["ip_id"]) or current["address"] != row["address"]):
+                        raise DispatchPaused("ip_assignment_changed")
+                    if current["auth_state"] != "authenticated":
+                        raise DispatchPaused("account_reauthentication_required", blocked=True)
+                    if current["proxy_id"] != proxy["id"]:
+                        raise DispatchPaused("send_proxy_changed")
+                    if not current["proxy_enabled"] or current["proxy_check_status"] != "ok" or current["proxy_ip_id"] != row["ip_id"]:
+                        raise DispatchPaused("send_proxy_unavailable", blocked=True)
+                    paused = _dispatch_block(
+                        connection, slot, expected_ip_id=row["ip_id"], expected_address=row["address"], available_hosts=available_hosts,
+                    )
+                    if paused is not None:
+                        raise paused
 
             require_same_route()
             adapter = PyMaxAdapter.create(
@@ -1064,7 +1070,9 @@ def create_app(
                         status = await PyMaxAdapter.check_send_proxy(source_ip=source_ip, url=url)
                     return {"id": proxy_id, "check_status": status, "last_checked_at": datetime.now(timezone.utc).isoformat()}
 
-            results = await asyncio.gather(*(probe(proxy_id) for proxy_id in proxy_ids))
+            async with asyncio.TaskGroup() as batch:
+                checks = [batch.create_task(probe(proxy_id)) for proxy_id in proxy_ids]
+            results = [task.result() for task in checks]
             with db() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 if connection.execute(
@@ -1145,7 +1153,7 @@ def create_app(
         return {"timezone": values["timezone"], "send_windows_weekday": values["send_windows_weekday"], "send_windows_weekend": values["send_windows_weekend"], "delay_min_sec": int(values["delay_min_sec"]), "delay_max_sec": int(values["delay_max_sec"]), "auto_run": values["auto_run"] == "1", "global_stop": values["global_stop"] == "1"}
 
     @app.put("/api/settings")
-    def update_settings(body: SettingsBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
+    async def update_settings(body: SettingsBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
         if body.delay_max_sec < body.delay_min_sec:
             raise HTTPException(422, "invalid_delay_range")
         try:
@@ -2166,13 +2174,13 @@ def create_app(
         return {"ip_id": ip_row["id"], "ip_address": ip_row["address"]}
 
     @app.post("/api/run/stop")
-    def stop(_session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
+    async def stop(_session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
         with db() as connection:
             connection.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
         return {"stopped": True}
 
     @app.post("/api/run/start")
-    def start(_session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
+    async def start(_session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
         with db() as connection:
             connection.execute("UPDATE settings SET value='0' WHERE key='global_stop'")
         return {"stopped": False}
