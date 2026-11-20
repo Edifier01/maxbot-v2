@@ -587,7 +587,7 @@ def test_no2fa_after_otp_cleans_unverified_account_without_automatic_code_retry(
     page.get_by_label("Название", exact=True).fill("Тестовая группа")
     page.get_by_label("Ссылка MAX").fill("https://max.ru/join/no2fa-test")
     page.get_by_role("button", name="Добавить", exact=True).click()
-    guest = browser.new_page()
+    guest = browser.new_page(viewport={"width": 390, "height": 844})
     guest.goto(page.locator(".invite-link a").get_attribute("href"))
     guest.get_by_label("ФИО").fill("Тестовый пользователь")
     guest.get_by_label("Телефон").fill("+79990000000")
@@ -595,7 +595,12 @@ def test_no2fa_after_otp_cleans_unverified_account_without_automatic_code_retry(
     expect(guest.get_by_role("heading", name="Введите код MAX")).to_be_visible()
     guest.get_by_label("Код").fill("123456")
     guest.get_by_role("button", name="Проверить код").click()
-    expect(guest.locator("#flow")).to_contain_text("MAX требует пароль для входа", timeout=5000)
+    expect(guest.locator("#flow")).to_contain_text("«Настройки» → «Безопасность» → «Пароль для входа»", timeout=5000)
+    expect(guest.locator("#flow .error")).to_contain_text("«Установить пароль»")
+    expect(guest.locator("#flow .error")).to_contain_text("«Повторить подключение»")
+    assert page_has_no_overflow(guest)
+    guest.get_by_role("button", name="Повторить подключение").click()
+    expect(guest.get_by_role("button", name="Начать подключение")).to_be_visible()
     assert len(local_app.code_requests) == 1
     connection = connect(local_app.app.state.database)
     try:
