@@ -608,6 +608,19 @@ def test_no2fa_after_otp_cleans_unverified_account_without_automatic_code_retry(
     finally:
         connection.close()
 
+    page.get_by_role("button", name="Журнал").press("Enter")
+    expect(page.get_by_role("columnheader", name="Телефон")).to_be_visible()
+    page.set_viewport_size({"width": 390, "height": 844})
+    failure = page.get_by_role("row").filter(has_text="MAX требует пароль для входа при активной сессии")
+    failure.scroll_into_view_if_needed()
+    expect(failure.get_by_role("cell").filter(has_text="+79990000000")).to_be_in_viewport()
+    expect(failure.locator(".log-details")).to_be_in_viewport()
+    expect(failure).to_contain_text("ответ получен")
+    assert page_has_no_overflow(page)
+    page.get_by_role("button", name="Выйти").click()
+    expect(page.locator("#view")).to_be_empty()
+    expect(page.get_by_role("heading", name="Вход")).to_be_visible()
+
 
 def test_expired_attempt_releases_account_lock_for_new_start(page: Page, browser, local_app):
     login(page, local_app)

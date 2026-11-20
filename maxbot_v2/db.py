@@ -213,8 +213,18 @@ CREATE TABLE IF NOT EXISTS onboarding_events (
     result TEXT NOT NULL,
     duration_ms INTEGER,
     response_received INTEGER NOT NULL DEFAULT 0,
-    error_class TEXT
+    error_class TEXT,
+    error_code TEXT
 );
+CREATE TABLE IF NOT EXISTS onboarding_log_context (
+    attempt_id TEXT NOT NULL PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    group_id INTEGER NOT NULL REFERENCES groups(id),
+    phone_ciphertext TEXT NOT NULL,
+    rejection_code TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_onboarding_rejected_starts ON onboarding_log_context(created_at DESC)
+    WHERE rejection_code IS NOT NULL;
 """
 
 DEFAULTS = {
@@ -268,6 +278,12 @@ def initialize(connection: sqlite3.Connection) -> None:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(onboarding_sessions)")}
     if "ip_id" not in columns:
         connection.execute("ALTER TABLE onboarding_sessions ADD COLUMN ip_id INTEGER REFERENCES server_ips(id)")
+    event_columns = {row[1] for row in connection.execute("PRAGMA table_info(onboarding_events)")}
+    if "error_code" not in event_columns:
+        connection.execute("ALTER TABLE onboarding_events ADD COLUMN error_code TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_onboarding_event_error ON onboarding_events(attempt_id,error_code) WHERE error_code IS NOT NULL"
+    )
     ip_columns = {row[1] for row in connection.execute("PRAGMA table_info(server_ips)")}
     if "last_assigned_at" not in ip_columns:
         connection.execute("ALTER TABLE server_ips ADD COLUMN last_assigned_at TEXT")
