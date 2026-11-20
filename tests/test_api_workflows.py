@@ -710,7 +710,8 @@ def test_owner_deletion_waits_for_live_auth_client_to_close(tmp_path, monkeypatc
     assert tuple(attempt_row) == ("cancelled", None, None)
 
 
-def test_failed_new_onboarding_cleans_account_and_logs_safe_failure_before_retry(tmp_path, monkeypatch):
+@pytest.mark.parametrize("connect_failure", [True, False])
+def test_failed_new_onboarding_cleans_account_and_logs_safe_failure_before_retry(tmp_path, monkeypatch, connect_failure):
     coroutines = []
     real_create_task = asyncio.create_task
 
@@ -729,8 +730,15 @@ def test_failed_new_onboarding_cleans_account_and_logs_safe_failure_before_retry
     token = client.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
 
     class FakeAdapter:
+        client = SimpleNamespace(me=SimpleNamespace(id=1234))
+
         async def connect(self):
-            raise OSError("synthetic network text must never be logged")
+            if connect_failure:
+                raise OSError("synthetic network text must never be logged")
+            client.app.state.onboarding_flows[first.json()["session_id"]]["flow"].current_stage = "send_code"
+
+        def persist_session_snapshot(self):
+            return False
 
         async def close(self):
             return None
@@ -749,11 +757,25 @@ def test_failed_new_onboarding_cleans_account_and_logs_safe_failure_before_retry
     assert tuple(attempt) == ("failed", None, None)
     assert connection.execute("SELECT 1 FROM ip_assignments WHERE account_id=?", (old_id,)).fetchone() is None
     connection.close()
-    log = client.get("/api/log").json()
+    owner_log = client.get("/api/log")
+    log = owner_log.json()
     failure = next(entry for entry in log if entry.get("attempt_id") == first.json()["session_id"] and entry["detail"].startswith("failed"))
-    assert failure["kind"] == "connect"
-    assert failure["error_class"] == "OSError"
-    assert "+79991234567" not in str(log) and "synthetic network text" not in str(log)
+    assert failure["kind"] == ("connect" if connect_failure else "persist_authenticated_session")
+    assert failure["error_class"] == ("OSError" if connect_failure else "RuntimeError")
+    assert failure["phone"] == "+79991234567"
+    assert failure["error_code"] == ("oserror" if connect_failure else "auth_session_not_saved")
+    assert "synthetic network text" not in owner_log.text and "phone_ciphertext" not in owner_log.text
+    assert "no-store" in owner_log.headers["cache-control"]
+    guest = TestClient(client.app, base_url="https://test.local")
+    assert guest.get("/api/log").status_code == 401
+    status = guest.get(f"/api/public/onboarding/{token}/{first.json()['session_id']}")
+    assert status.status_code == 200 and "+79991234567" not in status.text
+    with closing(connect(client.app.state.database)) as connection:
+        ciphertext = connection.execute(
+            "SELECT phone_ciphertext FROM onboarding_log_context WHERE attempt_id=?", (failure["attempt_id"],),
+        ).fetchone()[0]
+        assert ciphertext != failure["phone"] and SecretBox().decrypt(ciphertext) == failure["phone"]
+        assert "+79991234567" not in "\n".join(connection.iterdump())
     assert client.get("/api/overview").json()["counts"]["accounts"] == 0
 
     second = client.post(f"/api/public/onboarding/{token}/start", json={"full_name": "Иван", "phone": "+79991234567"})
@@ -764,6 +786,34 @@ def test_failed_new_onboarding_cleans_account_and_logs_safe_failure_before_retry
     assert connection.execute("SELECT COUNT(*) FROM accounts WHERE phone='+79991234567' AND lifecycle='active'", ()).fetchone()[0] == 1
     connection.close()
     coroutines.pop().close()
+
+
+def test_owner_journal_shows_number_rejected_before_max_start(tmp_path, monkeypatch):
+    owner, csrf = owner_client(tmp_path, monkeypatch)
+    group_id = owner.post(
+        "/api/groups", headers={"X-CSRF-Token": csrf},
+        json={"name": "Fixture", "invite_link": "https://max.ru/join/fixture"},
+    ).json()["id"]
+    link = owner.get(f"/api/groups/{group_id}/onboarding-link").json()["url"]
+    token = link.rsplit("/", 1)[1]
+    with closing(connect(owner.app.state.database)) as db:
+        db.execute("UPDATE server_ips SET enabled=0")
+
+    guest = TestClient(owner.app, base_url="https://test.local")
+    for code in ("invalid-link", token):
+        response = guest.post(
+            f"/api/public/onboarding/{code}/start", json={"full_name": "Fixture", "phone": "8 (999) 123-45-67"},
+        )
+        assert "+79991234567" not in response.text
+    assert response.status_code == 409 and response.json()["detail"] == "ip_assignment_required"
+    with closing(connect(owner.app.state.database)) as db:
+        assert db.execute("SELECT count(*) FROM onboarding_sessions").fetchone()[0] == 0
+
+    entries = [event for event in owner.get("/api/log").json() if event.get("phone")]
+    assert len(entries) == 1
+    assert (entries[0]["phone"], entries[0]["error_code"], entries[0]["group_id"]) == (
+        "+79991234567", "ip_assignment_required", group_id,
+    )
 
 
 def test_failed_attempt_cleanup_failure_blocks_reuse_until_retry_completes(tmp_path, monkeypatch):
@@ -1888,3 +1938,30 @@ def test_api_log_sorts_sqlite_and_iso_timestamps_chronologically(tmp_path, monke
     entries = client.get("/api/log").json()
 
     assert [entry["detail"] for entry in entries[:2]] == ["later", "earlier"]
+
+
+def test_owner_journal_recovers_legacy_numbers_and_terminal_state_reasons(tmp_path, monkeypatch):
+    owner, csrf = owner_client(tmp_path, monkeypatch)
+    group_id = owner.post(
+        "/api/groups", headers={"X-CSRF-Token": csrf},
+        json={"name": "Fixture", "invite_link": "https://max.ru/join/fixture"},
+    ).json()["id"]
+    with closing(connect(owner.app.state.database)) as db:
+        invite_id = db.execute("SELECT id FROM onboarding_invites WHERE group_id=?", (group_id,)).fetchone()[0]
+        for phone, session_id in (("+89991234567", "legacy"), ("deleted:2", "anonymized")):
+            account_id = db.execute(
+                "INSERT INTO accounts(group_id,phone,full_name) VALUES(?,?,'')", (group_id, phone),
+            ).lastrowid
+            db.execute(
+                "INSERT INTO onboarding_sessions(id,invite_id,token_hash,csrf_hash,state,account_id,expires_at,created_at,updated_at,error_code) "
+                "VALUES(?,?,'fixture','fixture','failed',?,'2099-01-01','2026-11-20T01:00:00+00:00',"
+                "'2026-11-20T01:01:00+00:00','process_interrupted')",
+                (session_id, invite_id, account_id),
+            )
+
+    entries = {
+        item["attempt_id"]: item for item in owner.get("/api/log").json()
+        if item.get("error_code") == "process_interrupted"
+    }
+    assert entries["legacy"]["phone"] == "+79991234567"
+    assert entries["anonymized"]["phone"] is None

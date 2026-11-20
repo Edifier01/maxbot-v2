@@ -5,3 +5,12 @@
 .button-link{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border-radius:9px;background:#2463eb;color:#fff;padding:11px 16px;font-weight:650;text-decoration:none;word-break:normal}.button-link:hover{filter:brightness(.96)}.ip-panel summary{cursor:pointer;font-weight:650;min-height:24px}.ip-panel summary::marker{color:#2463eb}#ip-count{display:inline-block;margin-left:8px;font-size:13px;font-weight:400}.ip-panel-body{margin-top:16px}#ip-list{max-height:420px;overflow-y:auto}.ip-panel .row>span{min-width:0}.ip-panel .row>button{flex-shrink:0}
 .proxy-import{max-width:520px}.check-line{display:flex;gap:8px;align-items:center}.check-line input{width:auto;margin:0}.proxy-entries{max-height:360px;overflow:auto}.account-proxy-form{width:100%}.ip-panel .row>.actions{justify-content:flex-end;flex-shrink:0}@media(max-width:420px){.ip-panel .row>.actions{flex-direction:column;align-items:stretch}}
 .account-row{align-items:flex-start}.account-row>.actions{flex:0 1 270px}.send-days{list-style:none;margin:6px 0 0;padding:0;font-size:13px}.send-days li+li{margin-top:4px}.send-day-count{font-weight:650}.send-day-unknown{color:#b42318}@media(max-width:800px){.account-row{display:block}.account-row>.actions{margin-top:12px}}
+.log-table td[data-label="Телефон"]{white-space:nowrap;font-variant-numeric:tabular-nums}
+@media(max-width:800px){
+ .log-table,.log-table tbody{display:block;white-space:normal}
+ .log-table thead{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);}
+ .log-table tbody tr{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));padding:12px 0;border-bottom:1px solid #edf0f3}
+ .log-table td{border:0;padding:5px 8px}
+ .log-table td[data-label]::before{content:attr(data-label);display:block;color:#6b7786;font-size:12px;margin-bottom:3px}
+ .log-table td.log-details{grid-column:1/-1}
+}

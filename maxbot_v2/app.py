@@ -193,17 +193,17 @@ def create_app(
     def record_onboarding_event(
         *, attempt_id: str, group_id: int, account_id: int, ip_id: int | None,
         stage: str, result: str, duration_ms: int | None = None,
-        response_received: bool = False, error_class: str | None = None,
+        response_received: bool = False, error_class: str | None = None, error_code: str | None = None,
     ) -> None:
         """Persist safe diagnostics only; never include provider data or user inputs."""
         try:
             with db() as connection:
                 connection.execute(
                     "INSERT INTO onboarding_events(created_at,attempt_id,group_id,account_id,ip_id,stage,result,"
-                    "duration_ms,response_received,error_class) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "duration_ms,response_received,error_class,error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (datetime.now(timezone.utc).isoformat(), attempt_id, group_id, account_id, ip_id,
                      stage[:48], result[:48], duration_ms, int(response_received),
-                     error_class[:80] if error_class else None),
+                     error_class[:80] if error_class else None, error_code),
                 )
         except Exception as exc:
             logger.warning("onboarding_event_persist_failed account_id=%s error_class=%s", account_id, type(exc).__name__)
@@ -1186,7 +1186,8 @@ def create_app(
         return {"version": version, "count": len(body.texts)}
 
     @app.get("/api/log")
-    def log(_session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
+    def log(response: Response, _session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
+        response.headers["Cache-Control"] = "no-store, private"
         with db() as connection:
             audit = connection.execute(
                 "SELECT created_at,kind,group_id,account_id,detail FROM audit_log ORDER BY id DESC LIMIT 200"
@@ -1196,15 +1197,52 @@ def create_app(
                 "COALESCE(o.error_code,'') AS detail FROM operations o ORDER BY o.id DESC LIMIT 200"
             ).fetchall()
             onboarding = connection.execute(
-                "SELECT created_at,stage AS kind,attempt_id,group_id,account_id,ip_id,"
-                "result || CASE WHEN error_class IS NULL THEN '' ELSE ':' || error_class END AS detail,"
-                "duration_ms,response_received,error_class FROM onboarding_events ORDER BY id DESC LIMIT 200"
+                "SELECT e.created_at,e.stage AS kind,e.attempt_id,e.group_id,e.account_id,e.ip_id,"
+                "e.result || CASE WHEN e.error_class IS NULL THEN '' ELSE ':' || e.error_class END AS detail,"
+                "e.duration_ms,e.response_received,e.error_class,e.error_code,c.phone_ciphertext,"
+                "COALESCE(s.phone,a.phone) AS legacy_phone FROM onboarding_events e "
+                "LEFT JOIN onboarding_log_context c ON c.attempt_id=e.attempt_id "
+                "LEFT JOIN onboarding_sessions s ON s.id=e.attempt_id LEFT JOIN accounts a ON a.id=e.account_id "
+                "ORDER BY e.id DESC LIMIT 200"
             ).fetchall()
-        return sorted(
-            [dict(row) for row in [*audit, *operations, *onboarding]],
+            rejected_starts = connection.execute(
+                "SELECT created_at,'attempt' AS kind,attempt_id,group_id,'rejected' AS detail,"
+                "rejection_code AS error_code,phone_ciphertext FROM onboarding_log_context "
+                "WHERE rejection_code IS NOT NULL ORDER BY created_at DESC LIMIT 200"
+            ).fetchall()
+            interrupted = connection.execute(
+                "SELECT s.updated_at AS created_at,'attempt' AS kind,s.id AS attempt_id,i.group_id,s.account_id,s.ip_id,"
+                "s.state AS detail,s.error_code,c.phone_ciphertext,COALESCE(s.phone,a.phone) AS legacy_phone "
+                "FROM onboarding_sessions s JOIN onboarding_invites i ON i.id=s.invite_id "
+                "LEFT JOIN onboarding_log_context c ON c.attempt_id=s.id LEFT JOIN accounts a ON a.id=s.account_id "
+                "WHERE s.state IN ('failed','expired','cancelled') "
+                "AND s.error_code IN ('process_interrupted','onboarding_attempt_expired','cancelled_by_guest',"
+                "'reauthentication_started','invite_unavailable','session_save_failed') "
+                "AND NOT EXISTS (SELECT 1 FROM onboarding_events e WHERE e.attempt_id=s.id AND e.error_code=s.error_code) "
+                "ORDER BY s.updated_at DESC LIMIT 200"
+            ).fetchall()
+        rows = sorted(
+            [dict(row) for row in [*audit, *operations, *onboarding, *rejected_starts, *interrupted]],
             key=lambda row: _log_timestamp_key(row["created_at"]),
             reverse=True,
         )[:200]
+        numbers: dict[str, str | None] = {}
+        for row in rows:
+            ciphertext = row.pop("phone_ciphertext", None)
+            legacy_phone = row.pop("legacy_phone", None)
+            attempt_id = row.get("attempt_id")
+            if not attempt_id:
+                continue
+            if attempt_id not in numbers:
+                numbers[attempt_id] = None
+                try:
+                    phone = SecretBox().decrypt(ciphertext) if ciphertext else legacy_phone
+                    if phone:
+                        numbers[attempt_id] = normalize_russian_phone(phone if ciphertext else phone.removeprefix("+8"))
+                except ValueError:
+                    pass
+            row["phone"] = numbers[attempt_id]
+        return rows
 
     @app.post("/api/operations/{operation_id}/resolve")
     def resolve_operation(operation_id: str, body: OperationResolutionBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, str]:
@@ -1293,13 +1331,26 @@ def create_app(
             raise HTTPException(422, "invalid_russian_phone") from exc
         row = invite_row(None, token, require_capacity=False)
         fingerprint = fingerprint_for(phone)
-        with db() as connection:
-            require_unlocked_number(connection, fingerprint)
-        await clean_previous_unverified_attempt(phone, int(row["group_id"]))
+        phone_ciphertext = SecretBox().encrypt(phone)
         session_id = new_token(16)
-        now = datetime.now(timezone.utc).isoformat()
         expired_session_ids: list[str] = []
+
+        def record_start_rejection(reason: str) -> None:
+            try:
+                with db() as connection:
+                    connection.execute(
+                        "INSERT INTO onboarding_log_context(attempt_id,created_at,group_id,phone_ciphertext,rejection_code) "
+                        "VALUES(?,?,?,?,?)",
+                        (session_id, datetime.now(timezone.utc).isoformat(), row["group_id"], phone_ciphertext, reason),
+                    )
+            except sqlite3.Error as exc:
+                logger.warning("onboarding_rejection_persist_failed group_id=%s error_class=%s", row["group_id"], type(exc).__name__)
+
         try:
+            with db() as connection:
+                require_unlocked_number(connection, fingerprint)
+            await clean_previous_unverified_attempt(phone, int(row["group_id"]))
+            now = datetime.now(timezone.utc).isoformat()
             with db() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 current_invite = connection.execute(
@@ -1403,9 +1454,17 @@ def create_app(
                     "INSERT INTO onboarding_events(created_at,attempt_id,group_id,account_id,ip_id,stage,result) VALUES(?,?,?,?,?,'attempt','started')",
                     (now, session_id, row["group_id"], account_id, ip_id),
                 )
+                connection.execute(
+                    "INSERT INTO onboarding_log_context(attempt_id,created_at,group_id,phone_ciphertext) VALUES(?,?,?,?)",
+                    (session_id, now, row["group_id"], phone_ciphertext),
+                )
                 connection.execute("UPDATE onboarding_invites SET uses_count=? WHERE id=?", (invite_use_count, row["id"]))
                 connection.commit()
+        except HTTPException as exc:
+            record_start_rejection(exc.detail)
+            raise
         except sqlite3.IntegrityError as exc:
+            record_start_rejection("phone_already_exists")
             raise HTTPException(409, "phone_already_exists") from exc
         cancel_onboarding_tasks(expired_session_ids)
 
@@ -1503,10 +1562,10 @@ def create_app(
             stage = "connect"
             stage_started = perf_counter()
             await adapter.connect()
-            validate_target()
             logger.info("onboarding_stage session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000))
-            stage = "resolve_group"
+            stage = "profile"
             stage_started = perf_counter()
+            validate_target()
             profile = getattr(adapter.client, "me", None)
             contact = getattr(profile, "contact", None)
             max_user_id = str(getattr(contact, "id", "") or getattr(profile, "id", ""))
@@ -1657,15 +1716,15 @@ def create_app(
                     safe = "password_entry_timeout"
                 else:
                     safe = "network_timeout"
-            event_stage = str(auth_stage if auth_stage and auth_stage != "request_code" else (last_diagnostic_stage or stage))
             event_result = "rejected" if password_locked else "failed"
             if isinstance(exc, TimeoutError) and auth_stage in {"wait_code_input", "wait_password_input"}:
                 event_result = "input_timeout"
             record_onboarding_event(
                 attempt_id=session_id, group_id=runtime["group_id"], account_id=runtime["account_id"],
-                ip_id=runtime["ip_id"], stage=event_stage, result=event_result,
+                ip_id=runtime["ip_id"], stage=stage, result=event_result,
                 duration_ms=int((perf_counter() - stage_started) * 1000),
-                response_received=password_locked, error_class=type(exc).__name__,
+                response_received=password_locked or type(exc).__name__ == "ApiError",
+                error_class=type(exc).__name__, error_code=safe,
             )
             logger.warning("onboarding_failed session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d error_class=%s", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000), type(exc).__name__)
             try:
@@ -1683,6 +1742,12 @@ def create_app(
                         logger.info("onboarding_stage session_id=%s account_id=%s ip_id=%s stage=%s duration_ms=%d", session_id, runtime["account_id"], runtime["ip_id"], stage, int((perf_counter() - stage_started) * 1000))
                     except Exception:
                         logger.warning("onboarding_failed session_id=%s account_id=%s ip_id=%s stage=session_close_seal error_class=SessionSaveError", session_id, runtime["account_id"], runtime["ip_id"])
+                        record_onboarding_event(
+                            attempt_id=session_id, group_id=runtime["group_id"], account_id=runtime["account_id"],
+                            ip_id=runtime["ip_id"], stage=stage, result="failed",
+                            duration_ms=int((perf_counter() - stage_started) * 1000),
+                            error_class="SessionSaveError", error_code="session_save_failed",
+                        )
                         set_onboarding_state(session_id, "failed", "session_save_failed")
             finally:
                 try:
