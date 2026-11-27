@@ -11,7 +11,7 @@ from time import perf_counter
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Iterator, Literal
+from typing import Annotated, Callable, Iterator, Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends
@@ -21,6 +21,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import connect, initialize
+from .channel_reactions import (
+    ChannelReactionWorker, channel_subscription_for_accounts, enroll_channel_account,
+    get_channel_reaction_settings, has_unresolved_reactions, list_channel_reaction_reviews,
+    reconcile_channel_reaction, recover_channel_reactions, save_channel_reaction_settings,
+    set_channel_reactions_run,
+)
 from .security import digest_token as _digest_token, new_invite_token, new_token, password_matches
 from .crypto import SecretBox
 from .message_pool import replace_message_pool
@@ -82,6 +88,15 @@ class GroupUpdateBody(GroupBody):
 
 class RunBody(BaseModel):
     enabled: bool
+
+
+class ChannelReactionSettingsBody(RunBody):
+    channel_url: str
+    reactions: list[str]
+
+
+class ChannelReactionResolutionBody(BaseModel):
+    outcome: Literal["confirmed", "not_applied"]
 
 
 class TextsBody(BaseModel):
@@ -244,7 +259,7 @@ def create_app(
                 "SELECT 1 FROM operations WHERE account_id=? AND status IN ('in_flight','unknown') LIMIT 1",
                 (account_id,),
             ).fetchone()
-            if unresolved:
+            if unresolved or has_unresolved_reactions(connection, account_id):
                 return False
             group_id = int(account["group_id"])
             ip_id = connection.execute("SELECT ip_id FROM ip_assignments WHERE account_id=?", (account_id,)).fetchone()
@@ -276,7 +291,7 @@ def create_app(
                 "SELECT 1 FROM operations WHERE account_id=? AND status IN ('in_flight','unknown') LIMIT 1",
                 (account_id,),
             ).fetchone()
-            if unresolved:
+            if unresolved or has_unresolved_reactions(connection, account_id):
                 connection.rollback()
                 return False
             connection.execute("DELETE FROM ip_assignments WHERE account_id=?", (account_id,))
@@ -552,15 +567,103 @@ def create_app(
                 lock.release()
             raise
 
+    async def open_channel_adapter(account_id: int, *, use_proxy: bool, before_network_action: Callable[[], None]):
+        lock = account_session_locks.for_account(account_id)
+        await lock.acquire()
+        adapter = None
+
+        def read_route(connection: sqlite3.Connection) -> sqlite3.Row:
+            row = connection.execute(
+                "SELECT a.phone,a.status,a.auth_state,a.lifecycle,a.session_generation,p.id AS ip_id,p.address,"
+                "p.enabled AS ip_enabled,p.available,sp.id AS proxy_id,sp.ip_id AS proxy_ip_id,"
+                "sp.enabled AS proxy_enabled,sp.check_status,sp.url_ciphertext "
+                "FROM accounts a LEFT JOIN ip_assignments ia ON ia.account_id=a.id "
+                "LEFT JOIN server_ips p ON p.id=ia.ip_id "
+                "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id "
+                "LEFT JOIN send_proxies sp ON sp.id=sa.proxy_id WHERE a.id=?",
+                (account_id,),
+            ).fetchone()
+            if row is None or row["status"] != "active" or row["lifecycle"] != "active":
+                raise DispatchPaused("account_not_active", blocked=True)
+            if row["auth_state"] != "authenticated":
+                raise DispatchPaused("account_reauthentication_required", blocked=True)
+            if not row["ip_enabled"] or not row["available"] or not allowed_address(row["address"]):
+                raise DispatchPaused("ip_assignment_unavailable", blocked=True)
+            return row
+
+        def validate_proxy(row: sqlite3.Row) -> None:
+            if row["proxy_id"] is None:
+                raise DispatchPaused("send_proxy_required", blocked=True)
+            if row["proxy_ip_id"] != row["ip_id"] or not row["proxy_enabled"] or row["check_status"] != "ok":
+                raise DispatchPaused("send_proxy_unavailable", blocked=True)
+
+        def require_same_route() -> None:
+            before_network_action()
+            with db() as connection:
+                current = read_route(connection)
+            if (
+                current["ip_id"] != route["ip_id"] or current["address"] != route["address"]
+                or current["address"] not in host_addresses()
+            ):
+                raise DispatchPaused("ip_assignment_changed", blocked=True)
+            if current["session_generation"] != route["session_generation"]:
+                raise DispatchPaused("account_session_changed", blocked=True)
+            if use_proxy:
+                if current["proxy_id"] != route["proxy_id"]:
+                    raise DispatchPaused("send_proxy_changed", blocked=True)
+                validate_proxy(current)
+
+        try:
+            before_network_action()
+            with db() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                route = read_route(connection)
+                if use_proxy and route["proxy_id"] is None:
+                    assigned_or_allocate_proxy(connection, account_id, route["ip_id"])
+                    route = read_route(connection)
+                if use_proxy:
+                    validate_proxy(route)
+                connection.commit()
+            proxy_url = None
+            if use_proxy:
+                try:
+                    proxy_url = SecretBox().decrypt(route["url_ciphertext"])
+                except ValueError:
+                    raise DispatchPaused("send_proxy_config_invalid", blocked=True) from None
+            require_same_route()
+            adapter = PyMaxAdapter.create(
+                phone=route["phone"], source_ip=route["address"], session_vault=session_vault_for(account_id),
+                send_proxy_url=proxy_url, before_network_action=require_same_route,
+            )
+            await adapter.connect()
+            require_same_route()
+            return LockedAdapter(adapter, lock, int(route["ip_id"]), route["address"])
+        except BaseException as exc:
+            try:
+                if adapter is not None:
+                    try:
+                        await adapter.close()
+                    except Exception as close_error:
+                        logger.warning("channel_session_close_failed account_id=%s error_class=%s", account_id, type(close_error).__name__)
+                if isinstance(exc, Exception) and PyMaxAdapter.is_invalid_saved_session_error(exc):
+                    mark_reauth_required(account_id)
+            finally:
+                lock.release()
+            raise
+
     worker_manager = GroupWorkerManager(database, scheduled_provider)
+    channel_reaction_worker = ChannelReactionWorker(database, open_channel_adapter)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         with db() as connection:
             bootstrap_ips(connection)
             recover_in_flight(connection)
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                recover_channel_reactions(connection)
+                connection.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
             connection.execute("UPDATE onboarding_sessions SET state='failed',error_code='process_interrupted',updated_at=?,phone=NULL,full_name=NULL WHERE state NOT IN ('completed','failed','expired','cancelled','waiting_membership')", (datetime.now(timezone.utc).isoformat(),))
-            connection.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
             pending_deletions = [(int(row[0]), row[1] or "owner_requested") for row in connection.execute("SELECT id,deletion_reason FROM accounts WHERE lifecycle='delete_pending'")]
             interrupted_attempts = [
                 (str(row[0]), int(row[1])) for row in connection.execute(
@@ -574,11 +677,13 @@ def create_app(
             delete_unverified_after_terminal_attempt(attempt_id, account_id)
         await worker_manager.start()
         proxy_health = asyncio.create_task(check_send_proxies_forever(), name="send-proxy-health")
+        channel_task = asyncio.create_task(channel_reaction_worker.run_forever(), name="channel-reactions")
         try:
             yield
         finally:
             proxy_health.cancel()
-            await asyncio.gather(proxy_health, return_exceptions=True)
+            channel_task.cancel()
+            await asyncio.gather(proxy_health, channel_task, return_exceptions=True)
             await worker_manager.stop()
             tasks = list(app.state.onboarding_tasks.items())
             with db() as connection:
@@ -609,6 +714,7 @@ def create_app(
     app.state.onboarding_flows = {}
     app.state.onboarding_tasks = {}
     app.state.worker_manager = worker_manager
+    app.state.channel_reaction_worker = channel_reaction_worker
     app.state.account_session_locks = account_session_locks
 
     def cancel_onboarding_tasks(session_ids: list[str]) -> None:
@@ -786,6 +892,37 @@ def create_app(
     @app.get("/api/auth/me")
     def me(_session: sqlite3.Row = Depends(current_session)) -> dict[str, str]:
         return {"username": owner_username}
+
+    def channel_reaction_configuration(connection: sqlite3.Connection) -> dict[str, object]:
+        return {**get_channel_reaction_settings(connection), "reviews": list_channel_reaction_reviews(connection)}
+
+    @app.get("/api/channel-reactions")
+    def channel_reaction_settings(_session: sqlite3.Row = Depends(current_session)) -> dict[str, object]:
+        with db() as connection, connection:
+            connection.execute("BEGIN")
+            return channel_reaction_configuration(connection)
+
+    @app.put("/api/channel-reactions")
+    def update_channel_reaction_settings(
+        body: ChannelReactionSettingsBody, _session: sqlite3.Row = Depends(require_csrf),
+    ) -> dict[str, object]:
+        with db() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                save_channel_reaction_settings(connection, enabled=body.enabled, channel_url=body.channel_url, reactions=body.reactions)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from None
+            return channel_reaction_configuration(connection)
+
+    @app.post("/api/channel-reactions/operations/{operation_id}/reconcile")
+    def resolve_channel_reaction(
+        operation_id: int, body: ChannelReactionResolutionBody, _session: sqlite3.Row = Depends(require_csrf),
+    ) -> dict[str, bool]:
+        with db() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if not reconcile_channel_reaction(connection, operation_id, outcome=body.outcome):
+                raise HTTPException(409, "channel_reaction_not_pending")
+        return {"resolved": True}
 
     @app.get("/api/overview")
     def overview(_session: sqlite3.Row = Depends(current_session)) -> dict[str, object]:
@@ -1578,6 +1715,7 @@ def create_app(
                 raise RuntimeError("auth_session_not_saved")
             with db() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                enroll_channel_account(connection, runtime["account_id"])
                 saved = connection.execute(
                     "UPDATE accounts SET auth_state='authenticated',ever_authenticated=1,max_user_id=? WHERE id=? AND status='pending' AND lifecycle='active'",
                     (max_user_id, runtime["account_id"]),
@@ -2030,6 +2168,7 @@ def create_app(
                 "WHERE a.group_id=? AND a.lifecycle<>'deleted' ORDER BY a.id",
                 (group_id,),
             ).fetchall()
+            channel_subscriptions = channel_subscription_for_accounts(connection, group_id)
             slots = connection.execute(
                 "SELECT account_id,scheduled_date,day_position,status,error_code FROM weekly_slots "
                 "WHERE group_id=? AND scheduled_date BETWEEN ? AND ? AND week_start=? "
@@ -2046,7 +2185,7 @@ def create_app(
         for row in rows:
             pair = row["send_day_pair"]
             dates = [] if pair is None else [(monday + timedelta(days=day)).isoformat() for day in SEND_DAY_PAIRS[pair]]
-            accounts.append({**dict(row), "send_days": [
+            accounts.append({**dict(row), **channel_subscriptions.get(row["id"], {}), "send_days": [
                 {"scheduled_date": day, "slots": slots_by_day.get((row["id"], day), [])} for day in dates
             ]})
         return accounts
@@ -2102,6 +2241,9 @@ def create_app(
             if account["lifecycle"] == "deleted":
                 connection.commit()
                 return {"deleted": True}
+            if has_unresolved_reactions(connection, account_id):
+                connection.rollback()
+                raise HTTPException(409, "channel_reaction_reconciliation_required")
             unresolved = connection.execute(
                 "SELECT 1 FROM operations WHERE account_id=? AND status IN ('in_flight','unknown') LIMIT 1",
                 (account_id,),
@@ -2148,6 +2290,8 @@ def create_app(
         await lock.acquire()
         try:
             with db() as connection:
+                if has_unresolved_reactions(connection, account_id):
+                    raise HTTPException(409, "channel_reaction_reconciliation_required")
                 unresolved = connection.execute(
                     "SELECT 1 FROM operations WHERE account_id=? AND status IN ('in_flight','unknown') LIMIT 1",
                     (account_id,),
@@ -2297,13 +2441,17 @@ def create_app(
 
     @app.post("/api/run/stop")
     async def stop(_session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
-        with db() as connection:
+        with db() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            set_channel_reactions_run(connection, stopped=True)
             connection.execute("UPDATE settings SET value='1' WHERE key='global_stop'")
         return {"stopped": True}
 
     @app.post("/api/run/start")
     async def start(_session: sqlite3.Row = Depends(require_csrf)) -> dict[str, bool]:
-        with db() as connection:
+        with db() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            set_channel_reactions_run(connection, stopped=False)
             connection.execute("UPDATE settings SET value='0' WHERE key='global_stop'")
         return {"stopped": False}
 

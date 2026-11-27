@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from urllib.request import urlopen
 
@@ -436,6 +436,122 @@ def test_owner_login_navigation_and_run_controls_at_supported_widths(page: Page,
     page.locator("#texts").fill("Первый тестовый текст\nВторой тестовый текст")
     page.get_by_role("button", name="Сохранить новый цикл").click()
     expect(page.locator("#view")).to_contain_text("2 текстов")
+
+
+@pytest.mark.parametrize("width", [390, 768, 1440])
+def test_owner_configures_channel_reactions_and_uses_common_run_controls(page: Page, local_app, width):
+    page.set_viewport_size({"width": width, "height": 900})
+    login(page, local_app)
+    panel = page.get_by_role("region", name="Канал и реакции")
+    enabled = panel.get_by_role("checkbox", name="Включить автоподписку и реакции")
+    channel = panel.get_by_label("Ссылка на публичный канал MAX")
+    reactions = panel.get_by_label("Реакции", exact=True)
+    save = panel.get_by_role("button", name="Сохранить настройки канала")
+
+    expect(panel.get_by_role("status")).to_have_text("Выключено")
+    expect(enabled).not_to_be_checked()
+    channel.fill("https://max.ru/test-channel")
+    reactions.fill("👍, 👍")
+    enabled.press("Space")
+    save.press("Enter")
+    expect(panel.get_by_role("alert")).to_have_text("Укажите минимум две разные реакции.")
+    expect(reactions).to_have_value("👍, 👍")
+
+    channel.fill("https://example.com/test-channel")
+    reactions.fill("👍, 🔥")
+    save.press("Enter")
+    expect(panel.get_by_role("alert")).to_have_text("Укажите публичную ссылку канала вида https://max.ru/…")
+
+    channel.fill("https://max.ru/test-channel")
+    save.press("Enter")
+    expect(page.locator("#notice")).to_have_text("Настройки канала сохранены")
+    expect(panel.get_by_role("status")).to_have_text("Реакции остановлены")
+    assert page_has_no_overflow(page)
+
+    page.reload()
+    expect(enabled).to_be_checked()
+    expect(channel).to_have_value("https://max.ru/test-channel")
+    expect(reactions).to_have_value("👍, 🔥")
+    page.locator("#run-toggle").press("Enter")
+    expect(panel.get_by_role("status")).to_have_text("Реакции запущены")
+    page.locator("#run-toggle").press("Enter")
+    expect(panel.get_by_role("status")).to_have_text("Реакции остановлены")
+    assert page_has_no_overflow(page)
+
+
+@pytest.fixture
+def channel_subscription(local_app):
+    with closing(connect(local_app.app.state.database)) as connection:
+        group_id = connection.execute(
+            "INSERT INTO groups(name,invite_link,chat_id) VALUES('Группа MAX','https://max.ru/join/test','7001')",
+        ).lastrowid
+        account_id = connection.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,ever_authenticated) "
+            "VALUES(?, '+79990000123', 'Иван Тестовый', 'active', 'authenticated', 1)",
+            (group_id,),
+        ).lastrowid
+        config_id = connection.execute(
+            "INSERT INTO channel_reaction_configs(channel_url,reactions,enabled,chat_id) "
+            "VALUES('https://max.ru/test-channel', '[]', 0, -232)",
+        ).lastrowid
+        connection.execute(
+            "INSERT INTO channel_subscriptions(account_id,config_id,status,joined_at_ms) VALUES(?,?,'subscribed',1)",
+            (account_id, config_id),
+        )
+    return SimpleNamespace(account_id=account_id, config_id=config_id)
+
+
+def test_owner_reconciles_channel_reaction_with_keyboard(page: Page, local_app, channel_subscription):
+    page.set_viewport_size({"width": 390, "height": 900})
+    post_id = 9_007_199_254_740_993
+    published_at_ms = int(datetime(2026, 11, 25, 10, 30, tzinfo=timezone.utc).timestamp() * 1000)
+    with closing(connect(local_app.app.state.database)) as connection:
+        operation_id = connection.execute(
+            "INSERT INTO channel_reaction_operations(config_id,account_id,chat_id,post_id,published_at_ms,status,emoji) "
+            "VALUES(?,?,-232,?,?,'unknown','🔥')",
+            (channel_subscription.config_id, channel_subscription.account_id, post_id, published_at_ms),
+        ).lastrowid
+        connection.execute(
+            "UPDATE channel_reaction_configs SET retired_at_ms=? WHERE id=?",
+            (published_at_ms + 1, channel_subscription.config_id),
+        )
+        connection.execute(
+            "INSERT INTO channel_reaction_configs(channel_url,reactions,enabled) "
+            "VALUES('https://max.ru/new-test-channel', '[]', 0)"
+        )
+    login(page, local_app)
+    panel = page.get_by_role("region", name="Канал и реакции")
+    review = panel.get_by_text(f"Аккаунт {channel_subscription.account_id} · канал -232 · пост {post_id} · 🔥")
+    expect(review).to_be_visible()
+    expect(panel.get_by_label("Ссылка на публичный канал MAX")).to_have_value("https://max.ru/new-test-channel")
+    old_channel = panel.get_by_role("link", name="Открыть канал в MAX")
+    expect(old_channel).to_have_attribute("href", "https://max.ru/test-channel")
+    expect(old_channel).to_have_attribute("rel", "noopener noreferrer")
+    published_at = panel.locator(f'[data-review-id="{operation_id}"] time')
+    expect(published_at).to_have_attribute("datetime", "2026-11-25T10:30:00.000Z")
+    expect(published_at).to_contain_text("13:30")
+    assert page_has_no_overflow(page)
+    panel.get_by_role("button", name="Реакция есть").press("Enter")
+    expect(page.locator("#notice")).to_have_text("Результат сверки сохранён")
+    expect(review).to_have_count(0)
+    with closing(connect(local_app.app.state.database)) as connection:
+        row = connection.execute("SELECT status,emoji FROM channel_reaction_operations WHERE id=?", (operation_id,)).fetchone()
+        assert tuple(row) == ("confirmed", "🔥")
+
+
+def test_owner_sees_channel_subscription_error_separately_from_group_status(page: Page, local_app, channel_subscription):
+    with closing(connect(local_app.app.state.database)) as connection:
+        connection.execute(
+            "UPDATE channel_subscriptions SET status='failed',error_code='ip_assignment_unavailable' WHERE account_id=?",
+            (channel_subscription.account_id,),
+        )
+    login(page, local_app)
+    page.get_by_role("button", name="Группы, номера и IP").click()
+    page.get_by_role("button", name="Номера", exact=True).press("Enter")
+    row = page.locator(".account-row").filter(has_text="Иван Тестовый")
+    expect(row).to_contain_text("подключён · авторизован")
+    expect(row).to_contain_text("Канал: ошибка подписки")
+    expect(row).to_contain_text("Назначенный IP недоступен.")
 
 
 def test_guest_connect_survives_reload_and_verifies_membership(page: Page, browser, local_app):

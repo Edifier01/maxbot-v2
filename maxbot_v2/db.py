@@ -225,6 +225,57 @@ CREATE TABLE IF NOT EXISTS onboarding_log_context (
 );
 CREATE INDEX IF NOT EXISTS idx_onboarding_rejected_starts ON onboarding_log_context(created_at DESC)
     WHERE rejection_code IS NOT NULL;
+CREATE TABLE IF NOT EXISTS channel_reaction_configs (
+    id INTEGER PRIMARY KEY,
+    channel_url TEXT NOT NULL,
+    reactions TEXT NOT NULL,
+    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+    chat_id INTEGER,
+    retired_at_ms INTEGER,
+    history_through_ms INTEGER,
+    scan_before_ms INTEGER,
+    scan_floor_ms INTEGER,
+    scan_newest_ms INTEGER,
+    scan_page_size INTEGER NOT NULL DEFAULT 50
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_reaction_current
+    ON channel_reaction_configs((1)) WHERE retired_at_ms IS NULL;
+CREATE TABLE IF NOT EXISTS channel_reaction_pauses (
+    id INTEGER PRIMARY KEY,
+    scope INTEGER NOT NULL,
+    started_at_ms INTEGER NOT NULL,
+    resumed_at_ms INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_reaction_open_pause
+    ON channel_reaction_pauses(scope) WHERE resumed_at_ms IS NULL;
+CREATE INDEX IF NOT EXISTS idx_channel_reaction_pause_time ON channel_reaction_pauses(scope,started_at_ms);
+CREATE TABLE IF NOT EXISTS channel_subscriptions (
+    account_id INTEGER PRIMARY KEY REFERENCES accounts(id),
+    config_id INTEGER NOT NULL REFERENCES channel_reaction_configs(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    joined_at_ms INTEGER,
+    last_emoji TEXT,
+    next_attempt_ms INTEGER NOT NULL DEFAULT 0,
+    error_code TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_channel_subscription_ready ON channel_subscriptions(config_id,status,next_attempt_ms);
+CREATE TABLE IF NOT EXISTS channel_reaction_operations (
+    id INTEGER PRIMARY KEY,
+    config_id INTEGER NOT NULL REFERENCES channel_reaction_configs(id),
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    chat_id INTEGER NOT NULL,
+    post_id INTEGER NOT NULL,
+    published_at_ms INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    emoji TEXT,
+    next_attempt_ms INTEGER NOT NULL DEFAULT 0,
+    inspect_pending INTEGER NOT NULL DEFAULT 0 CHECK(inspect_pending IN (0,1)),
+    UNIQUE(account_id,chat_id,post_id)
+);
+CREATE INDEX IF NOT EXISTS idx_channel_reaction_op_config ON channel_reaction_operations(config_id,status,next_attempt_ms);
+CREATE INDEX IF NOT EXISTS idx_channel_reaction_op_account ON channel_reaction_operations(account_id,config_id,published_at_ms);
+CREATE INDEX IF NOT EXISTS idx_channel_reaction_unresolved ON channel_reaction_operations(account_id,config_id)
+    WHERE status IN ('in_flight','unknown');
 """
 
 DEFAULTS = {

@@ -6,6 +6,11 @@
 .proxy-import{max-width:520px}.check-line{display:flex;gap:8px;align-items:center}.check-line input{width:auto;margin:0}.proxy-entries{max-height:360px;overflow:auto}.account-proxy-form{width:100%}.ip-panel .row>.actions{justify-content:flex-end;flex-shrink:0}@media(max-width:420px){.ip-panel .row>.actions{flex-direction:column;align-items:stretch}}
 .account-row{align-items:flex-start}.account-row>.actions{flex:0 1 270px}.send-days{list-style:none;margin:6px 0 0;padding:0;font-size:13px}.send-days li+li{margin-top:4px}.send-day-count{font-weight:650}.send-day-unknown{color:#b42318}@media(max-width:800px){.account-row{display:block}.account-row>.actions{margin-top:12px}}
 .log-table td[data-label="Телефон"]{white-space:nowrap;font-variant-numeric:tabular-nums}
+.channel-settings{max-width:520px}
+.channel-settings button{width:auto}
+.channel-review-list{list-style:none;margin:0;padding:0}
+.channel-review-list .row{align-items:flex-start;flex-wrap:wrap}
+.channel-review-meta{display:flex;flex-wrap:wrap;gap:4px 12px}
 @media(max-width:800px){
  .log-table,.log-table tbody{display:block;white-space:normal}
  .log-table thead{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);}

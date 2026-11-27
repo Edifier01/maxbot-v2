@@ -43,6 +43,232 @@ def owner_client(tmp_path, monkeypatch):
     return client, response.json()["csrf_token"]
 
 
+def test_channel_configuration_requires_owner_and_csrf(tmp_path, monkeypatch):
+    owner, csrf = owner_client(tmp_path, monkeypatch)
+    guest = TestClient(owner.app, base_url="https://test.local")
+    endpoint = "/api/channel-reactions"
+    assert guest.get(endpoint).status_code == 401
+    assert owner.get(endpoint).json()["enabled"] is False
+    payload = {"enabled": True, "channel_url": "https://max.ru/test-channel", "reactions": ["👍", "🔥"]}
+    assert owner.put(endpoint, json=payload).status_code == 403
+    headers = {"X-CSRF-Token": csrf}
+    assert owner.put(endpoint, headers=headers, json={**payload, "reactions": ["👍"]}).status_code == 422
+    assert owner.put(endpoint, headers=headers, json={**payload, "channel_url": "https://max.ru/join/secret"}).status_code == 422
+    saved = owner.put(endpoint, headers=headers, json=payload)
+    assert saved.status_code == 200
+    assert all(saved.json()[key] == value for key, value in payload.items())
+    assert saved.json()["stopped"] is True
+    assert saved.json()["reviews"] == []
+
+
+@pytest.mark.parametrize("manual_membership", [False, True])
+def test_first_successful_connection_enrolls_for_channel_without_blocking_group(tmp_path, monkeypatch, manual_membership):
+    tasks = []
+    real_create_task = asyncio.create_task
+
+    def capture_onboarding(coroutine, **kwargs):
+        if coroutine.cr_code.co_name == "run_onboarding_auth":
+            tasks.append(coroutine)
+            return None
+        return real_create_task(coroutine, **kwargs)
+
+    monkeypatch.setattr("maxbot_v2.app.asyncio.create_task", capture_onboarding)
+    owner, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    config = {"enabled": True, "channel_url": "https://max.ru/test-channel", "reactions": ["👍", "🔥"]}
+    assert owner.put("/api/channel-reactions", headers=headers, json=config).status_code == 200
+    group_id = owner.post("/api/groups", headers=headers, json={
+        "name": "Клуб", "invite_link": "https://max.ru/join/test",
+    }).json()["id"]
+    token = owner.get(f"/api/groups/{group_id}/onboarding-link").json()["url"].rsplit("/", 1)[1]
+    with closing(connect(owner.app.state.database)) as db:
+        db.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,ever_authenticated) "
+            "VALUES(?,'+79991234568','Ранее подключён','active','authenticated',1)", (group_id,),
+        )
+    channel_joins = []
+    group_reads = 0
+
+    class FakeAdapter:
+        client = SimpleNamespace(me=SimpleNamespace(contact=SimpleNamespace(id=781)))
+
+        async def connect(self):
+            pass
+
+        def persist_session_snapshot(self):
+            return True
+
+        async def resolve_group_by_link(self, _link):
+            return SimpleNamespace(id=100)
+
+        async def resolve_channel(self, link):
+            assert link == config["channel_url"]
+            return SimpleNamespace(id=-42, type="CHANNEL")
+
+        async def get_chat(self, chat_id):
+            nonlocal group_reads
+            if chat_id == 100:
+                group_reads += 1
+                if manual_membership and group_reads == 1:
+                    raise ConnectionResetError()
+                return SimpleNamespace(id=chat_id, status="member", join_time=1)
+            assert chat_id == -42
+            return SimpleNamespace(
+                id=chat_id, type="CHANNEL", status="member" if channel_joins and not manual_membership else "left",
+                join_time=1 if channel_joins and not manual_membership else 0,
+            )
+
+        async def join_channel(self, link):
+            channel_joins.append(link)
+            if manual_membership:
+                raise TimeoutError()
+            return SimpleNamespace(id=-42, type="CHANNEL", status="member", join_time=1)
+
+        async def close(self):
+            pass
+
+    def adapter_factory(_cls, **kwargs):
+        assert kwargs.get("send_proxy_url") is None
+        assert kwargs["source_ip"] == "62.109.20.186"
+        return FakeAdapter()
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(adapter_factory))
+    guest = f"/api/public/onboarding/{token}"
+    attempt = owner.post(f"{guest}/start", json={"full_name": "Иван", "phone": "+79991234567"})
+    assert attempt.status_code == 200
+    session = f"{guest}/{attempt.json()['session_id']}"
+    asyncio.run(tasks.pop())
+    worker = owner.app.state.channel_reaction_worker
+    if manual_membership:
+        assert owner.get(session).json()["state"] == "waiting_membership"
+        asyncio.run(worker.run_once())
+        assert channel_joins == []
+        assert owner.post(f"{session}/check-membership", json={}).json()["completed"]
+
+    assert owner.get(session).json()["state"] == "completed"
+    asyncio.run(worker.run_once())
+    assert channel_joins == [config["channel_url"]]
+    accounts = owner.get(f"/api/groups/{group_id}/accounts").json()
+    assert accounts[0].get("channel_subscription_status") is None
+    assert accounts[1]["channel_subscription_status"] == ("join_uncertain" if manual_membership else "subscribed")
+    assert accounts[1]["status"] == "active"
+
+
+def test_channel_reads_and_writes_only_through_the_account_verified_proxy(tmp_path, monkeypatch):
+    owner, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    assert owner.put("/api/channel-reactions", headers=headers, json={
+        "enabled": True, "channel_url": "https://max.ru/test-channel", "reactions": ["👍", "🔥"],
+    }).status_code == 200
+    group_id = owner.post("/api/groups", headers=headers, json={
+        "name": "Клуб", "invite_link": "https://max.ru/join/test",
+    }).json()["id"]
+    ip_id = owner.get("/api/ips").json()[0]["id"]
+    proxy_pool = f"/api/ips/{ip_id}/send-proxies"
+    proxy_id = owner.post(proxy_pool, headers=headers, json={"urls": ["socks5://8.8.4.4:1080"]}).json()["proxy_ids"][0]
+    check_and_enable_fake_proxies(owner, proxy_pool, headers, [proxy_id], monkeypatch)
+    published_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - 1
+    with closing(connect(owner.app.state.database)) as db:
+        account_id = db.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,ever_authenticated) "
+            "VALUES(?,'+79991234567','Иван','active','authenticated',1)", (group_id,),
+        ).lastrowid
+        config_id = db.execute("SELECT id FROM channel_reaction_configs").fetchone()[0]
+        db.execute("UPDATE channel_reaction_configs SET chat_id=-42 WHERE id=?", (config_id,))
+        db.execute(
+            "INSERT INTO channel_subscriptions(account_id,config_id,status,joined_at_ms) VALUES(?,?,'subscribed',?)",
+            (account_id, config_id, published_at_ms - 100),
+        )
+        db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
+        db.execute("INSERT INTO send_proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy_id))
+        db.execute("UPDATE send_proxies SET enabled=0 WHERE id=?", (proxy_id,))
+
+    calls = []
+
+    class FakeAdapter:
+        def __init__(self, validate):
+            self.validate = validate
+
+        async def connect(self):
+            self.validate()
+
+        async def close(self):
+            pass
+
+        async def fetch_channel_posts(self, chat_id, **_options):
+            self.validate()
+            calls.append(("history", chat_id))
+            return [SimpleNamespace(id=81, published_at_ms=published_at_ms, is_publication=True)]
+
+        async def read_channel_reaction(self, chat_id, post_id):
+            self.validate()
+            calls.append(("read", chat_id, post_id))
+            return None
+
+        async def write_channel_reaction(self, chat_id, post_id, emoji):
+            self.validate()
+            calls.append(("write", chat_id, post_id))
+            return emoji
+
+    def adapter_factory(_cls, **kwargs):
+        assert kwargs["source_ip"] == "62.109.20.186"
+        assert kwargs["send_proxy_url"] == "socks5://8.8.4.4:1080"
+        assert owner.app.state.account_session_locks.for_account(account_id).locked()
+        return FakeAdapter(kwargs["before_network_action"])
+
+    monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.create", classmethod(adapter_factory))
+    assert owner.post("/api/run/start", headers=headers).status_code == 200
+    worker = owner.app.state.channel_reaction_worker
+    asyncio.run(worker.run_once())
+    assert calls == []
+    with closing(connect(owner.app.state.database)) as db:
+        db.execute("UPDATE send_proxies SET enabled=1 WHERE id=?", (proxy_id,))
+        db.execute("UPDATE server_ips SET available=0 WHERE id=?", (ip_id,))
+    asyncio.run(worker.run_once())
+    assert calls == []
+    with closing(connect(owner.app.state.database)) as db:
+        db.execute("UPDATE server_ips SET available=1 WHERE id=?", (ip_id,))
+    asyncio.run(worker.run_once())
+    assert calls == [("history", -42), ("read", -42, 81), ("write", -42, 81)]
+
+
+def test_unknown_channel_reaction_blocks_deletion_until_owner_reconciles(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSION_RUNTIME_DIR", str(tmp_path / "runtime"))
+    owner, csrf = owner_client(tmp_path, monkeypatch)
+    headers = {"X-CSRF-Token": csrf}
+    config_url = "/api/channel-reactions"
+    assert owner.put(config_url, headers=headers, json={
+        "enabled": True, "channel_url": "https://max.ru/test-channel", "reactions": ["👍", "🔥"],
+    }).status_code == 200
+    group_id = owner.post("/api/groups", headers=headers, json={
+        "name": "Клуб", "invite_link": "https://max.ru/join/test",
+    }).json()["id"]
+    with closing(connect(owner.app.state.database)) as db:
+        account_id = db.execute(
+            "INSERT INTO accounts(group_id,phone,full_name,status,auth_state,ever_authenticated) "
+            "VALUES(?,'+79991234567','Иван','active','authenticated',1)", (group_id,),
+        ).lastrowid
+        config_id = db.execute("SELECT id FROM channel_reaction_configs").fetchone()[0]
+        db.execute(
+            "INSERT INTO channel_subscriptions(account_id,config_id,status,joined_at_ms) VALUES(?,?,'subscribed',1)",
+            (account_id, config_id),
+        )
+        operation_id = db.execute(
+            "INSERT INTO channel_reaction_operations(config_id,account_id,chat_id,post_id,published_at_ms,status,emoji) "
+            "VALUES(?,?,-42,81,5,'unknown','🔥')", (config_id, account_id),
+        ).lastrowid
+    account_url = f"/api/accounts/{account_id}"
+    reconcile_url = f"{config_url}/operations/{operation_id}/reconcile"
+    blocked = owner.delete(account_url, headers=headers)
+    assert (blocked.status_code, blocked.json()["detail"]) == (409, "channel_reaction_reconciliation_required")
+    assert owner.post(reconcile_url, json={"outcome": "not_applied"}).status_code == 403
+    assert owner.post(reconcile_url, headers=headers, json={"outcome": "not_applied"}).json() == {"resolved": True}
+    assert owner.post(reconcile_url, headers=headers, json={"outcome": "confirmed"}).status_code == 409
+    assert owner.delete(account_url, headers=headers).json() == {"deleted": True}
+    with closing(connect(owner.app.state.database)) as db:
+        assert db.execute("SELECT status FROM channel_reaction_operations WHERE id=?", (operation_id,)).fetchone()[0] == "not_applied"
+
+
 def test_group_invite_and_message_pool_are_owner_scoped(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
