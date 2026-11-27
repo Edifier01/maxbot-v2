@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 from contextlib import closing
 from importlib.metadata import version
+from types import SimpleNamespace
 
 import pytest
 from pymax.exceptions import ApiError
@@ -13,6 +14,69 @@ from pymax.session import SessionStore
 from maxbot_v2.crypto import SecretBox
 from maxbot_v2.max_adapter import AdapterUnavailable, PyMaxAdapter
 from maxbot_v2.session_vault import EncryptedSessionFile
+
+
+def test_channel_adapter_reads_only_publications_and_checks_own_reaction():
+    async def scenario():
+        async def fetch_history(**kwargs):
+            assert kwargs == {"chat_id": -10, "backward": 25, "from_time": 900}
+            return [
+                SimpleNamespace(id=1, chat_id=-10, post_id=None, time=700, type="USER"),
+                SimpleNamespace(id=2, chat_id=-10, post_id=1, time=710, type="USER"),
+                SimpleNamespace(id=3, chat_id=9, post_id=None, time=720, type="USER"),
+                SimpleNamespace(id=4, chat_id=-10, post_id=None, time=730, type="CONTROL"),
+            ]
+
+        async def get_reactions(**kwargs):
+            assert kwargs == {"chat_id": -10, "message_ids": [1]}
+            return {"1": SimpleNamespace(your_reaction="🔥")}
+
+        async def add_reaction(**kwargs):
+            assert kwargs == {"chat_id": -10, "message_id": 1, "reaction": "👍"}
+            return SimpleNamespace(your_reaction="👍")
+
+        adapter = PyMaxAdapter(SimpleNamespace(
+            fetch_history=fetch_history, get_reactions=get_reactions, add_reaction=add_reaction,
+        ))
+        page = await adapter.fetch_channel_posts(-10, before_ms=900, limit=25)
+        assert [(post.id, post.published_at_ms) for post in page if post.is_publication] == [(1, 700)]
+        assert len(page) == 4
+        assert await adapter.read_channel_reaction(-10, 1) == "🔥"
+        assert await adapter.write_channel_reaction(-10, 1, "👍") == "👍"
+
+    asyncio.run(scenario())
+
+
+def test_channel_adapter_resolves_public_link_without_joining():
+    async def invoke(opcode, payload):
+        assert opcode == Opcode.LINK_INFO
+        assert payload == {"link": "https://max.ru/public-channel"}
+        return InboundFrame(opcode=opcode, payload={
+            "chat": {"id": -45, "type": "CHANNEL", "status": "LEFT", "owner": 17},
+        })
+
+    adapter = PyMaxAdapter(SimpleNamespace(_app=SimpleNamespace(invoke=invoke)))
+    resolved = asyncio.run(adapter.resolve_channel("https://max.ru/public-channel"))
+    assert resolved.id == -45
+    assert resolved.type == "CHANNEL"
+
+
+def test_channel_adapter_checks_post_before_treating_missing_reactions_as_empty():
+    async def scenario():
+        async def get_reactions(**_kwargs):
+            return None
+
+        async def get_message(**kwargs):
+            return {1: SimpleNamespace(reaction_info=SimpleNamespace(your_reaction="🔥")),
+                    2: SimpleNamespace(reaction_info=None)}.get(kwargs["message_id"])
+
+        adapter = PyMaxAdapter(SimpleNamespace(get_reactions=get_reactions, get_message=get_message))
+        assert await adapter.read_channel_reaction(-10, 1) == "🔥"
+        assert await adapter.read_channel_reaction(-10, 2) is None
+        with pytest.raises(LookupError, match="channel_post_unavailable"):
+            await adapter.read_channel_reaction(-10, 3)
+
+    asyncio.run(scenario())
 
 
 def test_pinned_client_uses_standard_sms_flow_and_bound_transport(tmp_path, monkeypatch):

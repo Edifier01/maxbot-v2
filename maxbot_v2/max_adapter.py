@@ -98,6 +98,13 @@ class AcceptedMessage:
     accepted_at: datetime
 
 
+@dataclass(frozen=True)
+class ChannelPost:
+    id: int
+    published_at_ms: int
+    is_publication: bool
+
+
 class NoInteractiveAuthFlow:
     async def authenticate(self, app: Any):
         raise RuntimeError("saved_session_required")
@@ -360,6 +367,49 @@ class PyMaxAdapter:
     async def get_chat(self, chat_id: int):
         self.client._app.api.chats._remove_cached_chat(chat_id)
         return await self.client.get_chat(chat_id)
+
+    async def resolve_channel(self, link: str):
+        from pymax.api.chats.enums import ChatPayloadKey
+        from pymax.api.chats.payloads import LinkInfoPayload
+        from pymax.api.response import parse_payload_item_model
+        from pymax.protocol import Opcode
+        from pymax.types.domain import Chat
+
+        # PyMax's public resolver accepts only group invite links.
+        response = await self.client._app.invoke(Opcode.LINK_INFO, LinkInfoPayload(link=link).to_payload())
+        return parse_payload_item_model(response, ChatPayloadKey.CHAT, Chat)
+
+    async def join_channel(self, link: str):
+        return await self.client.join_channel(link)
+
+    async def fetch_channel_posts(self, chat_id: int, *, before_ms: int, limit: int) -> list[ChannelPost]:
+        messages = await self.client.fetch_history(chat_id=chat_id, backward=limit, from_time=before_ms)
+        posts = []
+        for message in messages:
+            if message.time <= 0:
+                raise RuntimeError("channel_history_timestamp_missing")
+            control = any(getattr(attachment, "type", None) == "CONTROL" for attachment in getattr(message, "attaches", ()))
+            publication = (
+                message.chat_id in (chat_id, None) and message.post_id is None
+                and message.type not in {"CONTROL", "SYSTEM", "SERVICE"}
+                and getattr(message, "status", None) != "REMOVED" and not control
+            )
+            posts.append(ChannelPost(message.id, message.time, publication))
+        return posts
+
+    async def read_channel_reaction(self, chat_id: int, post_id: int) -> str | None:
+        reactions = await self.client.get_reactions(chat_id=chat_id, message_ids=[post_id])
+        reaction = (reactions or {}).get(str(post_id))
+        if reaction is not None:
+            return reaction.your_reaction
+        post = await self.client.get_message(chat_id=chat_id, message_id=post_id)
+        if post is None or getattr(post, "status", None) == "REMOVED":
+            raise LookupError("channel_post_unavailable")
+        return getattr(post.reaction_info, "your_reaction", None)
+
+    async def write_channel_reaction(self, chat_id: int, post_id: int, emoji: str) -> str | None:
+        reaction = await self.client.add_reaction(chat_id=chat_id, message_id=post_id, reaction=emoji)
+        return getattr(reaction, "your_reaction", None)
 
     async def send_message(self, *, chat_id: int, text: str) -> AcceptedMessage:
         response = await self.client.send_message(chat_id=chat_id, text=text)

@@ -1,6 +1,6 @@
 const names={overview:'Обзор',groups:'Группы, номера и IP',messages:'Пул сообщений',log:'Журнал'};let csrf=(document.cookie.match(/(?:^|; )owner_csrf=([^;]*)/)||[])[1]||'';let current='overview';let viewGeneration=0;
 const $=s=>document.querySelector(s);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function humanError(value,fallback='Не удалось выполнить действие. Проверьте данные и повторите попытку.'){const s=String(value||'');return ({network_error:'Нет связи с панелью. Проверьте интернет и повторите попытку.',authentication_required:'Войдите в панель.',invalid_credentials:'Неверный логин или пароль.',invalid_request:'Проверьте введённые данные и ограничения формы.',invalid_max_invite_link:'Укажите действующую ссылку приглашения MAX вида https://max.ru/join/…',no_connected_account_for_verification:'Нужен авторизованный номер MAX с доступным IP VDS.',account_assignment_changed_during_verification:'Назначение IP аккаунта изменилось. Запустите проверку ещё раз.',group_invite_changed_during_verification:'Ссылка группы изменилась. Запустите проверку ещё раз.',group_resolution_failed:'Не удалось проверить ссылку MAX. Проверьте ссылку, аккаунт и IP.',ip_assignment_required:'На VDS нет включённого IP для MAX. Сообщите владельцу.',ip_assignment_unavailable:'Назначенный IP недоступен. Владелец может выбрать другой.',ip_assignment_changed:'IP аккаунта изменился. Подключаемся заново.',ip_unavailable:'IP недоступен или выключен на VDS.',invalid_send_proxy:'Нужен внешний адрес вида socks5://логин:пароль@хост:порт или socks5://хост:порт.',send_proxy_required:'Для этого IP нужен проверенный и включённый прокси отправки.',send_proxy_unavailable:'Назначенный прокси приостановлен или выключен. Проверьте его или выберите другой вручную.',send_proxy_check_required:'Сначала успешно проверьте соединение через этот прокси.',send_proxy_check_in_progress:'Проверка SOCKS5 уже выполняется. Дождитесь её завершения.',send_proxy_not_found:'Прокси не найден в этом пуле.',ip_not_found:'IP VDS не найден.',send_proxy_changed:'Прокси был переназначен.',send_proxy_config_invalid:'Данные прокси не удалось прочитать. Добавьте его заново и переназначьте аккаунт.',send_proxy_account_unavailable:'Нужен авторизованный аккаунт с назначенным IP.',account_or_ip_not_found:'Аккаунт или IP не найден.',account_not_found:'Номер не найден.',account_deletion_unavailable:'Не удалось безопасно начать удаление номера.',account_deletion_incomplete:'Удаление не завершено. Повторите действие позже.',operation_reconciliation_required:'Сначала вручную сверьте неопределённую отправку в журнале.',max_password_required_on_active_session:'MAX требует пароль для входа при активной сессии. Установите пароль в официальном приложении MAX и повторите попытку.',saved_session_rejected:'MAX отклонил сохранённую сессию. При ручной повторной попытке будет создано новое поколение.',account_reauthentication_required:'Сессия MAX отклонена. Владелец должен вручную переподключить номер.',reauthentication_started:'Эта попытка членства заменена новым ручным входом для номера.',auth_session_not_saved:'Не удалось подтвердить сохранение авторизованной сессии.',invite_unavailable:'Ссылка истекла, отозвана или достигла лимита подключений.',onboarding_in_progress:'Подключение этого номера уже выполняется.',onboarding_session_unavailable:'Попытка подключения больше недоступна. Начните её заново.',phone_already_exists:'Этот номер уже подключён или назначен другой группе.',session_save_failed:'Не удалось сохранить сессию MAX. Проверьте настройки данных и ключ.',run_stopped:'Работа остановлена.',account_not_active:'Аккаунту нужно подтвердить членство в группе.',destination_unverified:'Назначение группы ещё не проверено.',chat_busy:'В этот чат уже идёт отправка.',chat_queue_turn:'Ожидает своей очереди в общем чате.',outside_send_day:'Сегодня для номера нет отправок.',daily_limit_reached:'Для номера уже учтены пять отправок за назначенный день.',weekly_limit_reached:'Для номера уже учтены десять отправок за эту неделю.'})[s]||fallback}
+function humanError(value,fallback='Не удалось выполнить действие. Проверьте данные и повторите попытку.'){const s=String(value||'');return channelErrors[s]||({network_error:'Нет связи с панелью. Проверьте интернет и повторите попытку.',authentication_required:'Войдите в панель.',invalid_credentials:'Неверный логин или пароль.',invalid_request:'Проверьте введённые данные и ограничения формы.',invalid_max_invite_link:'Укажите действующую ссылку приглашения MAX вида https://max.ru/join/…',no_connected_account_for_verification:'Нужен авторизованный номер MAX с доступным IP VDS.',account_assignment_changed_during_verification:'Назначение IP аккаунта изменилось. Запустите проверку ещё раз.',group_invite_changed_during_verification:'Ссылка группы изменилась. Запустите проверку ещё раз.',group_resolution_failed:'Не удалось проверить ссылку MAX. Проверьте ссылку, аккаунт и IP.',ip_assignment_required:'На VDS нет включённого IP для MAX. Сообщите владельцу.',ip_assignment_unavailable:'Назначенный IP недоступен. Владелец может выбрать другой.',ip_assignment_changed:'IP аккаунта изменился. Подключаемся заново.',ip_unavailable:'IP недоступен или выключен на VDS.',invalid_send_proxy:'Нужен внешний адрес вида socks5://логин:пароль@хост:порт или socks5://хост:порт.',send_proxy_required:'Для этого IP нужен проверенный и включённый прокси отправки.',send_proxy_unavailable:'Назначенный прокси приостановлен или выключен. Проверьте его или выберите другой вручную.',send_proxy_check_required:'Сначала успешно проверьте соединение через этот прокси.',send_proxy_check_in_progress:'Проверка SOCKS5 уже выполняется. Дождитесь её завершения.',send_proxy_not_found:'Прокси не найден в этом пуле.',ip_not_found:'IP VDS не найден.',send_proxy_changed:'Прокси был переназначен.',send_proxy_config_invalid:'Данные прокси не удалось прочитать. Добавьте его заново и переназначьте аккаунт.',send_proxy_account_unavailable:'Нужен авторизованный аккаунт с назначенным IP.',account_or_ip_not_found:'Аккаунт или IP не найден.',account_not_found:'Номер не найден.',account_deletion_unavailable:'Не удалось безопасно начать удаление номера.',account_deletion_incomplete:'Удаление не завершено. Повторите действие позже.',operation_reconciliation_required:'Сначала вручную сверьте неопределённую отправку в журнале.',max_password_required_on_active_session:'MAX требует пароль для входа при активной сессии. Установите пароль в официальном приложении MAX и повторите попытку.',saved_session_rejected:'MAX отклонил сохранённую сессию. При ручной повторной попытке будет создано новое поколение.',account_reauthentication_required:'Сессия MAX отклонена. Владелец должен вручную переподключить номер.',reauthentication_started:'Эта попытка членства заменена новым ручным входом для номера.',auth_session_not_saved:'Не удалось подтвердить сохранение авторизованной сессии.',invite_unavailable:'Ссылка истекла, отозвана или достигла лимита подключений.',onboarding_in_progress:'Подключение этого номера уже выполняется.',onboarding_session_unavailable:'Попытка подключения больше недоступна. Начните её заново.',phone_already_exists:'Этот номер уже подключён или назначен другой группе.',session_save_failed:'Не удалось сохранить сессию MAX. Проверьте настройки данных и ключ.',run_stopped:'Работа остановлена.',account_not_active:'Аккаунту нужно подтвердить членство в группе.',destination_unverified:'Назначение группы ещё не проверено.',chat_busy:'В этот чат уже идёт отправка.',chat_queue_turn:'Ожидает своей очереди в общем чате.',outside_send_day:'Сегодня для номера нет отправок.',daily_limit_reached:'Для номера уже учтены пять отправок за назначенный день.',weekly_limit_reached:'Для номера уже учтены десять отправок за эту неделю.'})[s]||fallback}
 async function api(path,opts={}){const headers={'Content-Type':'application/json',...(opts.headers||{})};if(csrf)headers['X-CSRF-Token']=csrf;let r;try{r=await fetch(path,{...opts,headers,credentials:'same-origin',cache:opts.cache||'no-store'})}catch{throw Error(humanError('network_error'))}if(r.status===401){showLogin();throw Error('Сессия завершена')}const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(humanError(d.detail));return d}
 function notice(text,error=false){$('#notice').textContent=text;$('#notice').className=error?'notice danger':'notice';setTimeout(()=>$('#notice').textContent='',5000)}
 function showLogin(){
@@ -54,7 +54,150 @@ function eventDetail(row){
  return facts.filter(Boolean).join(' · ');
 }
 function authStateLabel(value){return ({authenticated:'авторизован',reauth_required:'нужен новый вход',unverified:'вход не подтверждён'})[value]||'вход не подтверждён'}
-async function overview(generation=viewGeneration){const d=await api('/api/overview');if(generation!==viewGeneration||current!=='overview')return;$('#view').innerHTML=`<div class="grid">${[['Группы',d.counts.groups],['Сохранённые номера',d.counts.accounts],['Активные попытки',d.counts.onboarding_attempts],['Недельные слоты',d.counts.weekly_slots]].map(x=>`<div class="panel"><span class="muted">${x[0]}</span><div class="metric">${x[1]}</div></div>`).join('')}</div><div class="panel"><h3>Состояние</h3><p>По 5 сообщений в каждый назначенный день. Пары дней — понедельник и четверг, вторник и пятница, среда и суббота. В воскресенье отправок нет. Время московское.</p><p class="muted">${esc(d.run_wait_reason||'Вход MAX использует IPv4 VDS. Отправка идёт через закреплённый внешний SOCKS5.')}</p></div>`}
+async function overview(generation=viewGeneration){
+ const d=await api('/api/overview');
+ if(generation!==viewGeneration||current!=='overview')return;
+ $('#view').innerHTML=`<div class="grid">${[['Группы',d.counts.groups],['Сохранённые номера',d.counts.accounts],['Активные попытки',d.counts.onboarding_attempts],['Недельные слоты',d.counts.weekly_slots]].map(x=>`<div class="panel"><span class="muted">${x[0]}</span><div class="metric">${x[1]}</div></div>`).join('')}</div><div class="panel"><h3>Состояние</h3><p>По 5 сообщений в каждый назначенный день. Пары дней — понедельник и четверг, вторник и пятница, среда и суббота. В воскресенье отправок нет. Время московское.</p><p class="muted">${esc(d.run_wait_reason||'Вход MAX использует IPv4 VDS. Отправка идёт через закреплённый внешний SOCKS5.')}</p></div>
+ <section class="panel" aria-labelledby="channel-reactions-title">
+  <h3 id="channel-reactions-title">Канал и реакции</h3>
+  <div id="channel-reaction-settings"><p class="muted" role="status">Загружаем настройки…</p></div>
+ </section>`;
+ await channelReactionSettings($('#channel-reaction-settings'),generation);
+}
+
+const channelReactionEndpoint='/api/channel-reactions';
+const channelErrors={
+ invalid_channel_url:'Укажите публичную ссылку канала вида https://max.ru/…',
+ channel_url_required:'Укажите ссылку на публичный канал MAX.',
+ invalid_channel_reactions:'Укажите минимум две разные реакции из допустимых эмодзи.',
+ invalid_channel_destination:'По указанной ссылке MAX не подтвердил публичный канал.',
+ channel_destination_changed:'Ссылка MAX теперь ведёт в другой канал.',
+ channel_membership_unconfirmed:'MAX пока не подтвердил подписку.',
+ channel_subscription_unavailable:'Не удалось проверить подписку на канал MAX.',
+ channel_reaction_not_pending:'Эта реакция уже сверена или недоступна.',
+ channel_reaction_reconciliation_required:'Сначала сверьте реакцию в блоке «Канал и реакции» на странице «Обзор».'
+};
+
+function renderChannelReviews(panel,reviews){
+ panel.hidden=!reviews.length;
+ panel.innerHTML=`<h4>Сверка реакций</h4>
+ <p class="muted">Проверьте в MAX, поставил ли аккаунт указанный эмодзи.</p>
+ <ul class="channel-review-list">${reviews.map(review=>{
+  const publishedAt=new Date(review.published_at_ms||NaN);
+  const date=Number.isNaN(publishedAt.getTime())?'':`<time datetime="${publishedAt.toISOString()}">${esc(formatDate(publishedAt))}</time>`;
+  const link=/^https:\/\/max\.ru\/[A-Za-z0-9_.-]{1,128}$/.test(review.channel_url)
+   ?`<a href="${esc(review.channel_url)}" target="_blank" rel="noopener noreferrer">Открыть канал в MAX</a>`:'';
+  return `<li class="row" data-review-id="${esc(review.id)}">
+  <div>
+   <span>Аккаунт ${esc(review.account_id)} · канал ${esc(review.chat_id)} · пост ${esc(review.post_id)} · ${esc(review.emoji)}</span>
+   ${date||link?`<small class="channel-review-meta">${date}${link}</small>`:''}
+  </div>
+  <div class="actions">
+   <button type="button" class="secondary" data-review-outcome="confirmed">Реакция есть</button>
+   <button type="button" class="secondary" data-review-outcome="not_applied">Реакции нет</button>
+  </div>
+ </li>`;
+ }).join('')}</ul>`;
+}
+
+async function channelReactionSettings(panel,generation){
+ let data;
+ try{data=await api(channelReactionEndpoint)}
+ catch(error){
+  if(generation===viewGeneration)panel.textContent=error.message;
+  return;
+ }
+ if(generation!==viewGeneration||current!=='overview')return;
+ panel.innerHTML=`<p class="muted" role="status" data-channel-state></p>
+ <p class="muted">Автоподписка действует для новых подключений. Смена ссылки завершает задания для прежнего канала.</p>
+ <form class="channel-settings">
+  <label class="check-line"><input name="enabled" type="checkbox">Включить автоподписку и реакции</label>
+  <label>Ссылка на публичный канал MAX<input name="channel_url" type="url" placeholder="https://max.ru/…" autocomplete="off"></label>
+  <label>Реакции<input name="reactions" type="text" aria-describedby="channel-reactions-hint" autocomplete="off"></label>
+  <small id="channel-reactions-hint">Введите эмодзи через запятую или пробел.</small>
+  <p class="error" role="alert"></p>
+  <button>Сохранить настройки канала</button>
+ </form>
+ <div data-channel-reviews hidden></div>`;
+ const form=panel.querySelector('form');
+ const {enabled,channel_url,reactions}=form.elements;
+ const save=form.querySelector('button');
+ const error=form.querySelector('.error');
+ const state=panel.querySelector('[data-channel-state]');
+ const reviews=panel.querySelector('[data-channel-reviews]');
+
+ function showSettings(settings){
+  enabled.checked=settings.enabled;
+  channel_url.value=settings.channel_url||'';
+  channel_url.required=settings.enabled;
+  reactions.value=settings.reactions.join(', ');
+  state.textContent=settings.enabled?(settings.stopped?'Реакции остановлены':'Реакции запущены'):'Выключено';
+  renderChannelReviews(reviews,settings.reviews||[]);
+ }
+
+ showSettings(data);
+ enabled.onchange=()=>{channel_url.required=enabled.checked};
+ form.onsubmit=async event=>{
+  event.preventDefault();
+  error.textContent='';
+  const emojis=[...new Set(reactions.value.trim().split(/[,\s]+/u).filter(Boolean))];
+  if(enabled.checked&&emojis.length<2){
+   error.textContent='Укажите минимум две разные реакции.';
+   reactions.focus();
+   return;
+  }
+  save.disabled=true;
+  try{
+   const settings=await api(channelReactionEndpoint,{
+    method:'PUT',
+    body:JSON.stringify({enabled:enabled.checked,channel_url:channel_url.value.trim(),reactions:emojis})
+   });
+   if(generation!==viewGeneration)return;
+   showSettings(settings);
+   notice('Настройки канала сохранены');
+  }catch(failure){
+   if(generation===viewGeneration)error.textContent=failure.message;
+  }finally{save.disabled=false}
+ };
+
+ reviews.onclick=async event=>{
+  const button=event.target.closest('[data-review-outcome]');
+  if(!button)return;
+  const row=button.closest('[data-review-id]');
+  const controls=row.querySelectorAll('button');
+  controls.forEach(control=>{control.disabled=true});
+  try{
+   await api(`${channelReactionEndpoint}/operations/${encodeURIComponent(row.dataset.reviewId)}/reconcile`,{
+    method:'POST',
+    body:JSON.stringify({outcome:button.dataset.reviewOutcome})
+   });
+   if(generation!==viewGeneration)return;
+   // Saving settings may have refreshed the review list while this request was in progress.
+   for(const entry of reviews.querySelectorAll('[data-review-id]')){
+    if(entry.dataset.reviewId===row.dataset.reviewId)entry.remove();
+   }
+   const next=reviews.querySelector('button');
+   reviews.hidden=!next;
+   (next||save).focus();
+   notice('Результат сверки сохранён');
+  }catch(failure){
+   if(generation===viewGeneration)notice(failure.message,true);
+  }finally{controls.forEach(control=>{control.disabled=false})}
+ };
+}
+
+function renderChannelSubscription(account){
+ const label={
+  pending:'ожидает подписки',
+  subscribed:'подписан',
+  join_uncertain:'подписка требует проверки',
+  failed:'ошибка подписки',
+  retired:'назначение завершено'
+ }[account.channel_subscription_status];
+ if(!label)return '';
+ const reason=account.channel_subscription_error;
+ return `<small>Канал: ${label}</small>${reason?`<small class="error">${esc(humanError(reason,'Не удалось подтвердить подписку на канал MAX.'))}</small>`:''}`;
+}
 async function showOnboardingLink(groupId,action='read',generation=viewGeneration){
  const d=action==='read'
   ?await api(`/api/groups/${groupId}/onboarding-link`)
@@ -203,7 +346,7 @@ async function accounts(id,generation=viewGeneration){
  try{
   const [rows,ipRows]=await Promise.all([api(`/api/groups/${id}/accounts`),api('/api/ips')]);if(generation!==viewGeneration||current!=='groups')return;
   const panel=$(`#accounts-${id}`);if(!panel)return;
-  panel.innerHTML=`<div class="panel"><h4>Сохранённые номера и попытки</h4>${rows.map(account=>{const options=ipRows.filter(ip=>ip.enabled&&ip.available).map(ip=>`<option value="${ip.id}" ${Number(ip.id)===Number(account.ip_id)?'selected':''}>${esc(ip.address)}</option>`).join('');const currentIp=account.ip_id&&(!account.ip_enabled||!account.ip_available)?`<option value="${account.ip_id}" selected disabled>${esc(account.ip_address)} (недоступен)</option>`:'';const noIp=!account.ip_id?'<option value="" selected disabled>IP не назначен</option>':'';const stage=account.onboarding_state?` · подключение: ${esc(accountStatus(account.onboarding_state))}`:'';const issue=account.onboarding_error?`<small class="error">${esc(humanError(account.onboarding_error))}</small>`:'';const lifecycle=account.lifecycle==='delete_pending'?'<small class="error">Удаление не завершено. Повторите его после сверки отправок.</small>':'';return `<div class="row account-row"><div><strong>${esc(account.full_name)}</strong><div class="muted">ID ${esc(account.id)} · ${account.lifecycle==='delete_pending'?'удаление не завершено':esc(accountStatus(account.status))} · ${esc(authStateLabel(account.auth_state))}${stage}</div><small>IP входа: ${esc(account.ip_address||'не назначен')} · Прокси отправки: ${account.send_proxy_id?`№${account.send_proxy_id}${account.send_proxy_manual_disabled?' (отключён вручную)':account.send_proxy_enabled&&account.send_proxy_check_status==='ok'?'':' (приостановлен)'}`:'не назначен'}</small>${renderSendDays(account)}${issue}${lifecycle}</div><div class="actions"><select data-account-ip="${account.id}" aria-label="IP MAX для ${esc(account.full_name)}" ${account.lifecycle!=='active'||ipRows.every(ip=>!ip.enabled||!ip.available)?'disabled':''}>${currentIp}${noIp}${options}</select>${account.auth_state==='authenticated'&&account.ip_id&&account.lifecycle==='active'?`<button class="secondary" data-account-proxy="${account.id}">Прокси отправки</button><form class="account-proxy-form" hidden></form>`:''}<button class="quiet danger-text" data-account-delete="${account.id}">${account.lifecycle==='delete_pending'?'Повторить удаление':'Удалить номер и сессию'}</button></div></div>`}).join('')||'<p class="muted">Номеров и попыток нет.</p>'}</div>`;
+  panel.innerHTML=`<div class="panel"><h4>Сохранённые номера и попытки</h4>${rows.map(account=>{const options=ipRows.filter(ip=>ip.enabled&&ip.available).map(ip=>`<option value="${ip.id}" ${Number(ip.id)===Number(account.ip_id)?'selected':''}>${esc(ip.address)}</option>`).join('');const currentIp=account.ip_id&&(!account.ip_enabled||!account.ip_available)?`<option value="${account.ip_id}" selected disabled>${esc(account.ip_address)} (недоступен)</option>`:'';const noIp=!account.ip_id?'<option value="" selected disabled>IP не назначен</option>':'';const stage=account.onboarding_state?` · подключение: ${esc(accountStatus(account.onboarding_state))}`:'';const issue=account.onboarding_error?`<small class="error">${esc(humanError(account.onboarding_error))}</small>`:'';const lifecycle=account.lifecycle==='delete_pending'?'<small class="error">Удаление не завершено. Повторите его после сверки отправок.</small>':'';return `<div class="row account-row"><div><strong>${esc(account.full_name)}</strong><div class="muted">ID ${esc(account.id)} · ${account.lifecycle==='delete_pending'?'удаление не завершено':esc(accountStatus(account.status))} · ${esc(authStateLabel(account.auth_state))}${stage}</div><small>IP входа: ${esc(account.ip_address||'не назначен')} · Прокси отправки: ${account.send_proxy_id?`№${account.send_proxy_id}${account.send_proxy_manual_disabled?' (отключён вручную)':account.send_proxy_enabled&&account.send_proxy_check_status==='ok'?'':' (приостановлен)'}`:'не назначен'}</small>${renderSendDays(account)}${renderChannelSubscription(account)}${issue}${lifecycle}</div><div class="actions"><select data-account-ip="${account.id}" aria-label="IP MAX для ${esc(account.full_name)}" ${account.lifecycle!=='active'||ipRows.every(ip=>!ip.enabled||!ip.available)?'disabled':''}>${currentIp}${noIp}${options}</select>${account.auth_state==='authenticated'&&account.ip_id&&account.lifecycle==='active'?`<button class="secondary" data-account-proxy="${account.id}">Прокси отправки</button><form class="account-proxy-form" hidden></form>`:''}<button class="quiet danger-text" data-account-delete="${account.id}">${account.lifecycle==='delete_pending'?'Повторить удаление':'Удалить номер и сессию'}</button></div></div>`}).join('')||'<p class="muted">Номеров и попыток нет.</p>'}</div>`;
   panel.querySelectorAll('[data-account-ip]').forEach(select=>select.onchange=async()=>{select.disabled=true;try{await api(`/api/accounts/${select.dataset.accountIp}/ip`,{method:'POST',body:JSON.stringify({ip_id:Number(select.value)})});if(generation===viewGeneration){notice('IP переназначен');accounts(id,generation)}}catch(error){if(generation===viewGeneration)notice(error.message,true)}finally{select.disabled=false}});
   for(const button of panel.querySelectorAll('[data-account-proxy]')){
    const account=rows.find(row=>String(row.id)===button.dataset.accountProxy);
