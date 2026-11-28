@@ -179,7 +179,7 @@ def test_shared_proxy_pool_preview_backfills_manual_disabling_without_remigratin
             (1, 17, 0, 1, "ok", "2026-11-27T08:00:00+00:00"),
             (1, 18, 0, 0, "unchecked", None),
             (2, 17, 1, 0, "ok", "2026-11-27T09:00:00+00:00"),
-            (2, 18, 0, 0, "tls_failed", "2026-11-27T10:00:00+00:00"),
+            (2, 18, 0, 1, "tls_failed", "2026-11-27T10:00:00+00:00"),
         ]
         connection.execute("UPDATE send_proxy_routes SET manual_disabled=0 WHERE ip_id=1 AND proxy_id=17")
         initialize(connection)

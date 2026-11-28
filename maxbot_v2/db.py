@@ -412,7 +412,9 @@ def _migrate_send_proxy_pool(connection: sqlite3.Connection) -> None:
                 "ALTER TABLE send_proxy_routes ADD COLUMN manual_disabled INTEGER NOT NULL DEFAULT 0 CHECK(manual_disabled IN (0,1))"
             )
             # Keep checked routes that were disabled in the preview disabled across automatic checks.
-            connection.execute("UPDATE send_proxy_routes SET manual_disabled=1 WHERE enabled=0 AND check_status='ok'")
+            connection.execute(
+                "UPDATE send_proxy_routes SET manual_disabled=1 WHERE enabled=0 AND check_status<>'unchecked'"
+            )
         if connection.execute("SELECT 1 FROM settings WHERE key=?", (migration_key,)).fetchone() is not None:
             return
 
