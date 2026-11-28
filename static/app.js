@@ -210,8 +210,9 @@ async function showOnboardingLink(groupId,action='read',generation=viewGeneratio
 async function groups(generation=viewGeneration){
  const rows=await api('/api/groups');
  if(generation!==viewGeneration||current!=='groups')return;
- $('#view').innerHTML=`<details id="ip-panel" class="panel ip-panel"><summary>IP-адреса VDS для MAX <span id="ip-count" class="muted">Загрузка…</span></summary><div class="ip-panel-body"><p class="muted">Рабочие адреса включаются автоматически после проверки.</p><button id="refresh-ips" class="secondary">Обновить IP</button><div id="ip-list"></div></div></details><div class="panel"><h3>Добавить группу</h3><form id="new-group" class="inline"><label>Название<input name="name" required></label><label>Ссылка MAX<input name="invite_link" placeholder="https://max.ru/join/…" required></label><button>Добавить</button><p class="error" data-form-error></p></form></div><div id="group-list"></div>`;
- $('#refresh-ips').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{await api('/api/ips/refresh',{method:'POST',body:'{}'});if(generation===viewGeneration){notice('Список IP обновлён');await ips(generation)}}catch(error){if(generation===viewGeneration)notice(error.message,true)}finally{button.disabled=false}};
+ $('#view').innerHTML=`<details id="ip-panel" class="panel ip-panel"><summary>IP-адреса VDS для MAX <span id="ip-count" class="muted">Загрузка…</span></summary><div class="ip-panel-body"><p class="muted">Рабочие адреса включаются автоматически после проверки.</p><button id="refresh-ips" class="secondary">Обновить IP</button><div id="ip-list"></div></div></details><section id="send-proxy-pool" class="panel" aria-labelledby="send-proxy-pool-title"></section><div class="panel"><h3>Добавить группу</h3><form id="new-group" class="inline"><label>Название<input name="name" required></label><label>Ссылка MAX<input name="invite_link" placeholder="https://max.ru/join/…" required></label><button>Добавить</button><p class="error" data-form-error></p></form></div><div id="group-list"></div>`;
+ const updateProxySources=setupProxyPool($('#send-proxy-pool'),generation);
+ $('#refresh-ips').onclick=async event=>{const button=event.currentTarget;button.disabled=true;try{await api('/api/ips/refresh',{method:'POST',body:'{}'});if(button.isConnected&&generation===viewGeneration){notice('Список IP обновлён');await ips(generation,updateProxySources)}}catch(error){if(button.isConnected&&generation===viewGeneration)notice(error.message,true)}finally{button.disabled=false}};
  $('#new-group').onsubmit=async event=>{event.preventDefault();const form=event.currentTarget,button=form.querySelector('button'),data=Object.fromEntries(new FormData(form));button.disabled=true;try{await api('/api/groups',{method:'POST',body:JSON.stringify(data)});if(generation===viewGeneration){notice('Группа добавлена');groups(generation)}}catch(error){if(generation===viewGeneration)form.querySelector('[data-form-error]').textContent=error.message}finally{button.disabled=false}};
   $('#group-list').innerHTML=rows.map(g=>`<div class="panel group-card"><div class="row group-heading"><div><strong>${esc(g.name)}</strong><div class="muted">Сохранено: ${g.account_count} · активных попыток: ${g.onboarding_attempt_count} · авторизовано: ${g.authenticated_account_count} · ${g.chat_id?'группа связана':'ожидает подключения'}</div></div><div class="actions"><span id="add-number-${g.id}"><button disabled>Добавить номер</button></span><button class="secondary" data-accounts="${g.id}">Номера</button><button class="secondary" data-verify="${g.id}" ${g.verifiable_account_count?'':'disabled title="Нужен авторизованный номер с доступным IP"'}>Проверить назначение</button><button class="secondary" data-active="${g.id}" data-enabled="${g.active?1:0}">${g.active?'Остановить':'Запустить'}</button></div></div><section class="group-link"><h4>Ссылка подключения</h4><div id="invite-${g.id}"><span class="muted">Загружаем ссылку…</span></div></section><form class="inline edit-group" data-group="${g.id}"><label>Название<input name="name" value="${esc(g.name)}" required></label><label>Ссылка MAX<input name="invite_link" value="${esc(g.invite_link||'')}" required></label><button>Сохранить изменения</button><p class="error" data-form-error></p></form><div id="accounts-${g.id}"></div></div>`).join('')||'<div class="panel">Пока нет групп</div>';
  for(const g of rows)showOnboardingLink(g.id,'read',generation).catch(error=>{if(generation===viewGeneration)$(`#invite-${g.id}`).textContent=error.message});
@@ -219,21 +220,20 @@ async function groups(generation=viewGeneration){
  document.querySelectorAll('[data-verify]').forEach(button=>button.onclick=async()=>{button.disabled=true;try{const result=await api(`/api/groups/${button.dataset.verify}/verify-destination`,{method:'POST',body:'{}'});if(generation===viewGeneration){notice(`Назначение проверено: ${result.verified_accounts} подтверждено, ${result.accounts_needing_membership} требуют вступления`);groups(generation)}}catch(error){if(generation===viewGeneration)notice(error.message,true)}finally{button.disabled=false}});
  document.querySelectorAll('[data-active]').forEach(button=>button.onclick=async()=>{const enabled=button.dataset.enabled!=='1';button.disabled=true;try{await api(`/api/groups/${button.dataset.active}/active`,{method:'POST',body:JSON.stringify({enabled})});if(generation===viewGeneration)groups(generation)}catch(error){if(generation===viewGeneration)notice(error.message,true)}finally{button.disabled=false}});
  document.querySelectorAll('.edit-group').forEach(form=>form.onsubmit=async event=>{event.preventDefault();const button=form.querySelector('button');button.disabled=true;try{await api(`/api/groups/${form.dataset.group}`,{method:'PUT',body:JSON.stringify(Object.fromEntries(new FormData(form)))});if(generation===viewGeneration){notice('Настройки группы сохранены');groups(generation)}}catch(error){if(generation===viewGeneration)form.querySelector('[data-form-error]').textContent=error.message}finally{button.disabled=false}});
- await ips(generation);
+ await ips(generation,updateProxySources);
 }
-async function ips(generation=viewGeneration){
+async function ips(generation,updateProxySources){
+ const panel=$('#ip-list'),count=$('#ip-count'),request=Symbol();
+ if(!panel||generation!==viewGeneration||current!=='groups')return;
+ panel.ipRequest=request;
+ const isCurrent=()=>panel.isConnected&&panel.ipRequest===request&&generation===viewGeneration;
  try{
-  const rows=await api('/api/ips');if(generation!==viewGeneration||current!=='groups')return;
-  const panel=$('#ip-list');if(!panel)return;
-  if(!$('#send-proxy-pool'))panel.insertAdjacentHTML('afterend','<section id="send-proxy-pool" class="group-link" hidden></section>');
-  $('#ip-count').textContent=`Всего: ${rows.length} · включено: ${rows.filter(ip=>ip.enabled).length}`;
-  panel.innerHTML=rows.map(ip=>`<div class="row"><span><strong>${esc(ip.address)}</strong><small>${ip.available?'Доступен на VDS':'Недоступен на VDS'} · ${ip.enabled?'включён':ip.manual_disabled?'отключён вручную':'приостановлен'} · назначено ${ip.assigned_count} · авторизовано ${ip.authenticated_count} · попыток ${ip.in_progress_count} · не подтверждено ${ip.unconfirmed_count}</small></span><div class="actions"><button class="secondary" data-ip-toggle="${ip.id}" data-enabled="${ip.manual_disabled?0:1}" ${ip.manual_disabled&&!ip.available?'disabled':''}>${ip.manual_disabled?'Включить':'Отключить'}</button><button class="secondary" data-ip-proxies="${ip.id}">Прокси</button></div></div>`).join('')||'<p class="muted">Доступных IP пока нет. Нажмите «Обновить IP».</p>';
-  panel.querySelectorAll('[data-ip-toggle]').forEach(button=>button.onclick=async()=>{const enabled=button.dataset.enabled!=='1',ip=rows.find(item=>Number(item.id)===Number(button.dataset.ipToggle));if(!enabled&&ip?.assigned_count&&!confirm(`Отключить ${ip.address}? Назначенные аккаунты будут приостановлены.`))return;button.disabled=true;try{await api(`/api/ips/${button.dataset.ipToggle}`,{method:'PATCH',body:JSON.stringify({enabled})});if(generation===viewGeneration){notice(enabled?'IP включён':'IP отключён');await ips(generation)}}catch(error){if(generation===viewGeneration)notice(error.message,true)}finally{button.disabled=false}});
-  for(const button of panel.querySelectorAll('[data-ip-proxies]')){
-   const ip=rows.find(row=>String(row.id)===button.dataset.ipProxies);
-   button.onclick=()=>showProxyPool(ip,generation);
-  }
- }catch(error){if(generation===viewGeneration){const panel=$('#ip-list');if(panel)panel.innerHTML=`<p class="error" role="alert">${esc(error.message)}</p>`;const count=$('#ip-count');if(count)count.textContent='Не удалось загрузить IP'}}
+  const rows=await api('/api/ips');if(!isCurrent())return;
+  count.textContent=`Всего: ${rows.length} · включено: ${rows.filter(ip=>ip.enabled).length}`;
+  panel.innerHTML=rows.map(ip=>`<div class="row"><span><strong>${esc(ip.address)}</strong><small>${ip.available?'Доступен на VDS':'Недоступен на VDS'} · ${ip.enabled?'включён':ip.manual_disabled?'отключён вручную':'приостановлен'} · назначено ${ip.assigned_count} · авторизовано ${ip.authenticated_count} · попыток ${ip.in_progress_count} · не подтверждено ${ip.unconfirmed_count}</small></span><div class="actions"><button class="secondary" data-ip-toggle="${ip.id}" data-enabled="${ip.manual_disabled?0:1}" ${ip.manual_disabled&&!ip.available?'disabled':''}>${ip.manual_disabled?'Включить':'Отключить'}</button></div></div>`).join('')||'<p class="muted">Доступных IP пока нет. Нажмите «Обновить IP».</p>';
+  panel.querySelectorAll('[data-ip-toggle]').forEach(button=>button.onclick=async()=>{const enabled=button.dataset.enabled!=='1',ip=rows.find(item=>Number(item.id)===Number(button.dataset.ipToggle));if(!enabled&&ip?.assigned_count&&!confirm(`Отключить ${ip.address}? Назначенные аккаунты будут приостановлены.`))return;button.disabled=true;try{await api(`/api/ips/${button.dataset.ipToggle}`,{method:'PATCH',body:JSON.stringify({enabled})});if(panel.isConnected&&generation===viewGeneration){notice(enabled?'IP включён':'IP отключён');await ips(generation,updateProxySources)}}catch(error){if(panel.isConnected&&generation===viewGeneration)notice(error.message,true)}finally{button.disabled=false}});
+  updateProxySources(rows);
+ }catch(error){if(isCurrent()){panel.innerHTML=`<p class="error" role="alert">${esc(error.message)}</p>`;count.textContent='Не удалось загрузить IP'}}
 }
 function proxyCheckLabel(status){
  return ({
@@ -249,82 +249,128 @@ function proxyCheckLabel(status){
   check_unavailable:'Проверка недоступна',
  })[status]||'Проверка недоступна';
 }
-async function showProxyPool(ip,generation,imported=[],focusSelector='h4'){
- const panel=$('#send-proxy-pool');
- if(!panel||generation!==viewGeneration)return;
- const endpoint=`/api/ips/${ip.id}/send-proxies`;
- const request=Symbol();
- panel.poolRequest=request;
- const currentPool=()=>panel.isConnected&&panel.poolRequest===request&&generation===viewGeneration;
- panel.hidden=false;
- panel.textContent='Загружаем прокси…';
- try{
-  const rows=await api(endpoint);
-  if(!currentPool())return;
-  const batch=imported.length?[...new Set(imported)]:rows.filter(proxy=>proxy.check_status==='unchecked').slice(0,30).map(proxy=>proxy.id);
-  panel.innerHTML=`<h4 tabindex="-1">Прокси для ${esc(ip.address)}</h4><form class="proxy-import">
+function setupProxyPool(panel,generation){
+ const poolEndpoint='/api/send-proxies';
+ panel.innerHTML=`<h3 id="send-proxy-pool-title">Общий пул SOCKS5</h3>
+  <form class="proxy-import">
    <label>Адрес SOCKS5<input type="password" name="url" placeholder="socks5://…" autocomplete="new-password" maxlength="2048"></label>
    <label>Список SOCKS5 в TXT<input type="file" name="list" accept=".txt,text/plain"></label>
    <button>Добавить прокси</button><p class="error" role="alert"></p></form>
-   ${imported.length?`<p class="muted">Номера в порядке импорта: ${imported.map(id=>`№${id}`).join(', ')}</p>`:''}
-   ${batch.length?`<button type="button" class="secondary" data-check-batch>${imported.length?'Проверить импортированные':'Проверить непроверенные'} (${batch.length})</button>`:''}
-   <p class="muted" data-proxy-progress role="status" hidden></p>
-   <div class="proxy-entries">${rows.map(proxy=>{
-    const checked=proxy.check_status==='ok';
-    const state=proxy.manual_disabled?'Отключён вручную':proxy.enabled&&checked?'Включён':proxy.check_status==='unchecked'?'Ожидает проверки':'Приостановлен';
-    return `<div class="row"><span>Прокси №${proxy.id} · ${state}<small>Назначено аккаунтам: ${proxy.assigned_count}</small>
-     <small>${esc(proxyCheckLabel(proxy.check_status))}${proxy.last_checked_at?` · ${esc(formatDate(proxy.last_checked_at))}`:''}</small></span>
-     <div class="actions"><button class="secondary" data-check-proxy="${proxy.id}">Проверить</button>
-     <button class="secondary" data-toggle-proxy="${proxy.id}" data-enabled="${proxy.manual_disabled?0:1}" ${!proxy.manual_disabled||checked?'':'disabled'}>${proxy.manual_disabled?'Включить':'Отключить'}</button></div></div>`;
-   }).join('')||'<p class="muted">Прокси для этого IP пока не добавлены.</p>'}</div>`;
-  (panel.querySelector(focusSelector)||panel.querySelector('h4')).focus();
-  const form=panel.querySelector('form');
-  form.onsubmit=async event=>{
-   event.preventDefault();
-   const button=form.querySelector('button'),error=form.querySelector('.error');
-   const file=form.elements.list.files[0];
-   button.disabled=true;error.textContent='';
-   try{
-    if(file&&file.size>65536)throw new Error('Загрузите TXT до 64 КБ.');
-    const sources=[form.elements.url.value,file?await file.text():''];
-    const urls=sources.join('\n').split(/\r?\n/).map(line=>line.trim()).filter(Boolean);
-    if(urls.length<1||urls.length>30)throw new Error('Укажите от 1 до 30 адресов SOCKS5, по одному на строку.');
-    const result=await api(endpoint,{method:'POST',body:JSON.stringify({urls})});
-    form.reset();
-    if(currentPool()){notice(`Добавлено: ${result.added} · уже в пуле: ${result.duplicates}`);await showProxyPool(ip,generation,result.proxy_ids)}
-   }catch(err){if(currentPool())error.textContent=err.message}finally{button.disabled=false}
-  };
-  async function checkProxies(ids,selector){
-   const progress=panel.querySelector('[data-proxy-progress]');
-   const controls=[...panel.querySelectorAll('[data-check-batch],[data-check-proxy],[data-toggle-proxy]')].filter(button=>!button.disabled);
-   controls.forEach(button=>button.disabled=true);
-   progress.hidden=false;
-   progress.textContent='Проверяем соединение через SOCKS5…';
-   try{
-    const results=await api(`${endpoint}/check`,{method:'POST',body:JSON.stringify({proxy_ids:ids})});
-    if(currentPool()){
-     notice(`Доступно через SOCKS5: ${results.filter(row=>row.check_status==='ok').length} из ${results.length}`);
-     await showProxyPool(ip,generation,imported,selector);
-    }
-   }catch(error){if(currentPool())notice(error.message,true)}finally{
-    controls.forEach(button=>button.disabled=false);
-    progress.hidden=true;
+  <p class="muted" data-proxy-imported hidden></p>
+  <label class="field proxy-source">Исходящий IPv4<select disabled aria-describedby="proxy-source-help"><option value="">Нет IPv4 на VDS</option></select></label>
+  <p class="muted" id="proxy-source-help" hidden></p>
+  <div data-proxy-routes></div>`;
+ const form=panel.querySelector('form');
+ const source=panel.querySelector('select');
+ const sourceHelp=panel.querySelector('#proxy-source-help');
+ const routes=panel.querySelector('[data-proxy-routes]');
+ const pendingActions=new Map();
+ let ipRows=[],imported=[],routeRequest=0;
+ const isCurrent=()=>panel.isConnected&&generation===viewGeneration&&!$('#app').hidden;
+ const selectedIp=()=>ipRows.find(ip=>String(ip.id)===source.value);
+
+ form.onsubmit=async event=>{
+  event.preventDefault();
+  const button=form.querySelector('button'),error=form.querySelector('.error');
+  const file=form.elements.list.files[0],restoreFocus=document.activeElement===button;
+  button.disabled=true;error.textContent='';
+  try{
+   if(file&&file.size>65536)throw new Error('Загрузите TXT до 64 КБ.');
+   const sources=[form.elements.url.value,file?await file.text():''];
+   const urls=sources.join('\n').split(/\r?\n/).map(line=>line.trim()).filter(Boolean);
+   if(urls.length<1||urls.length>30)throw new Error('Укажите от 1 до 30 адресов SOCKS5, по одному на строку.');
+   const result=await api(poolEndpoint,{method:'POST',body:JSON.stringify({urls})});
+   form.reset();
+   if(isCurrent()){
+    imported=result.proxy_ids;
+    const importedInfo=panel.querySelector('[data-proxy-imported]');
+    importedInfo.textContent=`Номера в порядке импорта: ${imported.map(id=>`№${id}`).join(', ')}`;
+    importedInfo.hidden=!imported.length;
+    notice(`Добавлено: ${result.added} · уже в пуле: ${result.duplicates}`);
+    await loadRows();
    }
+  }catch(err){if(isCurrent())error.textContent=err.message}
+  finally{
+   button.disabled=false;
+   if(isCurrent()&&restoreFocus&&document.activeElement===document.body)button.focus();
   }
-  const batchButton=panel.querySelector('[data-check-batch]');
-  if(batchButton)batchButton.onclick=()=>checkProxies(batch,'[data-check-batch]');
-  for(const button of panel.querySelectorAll('[data-check-proxy]')){
-   const id=Number(button.dataset.checkProxy);
-   button.onclick=()=>checkProxies([id],`[data-check-proxy="${id}"]`);
+ };
+
+ async function loadRows(focusSelector){
+  const request=++routeRequest,ip=selectedIp();
+  const endpoint=ip?`/api/ips/${ip.id}/send-proxies`:poolEndpoint;
+  const canCheck=ip?.enabled&&ip.available;
+  sourceHelp.textContent=ip&&!canCheck?'Для проверки маршрутов нужен включённый и доступный IPv4.':'';
+  sourceHelp.hidden=!sourceHelp.textContent;
+  const latest=()=>isCurrent()&&request===routeRequest;
+  routes.innerHTML='<p class="muted" role="status">Загружаем прокси…</p>';
+  try{
+   const rows=await api(endpoint);
+   if(!latest())return;
+   const busy=pendingActions.get(ip?.id);
+   const batch=imported.length?[...new Set(imported)]:rows.filter(proxy=>proxy.check_status==='unchecked').slice(0,30).map(proxy=>proxy.id);
+   routes.innerHTML=`${canCheck&&batch.length?`<button type="button" class="secondary" data-check-batch ${busy?'disabled':''}>${imported.length?'Проверить импортированные':'Проверить непроверенные'} (${batch.length})</button>`:''}
+    <p class="muted" data-proxy-progress role="status" ${busy?'':'hidden'}>${busy||''}</p>
+    <div class="proxy-entries">${rows.map(proxy=>{
+     const checked=proxy.check_status==='ok';
+     const state=proxy.manual_disabled?'Отключён вручную':proxy.enabled&&checked?'Включён':proxy.check_status==='unchecked'?'Ожидает проверки':'Приостановлен';
+     const canToggle=!busy&&(!proxy.manual_disabled||checked);
+     const check=`${esc(proxyCheckLabel(proxy.check_status))}${proxy.last_checked_at?` · ${esc(formatDate(proxy.last_checked_at))}`:''}`;
+     return `<div class="row"><span>Прокси №${proxy.id}${ip?` · ${state}`:''}<small>Назначено аккаунтам: ${proxy.assigned_count}</small>${ip?`<small>${check}</small>`:''}</span>
+      ${ip?`<div class="actions"><button class="secondary" data-check-proxy="${proxy.id}" ${busy||!canCheck?'disabled':''}>Проверить</button>
+      <button class="secondary" data-toggle-proxy="${proxy.id}" data-enabled="${proxy.manual_disabled?0:1}" ${canToggle?'':'disabled'}>${proxy.manual_disabled?'Включить':'Отключить'}</button></div>`:''}</div>`;
+    }).join('')||'<p class="muted">Прокси пока не добавлены.</p>'}</div>`;
+   if(focusSelector&&document.activeElement===document.body){
+    const target=routes.querySelector(focusSelector);
+    (target&&!target.disabled?target:source).focus();
+   }
+   if(!ip)return;
+
+   async function updateRoute(button,selector,path,method,body){
+    if(!latest()||pendingActions.has(ip.id))return;
+    const checking=method==='POST',restoreFocus=document.activeElement===button;
+    const progress=routes.querySelector('[data-proxy-progress]');
+    const message=checking?'Проверяем соединение через SOCKS5…':'Сохраняем состояние маршрута…';
+    pendingActions.set(ip.id,message);
+    routes.querySelectorAll('button').forEach(control=>control.disabled=true);
+    progress.textContent=message;
+    progress.hidden=false;
+    const sameSource=()=>isCurrent()&&selectedIp()?.id===ip.id;
+    try{
+     const results=await api(path,{method,body:JSON.stringify(body)});
+     if(checking&&sameSource())notice(`Доступно через SOCKS5: ${results.filter(row=>row.check_status==='ok').length} из ${results.length}`);
+    }catch(error){if(sameSource())notice(error.message,true)}
+    finally{pendingActions.delete(ip.id)}
+    if(sameSource())await loadRows(latest()&&restoreFocus?selector:null);
+   }
+
+   const batchButton=routes.querySelector('[data-check-batch]');
+   if(batchButton)batchButton.onclick=()=>updateRoute(batchButton,'[data-check-batch]',`${endpoint}/check`,'POST',{proxy_ids:batch});
+   for(const button of routes.querySelectorAll('[data-check-proxy]')){
+    const id=Number(button.dataset.checkProxy);
+    button.onclick=()=>updateRoute(button,`[data-check-proxy="${id}"]`,`${endpoint}/check`,'POST',{proxy_ids:[id]});
+   }
+   for(const button of routes.querySelectorAll('[data-toggle-proxy]')){
+    const id=Number(button.dataset.toggleProxy);
+    button.onclick=()=>updateRoute(button,`[data-toggle-proxy="${id}"]`,`${endpoint}/${id}`,'PATCH',{enabled:button.dataset.enabled==='0'});
+   }
+  }catch(error){
+   if(latest())routes.innerHTML=`<p class="error" role="alert">${esc(error.message)}</p>`;
   }
-  for(const button of panel.querySelectorAll('[data-toggle-proxy]'))button.onclick=async()=>{
-   button.disabled=true;
-   try{
-    await api(`${endpoint}/${button.dataset.toggleProxy}`,{method:'PATCH',body:JSON.stringify({enabled:button.dataset.enabled==='0'})});
-    if(currentPool())await showProxyPool(ip,generation,imported,`[data-toggle-proxy="${button.dataset.toggleProxy}"]`);
-   }catch(err){if(currentPool())notice(err.message,true)}finally{button.disabled=false}
-  };
- }catch(error){if(currentPool())panel.textContent=error.message}
+ }
+
+ source.onchange=()=>loadRows();
+ loadRows();
+ return rows=>{
+  if(!isCurrent())return;
+  const previous=source.value;
+  ipRows=rows;
+  source.innerHTML=rows.map(ip=>`<option value="${ip.id}">${esc(ip.address)}${ip.manual_disabled?' (отключён вручную)':ip.enabled?'':' (приостановлен)'}${ip.available?'':' (недоступен)'}</option>`).join('')||'<option value="">Нет IPv4 на VDS</option>';
+  const next=rows.find(ip=>String(ip.id)===previous)||rows.find(ip=>ip.enabled&&ip.available)||rows[0];
+  source.disabled=!next;
+  if(next)source.value=String(next.id);
+  if(next||previous)loadRows();
+ };
 }
 function renderSendDays(account){
  const pair=['Пн и Чт','Вт и Пт','Ср и Сб'][account.send_day_pair];

@@ -165,7 +165,10 @@ def test_channel_reads_and_writes_only_through_the_account_verified_proxy(tmp_pa
     }).json()["id"]
     ip_id = owner.get("/api/ips").json()[0]["id"]
     proxy_pool = f"/api/ips/{ip_id}/send-proxies"
-    proxy_id = owner.post(proxy_pool, headers=headers, json={"urls": ["socks5://8.8.4.4:1080"]}).json()["proxy_ids"][0]
+    route_url = "socks5://8.8.4.4:1080"
+    proxy_id, alternate_id = owner.post(
+        "/api/send-proxies", headers=headers, json={"urls": [route_url, "socks5://1.1.1.1:1080"]},
+    ).json()["proxy_ids"]
     check_and_enable_fake_proxies(owner, proxy_pool, headers, [proxy_id], monkeypatch)
     published_at_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - 1
     with closing(connect(owner.app.state.database)) as db:
@@ -180,8 +183,12 @@ def test_channel_reads_and_writes_only_through_the_account_verified_proxy(tmp_pa
             (account_id, config_id, published_at_ms - 100),
         )
         db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account_id, ip_id))
-        db.execute("INSERT INTO send_proxy_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy_id))
-        db.execute("UPDATE send_proxies SET enabled=0 WHERE id=?", (proxy_id,))
+        db.execute("INSERT INTO send_proxy_pool_assignments(account_id,proxy_id) VALUES(?,?)", (account_id, proxy_id))
+        db.execute("UPDATE send_proxy_routes SET enabled=0 WHERE ip_id=? AND proxy_id=?", (ip_id, proxy_id))
+        other_ip = db.execute(
+            "INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.187',1,1)",
+        ).lastrowid
+    monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: {"62.109.20.186", "62.109.20.187"})
 
     calls = []
 
@@ -211,8 +218,8 @@ def test_channel_reads_and_writes_only_through_the_account_verified_proxy(tmp_pa
             return emoji
 
     def adapter_factory(_cls, **kwargs):
-        assert kwargs["source_ip"] == "62.109.20.186"
-        assert kwargs["send_proxy_url"] == "socks5://8.8.4.4:1080"
+        assert kwargs["source_ip"] == "62.109.20.187"
+        assert kwargs["send_proxy_url"] == route_url
         assert owner.app.state.account_session_locks.for_account(account_id).locked()
         return FakeAdapter(kwargs["before_network_action"])
 
@@ -222,12 +229,18 @@ def test_channel_reads_and_writes_only_through_the_account_verified_proxy(tmp_pa
     asyncio.run(worker.run_once())
     assert calls == []
     with closing(connect(owner.app.state.database)) as db:
-        db.execute("UPDATE send_proxies SET enabled=1 WHERE id=?", (proxy_id,))
+        db.execute("UPDATE send_proxy_routes SET enabled=1 WHERE ip_id=? AND proxy_id=?", (ip_id, proxy_id))
         db.execute("UPDATE server_ips SET available=0 WHERE id=?", (ip_id,))
     asyncio.run(worker.run_once())
     assert calls == []
     with closing(connect(owner.app.state.database)) as db:
         db.execute("UPDATE server_ips SET available=1 WHERE id=?", (ip_id,))
+    new_pool = f"/api/ips/{other_ip}/send-proxies"
+    check_and_enable_fake_proxies(owner, new_pool, headers, [alternate_id], monkeypatch)
+    assert owner.post(f"/api/accounts/{account_id}/ip", headers=headers, json={"ip_id": other_ip}).status_code == 200
+    asyncio.run(worker.run_once())
+    assert calls == []
+    check_and_enable_fake_proxies(owner, new_pool, headers, [proxy_id], monkeypatch)
     asyncio.run(worker.run_once())
     assert calls == [("history", -42), ("read", -42, 81), ("write", -42, 81)]
 
@@ -1208,55 +1221,65 @@ def test_refresh_enables_new_ip_and_respects_manual_disable(tmp_path, monkeypatc
     assert client.get(f"/api/groups/{group_id}/accounts").json()[0]["ip_id"] == new["id"]
 
 
-def test_owner_manages_external_proxy_pool_without_exposing_credentials(tmp_path, monkeypatch):
+def test_owner_manages_shared_proxy_pool_with_independent_ip_checks(tmp_path, monkeypatch):
     client, csrf = owner_client(tmp_path, monkeypatch)
     headers = {"X-CSRF-Token": csrf}
+    catalog = "/api/send-proxies"
     ip_id = client.get("/api/ips").json()[0]["id"]
     endpoint = f"/api/ips/{ip_id}/send-proxies"
+    sources = {"62.109.20.186", "62.109.20.187"}
+    monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: sources)
+    with closing(connect(client.app.state.database)) as db:
+        other_ip = db.execute(
+            "INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.187',1,1)",
+        ).lastrowid
+    other_endpoint = f"/api/ips/{other_ip}/send-proxies"
     url = "socks5://sample-user:sample-password@8.8.4.4:1080"
 
-    assert client.post(endpoint, json={"urls": [url]}).status_code == 403
-    rejected = client.post(endpoint, headers=headers, json={"urls": [url, "socks5://127.0.0.1:1080"]})
+    assert TestClient(client.app, base_url="https://test.local").get(catalog).status_code == 401
+    assert client.post(catalog, json={"urls": [url]}).status_code == 403
+    rejected = client.post(catalog, headers=headers, json={"urls": [url, "socks5://127.0.0.1:1080"]})
     assert rejected.status_code == 422
-    assert client.get(endpoint).json() == []
+    assert client.get(catalog).json() == []
 
-    result = client.post(endpoint, headers=headers, json={"urls": [url, url]})
+    result = client.post(catalog, headers=headers, json={"urls": [url, url]})
     assert result.status_code == 201
     rows = client.get(endpoint).json()
     assert len(rows) == 1
-    assert result.json() == {"added": 1, "duplicates": 1, "proxy_ids": [rows[0]["id"], rows[0]["id"]]}
+    proxy_id = rows[0]["id"]
+    assert result.json() == {"added": 1, "duplicates": 1, "proxy_ids": [proxy_id, proxy_id]}
+    assert client.get(catalog).json() == [{"id": proxy_id, "assigned_count": 0}]
+    assert client.get(other_endpoint).json() == rows
+    repeated = client.post(other_endpoint, headers=headers, json={"urls": [url]})
+    assert repeated.json() == {"added": 0, "duplicates": 1, "proxy_ids": [proxy_id]}
     assert not rows[0]["enabled"]
+    assert not rows[0]["manual_disabled"]
     assert rows[0]["check_status"] == "unchecked"
     assert rows[0]["last_checked_at"] is None
     assert "sample-user" not in str(rows) and "sample-password" not in str(rows)
-    db = connect(client.app.state.database)
-    try:
-        ciphertext = db.execute("SELECT url_ciphertext FROM send_proxies").fetchone()[0]
+    with closing(connect(client.app.state.database)) as db:
+        ciphertext = db.execute("SELECT url_ciphertext FROM send_proxy_pool").fetchone()[0]
         assert ciphertext != url
         assert SecretBox().decrypt(ciphertext) == url
-    finally:
-        db.close()
-    proxy_id = rows[0]["id"]
-    other_ip = client.get("/api/ips").json()[0]["id"] + 1
     change = f"{endpoint}/{proxy_id}"
     check = f"{endpoint}/check"
     ids = {"proxy_ids": [proxy_id, proxy_id]}
     assert client.patch(change, headers=headers, json={"enabled": True}).json()["detail"] == "send_proxy_check_required"
-    assert client.post(endpoint, headers=headers, json={"urls": [url], "enabled": True}).status_code == 422
+    assert client.post(catalog, headers=headers, json={"urls": [url], "enabled": True}).status_code == 422
 
     probes = []
     result_status = "auth_failed"
 
     async def probe(*, source_ip, url):
         probes.append((source_ip, url))
-        return result_status
+        return result_status if source_ip == "62.109.20.186" else "ok"
 
     monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.check_send_proxy", staticmethod(probe))
     assert client.post(check, json=ids).status_code == 403
     assert TestClient(client.app, base_url="https://test.local").post(check, json=ids).status_code == 401
     assert client.post(check, headers=headers, json={"proxy_ids": [proxy_id] * 31}).status_code == 422
     assert client.post(check, headers=headers, json={"proxy_ids": [proxy_id, proxy_id + 1]}).status_code == 404
-    assert client.post(f"/api/ips/{other_ip}/send-proxies/check", headers=headers, json=ids).status_code == 404
+    assert client.post(f"/api/ips/{other_ip + 1}/send-proxies/check", headers=headers, json=ids).status_code == 404
     assert probes == []
 
     response = client.post(check, headers=headers, json=ids)
@@ -1267,6 +1290,17 @@ def test_owner_manages_external_proxy_pool_without_exposing_credentials(tmp_path
     assert set(failed) == {"id", "check_status", "last_checked_at"}
     assert probes == [("62.109.20.186", url)]
     assert client.patch(change, headers=headers, json={"enabled": True}).status_code == 409
+    assert client.get(other_endpoint).json()[0]["check_status"] == "unchecked"
+    other_change = f"{other_endpoint}/{proxy_id}"
+    assert client.patch(other_change, headers=headers, json={"enabled": False}).status_code == 200
+    assert client.get(other_endpoint).json()[0]["manual_disabled"]
+    assert client.post(f"{other_endpoint}/check", headers=headers, json=ids).json()[0]["check_status"] == "ok"
+    assert probes[-1] == ("62.109.20.187", url)
+    other_route = client.get(other_endpoint).json()[0]
+    assert other_route["manual_disabled"] and not other_route["enabled"]
+    assert client.patch(other_change, headers=headers, json={"enabled": True}).status_code == 200
+    assert client.get(endpoint).json()[0]["check_status"] == "auth_failed"
+    assert not client.get(endpoint).json()[0]["enabled"]
 
     result_status = "ok"
     response = client.post(check, headers=headers, json=ids)
@@ -1274,12 +1308,13 @@ def test_owner_manages_external_proxy_pool_without_exposing_credentials(tmp_path
     assert client.get(endpoint).json()[0]["enabled"]
     assert client.patch(change, headers=headers, json={"enabled": False}).status_code == 200
     assert client.post(check, headers=headers, json=ids).json()[0]["check_status"] == "ok"
-    assert not client.get(endpoint).json()[0]["enabled"]
-    assert client.patch(change, headers=headers, json={"enabled": True}).status_code == 200
-    assert client.get(endpoint).json()[0]["enabled"]
+    primary_route = client.get(endpoint).json()[0]
+    assert primary_route["manual_disabled"] and not primary_route["enabled"]
+    other_route = client.get(other_endpoint).json()[0]
+    assert other_route["enabled"] and not other_route["manual_disabled"]
     monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: set())
     assert client.post(check, headers=headers, json=ids).status_code == 409
-    assert len(probes) == 3
+    assert len(probes) == 4
     assert "sample-password" not in client.get("/api/log").text
 
 
@@ -1329,32 +1364,36 @@ def test_daily_proxy_checks_run_with_sending_stopped_and_keep_assignments(tmp_pa
         disabled_ip = db.execute(
             "INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.188',0,1)",
         ).lastrowid
+        missing_ip = db.execute(
+            "INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.189',1,1)",
+        ).lastrowid
         account = db.execute(
             "INSERT INTO accounts(group_id,phone,full_name,status,auth_state) "
             "VALUES(?,'+79990000000','Fixture','active','authenticated')", (group_id,),
         ).lastrowid
         db.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?)", (account, main_ip))
-        routes = (
-            (1, main_ip, 1080, 1, "ok", old),
-            (2, main_ip, 1081, 1, "ok", recent),
-            (3, main_ip, 1082, 0, "unchecked", None),
-            (4, other_ip, 1083, 0, "tls_failed", old),
-            (5, disabled_ip, 1084, 1, "ok", old),
-            (6, main_ip, 1085, 1, "tls_failed", old),
-            (7, main_ip, 1086, 0, "ok", recent),
-            (8, main_ip, 1087, 0, "ok", old),
-        )
         db.executemany(
-            "INSERT INTO send_proxies(id,ip_id,url_ciphertext,url_fingerprint,enabled,check_status,last_checked_at) "
-            "VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO send_proxy_pool(id,url_ciphertext,url_fingerprint) VALUES(?,?,?)",
             [
-                (proxy_id, ip_id, box.encrypt(f"socks5://8.8.4.4:{port}"), str(proxy_id), enabled, status, checked)
-                for proxy_id, ip_id, port, enabled, status, checked in routes
+                (proxy_id, box.encrypt(f"socks5://8.8.4.4:{port}"), str(proxy_id))
+                for proxy_id, port in enumerate((1080, 1081, 1082, 1085, 1086, 1087), 1)
             ],
         )
-        db.execute("INSERT INTO send_proxy_assignments(account_id,proxy_id) VALUES(?,1)", (account,))
+        db.executemany(
+            "INSERT INTO send_proxy_routes(ip_id,proxy_id,enabled,check_status,last_checked_at) VALUES(?,?,?,?,?)",
+            (
+                (main_ip, 1, 1, "ok", old), (other_ip, 1, 0, "tls_failed", old),
+                (main_ip, 2, 1, "ok", recent), (other_ip, 2, 1, "ok", recent),
+                (main_ip, 3, 0, "unchecked", None),
+                (main_ip, 4, 0, "tls_failed", old), (other_ip, 4, 1, "ok", recent),
+                (main_ip, 5, 0, "ok", recent), (other_ip, 5, 1, "ok", recent),
+                (main_ip, 6, 1, "ok", old),
+                (disabled_ip, 1, 1, "ok", old), (missing_ip, 1, 1, "ok", old),
+            ),
+        )
+        db.execute("INSERT INTO send_proxy_pool_assignments(account_id,proxy_id) VALUES(?,1)", (account,))
 
-    assert client.patch(f"/api/ips/{main_ip}/send-proxies/8", headers=headers, json={"enabled": False}).status_code == 200
+    assert client.patch(f"/api/ips/{main_ip}/send-proxies/6", headers=headers, json={"enabled": False}).status_code == 200
     probes = []
     finish_slow_check = asyncio.Event()
 
@@ -1362,44 +1401,53 @@ def test_daily_proxy_checks_run_with_sending_stopped_and_keep_assignments(tmp_pa
         probes.append((source_ip, url))
         if url.endswith(":1085"):
             await finish_slow_check.wait()
-        return "connection_failed" if url.endswith(":1080") else "ok"
+        return "connection_failed" if (source_ip, url) == ("62.109.20.186", "socks5://8.8.4.4:1080") else "ok"
 
     async def wait_for_results(expected):
         deadline = asyncio.get_running_loop().time() + 2
         while asyncio.get_running_loop().time() < deadline:
             with closing(connect(client.app.state.database)) as db:
-                results = db.execute("SELECT enabled,check_status,last_checked_at FROM send_proxies ORDER BY id").fetchall()
-                if all(results[index]["check_status"] == status for index, status in expected.items()):
+                results = {
+                    (row["ip_id"], row["proxy_id"]): (
+                        row["enabled"], row["manual_disabled"], row["check_status"], row["last_checked_at"],
+                    )
+                    for row in db.execute("SELECT * FROM send_proxy_routes")
+                }
+                if all(key in results and results[key][2] == status for key, status in expected.items()):
                     return results
             await asyncio.sleep(0.025)
         return None
 
     monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.check_send_proxy", staticmethod(probe))
     with TestClient(client.app) as running_client:
-        early_results = running_client.portal.call(wait_for_results, {0: "connection_failed"})
+        early_results = running_client.portal.call(wait_for_results, {(main_ip, 1): "connection_failed"})
         assert early_results is not None, "A slow proxy must not delay saving another route's failure"
-        assert tuple(early_results[5]) == (1, "tls_failed", old)
+        assert early_results[(main_ip, 4)] == (0, 0, "tls_failed", old)
         running_client.portal.call(finish_slow_check.set)
-        results = running_client.portal.call(wait_for_results, {2: "ok", 3: "ok", 5: "ok"})
+        results = running_client.portal.call(
+            wait_for_results, {(main_ip, 4): "ok", (other_ip, 1): "ok", (other_ip, 3): "ok", (other_ip, 6): "ok"},
+        )
         assert results is not None, "The background proxy check did not save its results"
         assert sorted(probes) == [
             ("62.109.20.186", "socks5://8.8.4.4:1080"),
             ("62.109.20.186", "socks5://8.8.4.4:1082"),
             ("62.109.20.186", "socks5://8.8.4.4:1085"),
             ("62.109.20.186", "socks5://8.8.4.4:1086"),
-            ("62.109.20.187", "socks5://8.8.4.4:1083"),
+            ("62.109.20.187", "socks5://8.8.4.4:1080"),
+            ("62.109.20.187", "socks5://8.8.4.4:1082"),
+            ("62.109.20.187", "socks5://8.8.4.4:1087"),
         ]
-        assert [tuple(results[index]) for index in (1, 4, 7)] == [
-            (1, "ok", recent), (1, "ok", old), (0, "ok", old),
-        ]
-        assert results[0]["enabled"] == 0
-        assert datetime.fromisoformat(results[0]["last_checked_at"]) >= now
-        for index in (2, 3, 5, 6):
-            assert results[index]["enabled"] == 1
-            assert datetime.fromisoformat(results[index]["last_checked_at"]) >= now
+        for key in ((main_ip, 2), (other_ip, 2), (other_ip, 4), (other_ip, 5)):
+            assert results[key] == (1, 0, "ok", recent)
+        assert results[(disabled_ip, 1)] == results[(missing_ip, 1)] == (1, 0, "ok", old)
+        assert results[(main_ip, 6)] == (0, 1, "ok", old)
+        assert results[(main_ip, 1)][:3] == (0, 0, "connection_failed")
+        for key in ((main_ip, 3), (main_ip, 4), (main_ip, 5), (other_ip, 1), (other_ip, 3), (other_ip, 6)):
+            assert results[key][:3] == (1, 0, "ok")
+            assert datetime.fromisoformat(results[key][3]) >= now
         with closing(connect(client.app.state.database)) as db:
             assert tuple(db.execute("SELECT ip_id FROM ip_assignments WHERE account_id=?", (account,)).fetchone()) == (main_ip,)
-            assert tuple(db.execute("SELECT proxy_id FROM send_proxy_assignments WHERE account_id=?", (account,)).fetchone()) == (1,)
+            assert tuple(db.execute("SELECT proxy_id FROM send_proxy_pool_assignments WHERE account_id=?", (account,)).fetchone()) == (1,)
             assert db.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 0
             assert db.execute("SELECT value FROM settings WHERE key='global_stop'").fetchone()[0] == "1"
 
@@ -1479,10 +1527,10 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
     proxy_id, alternate_id = [proxy["id"] for proxy in client.get(endpoint).json()]
     db = connect(client.app.state.database)
     try:
-        db.execute("UPDATE send_proxies SET enabled=1 WHERE id=?", (proxy_id,))
+        db.execute("INSERT INTO send_proxy_routes(ip_id,proxy_id,enabled) VALUES(?,?,1)", (ip_id, proxy_id))
         with pytest.raises(DispatchPaused, match="send_proxy_required"):
             asyncio.run(provider(slots[account_id]))
-        assert db.execute("SELECT COUNT(*) FROM send_proxy_assignments").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM send_proxy_pool_assignments").fetchone()[0] == 0
     finally:
         db.close()
     check_and_enable_fake_proxies(client, endpoint, headers, [proxy_id, alternate_id], monkeypatch)
@@ -1514,7 +1562,10 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
         def failed_probe_during_ip_check():
             db = connect(client.app.state.database)
             try:
-                db.execute("UPDATE send_proxies SET check_status='tls_failed' WHERE id=?", (proxy_id,))
+                db.execute(
+                    "UPDATE send_proxy_routes SET check_status='tls_failed' WHERE ip_id=? AND proxy_id=?",
+                    (ip_id, proxy_id),
+                )
             finally:
                 db.close()
             return {"62.109.20.186"}
@@ -1535,7 +1586,7 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
         db.execute("UPDATE weekly_slots SET status='blocked',error_code='send_proxy_unavailable' WHERE slot_id=?", (slot["slot_id"],))
         resume_proxy_blocked_slots(db, group_id, date(2099, 1, 5))
         assert db.execute("SELECT status FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],)).fetchone()[0] == "blocked"
-        assert db.execute("SELECT proxy_id FROM send_proxy_assignments WHERE account_id=?", (account_id,)).fetchone()[0] == proxy_id
+        assert db.execute("SELECT proxy_id FROM send_proxy_pool_assignments WHERE account_id=?", (account_id,)).fetchone()[0] == proxy_id
         assert client.post(f"{endpoint}/check", headers=headers, json={"proxy_ids": [proxy_id]}).json()[0]["check_status"] == "ok"
         resume_proxy_blocked_slots(db, group_id, date(2099, 1, 5))
         assert db.execute("SELECT status FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],)).fetchone()[0] == "queued"
@@ -1548,8 +1599,34 @@ def test_scheduled_connection_uses_only_the_assigned_external_proxy(tmp_path, mo
     db = connect(client.app.state.database)
     try:
         assert tuple(db.execute("SELECT status,error_code FROM weekly_slots WHERE slot_id=?", (slot["slot_id"],)).fetchone()) == ("queued", None)
+        other_ip = db.execute(
+            "INSERT INTO server_ips(address,enabled,available) VALUES('62.109.20.187',1,1)",
+        ).lastrowid
     finally:
         db.close()
+
+    monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: {"62.109.20.186", "62.109.20.187"})
+    other_endpoint = f"/api/ips/{other_ip}/send-proxies"
+    check_and_enable_fake_proxies(client, other_endpoint, headers, [proxy_id], monkeypatch)
+    moved = client.post(f"/api/accounts/{account_id}/ip", headers=headers, json={"ip_id": other_ip})
+    assert moved.status_code == 200
+    account = client.get(f"/api/groups/{group_id}/accounts").json()[0]
+    assert account["send_proxy_id"] == alternate_id
+    assert not account["send_proxy_enabled"] and account["send_proxy_check_status"] == "unchecked"
+    assert client.put(
+        f"/api/accounts/{account_id}/send-proxy", headers=headers, json={"proxy_id": alternate_id},
+    ).status_code == 409
+    with pytest.raises(DispatchPaused, match="send_proxy_unavailable"):
+        asyncio.run(provider(slots[account_id]))
+    assert len(routes) == 2
+    check_and_enable_fake_proxies(client, other_endpoint, headers, [alternate_id], monkeypatch)
+
+    async def connect_after_ip_move():
+        connected = await provider(slots[account_id])
+        await connected.close()
+
+    asyncio.run(connect_after_ip_move())
+    assert routes[-1]["source_ip"] == "62.109.20.187" and routes[-1]["send_proxy_url"] == alternate
 
 
 def test_legacy_proxy_api_removed_without_dropping_historical_rows(tmp_path, monkeypatch):
@@ -1656,7 +1733,7 @@ def test_initial_membership_read_network_error_preserves_authenticated_attempt(t
     try:
         account = db.execute("SELECT auth_state,ever_authenticated,status FROM accounts").fetchone()
         assert tuple(account) == ("authenticated", 1, "needs_membership")
-        assert db.execute("SELECT proxy_id FROM send_proxy_assignments").fetchone()[0] == proxy_id
+        assert db.execute("SELECT proxy_id FROM send_proxy_pool_assignments").fetchone()[0] == proxy_id
     finally:
         db.close()
     checked = client.post(f"{base}/{session_id}/check-membership", json={})

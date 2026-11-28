@@ -96,6 +96,27 @@ CREATE TABLE IF NOT EXISTS send_proxy_assignments (
     assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_send_proxy_assignments_proxy ON send_proxy_assignments(proxy_id);
+CREATE TABLE IF NOT EXISTS send_proxy_pool (
+    id INTEGER PRIMARY KEY,
+    url_ciphertext TEXT NOT NULL,
+    url_fingerprint TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS send_proxy_routes (
+    ip_id INTEGER NOT NULL REFERENCES server_ips(id),
+    proxy_id INTEGER NOT NULL REFERENCES send_proxy_pool(id),
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+    manual_disabled INTEGER NOT NULL DEFAULT 0 CHECK(manual_disabled IN (0,1)),
+    check_status TEXT NOT NULL DEFAULT 'unchecked',
+    last_checked_at TEXT,
+    PRIMARY KEY(ip_id, proxy_id)
+);
+CREATE INDEX IF NOT EXISTS idx_send_proxy_routes_proxy ON send_proxy_routes(proxy_id);
+CREATE TABLE IF NOT EXISTS send_proxy_pool_assignments (
+    account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    proxy_id INTEGER NOT NULL REFERENCES send_proxy_pool(id),
+    assigned_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_send_proxy_pool_assignments_proxy ON send_proxy_pool_assignments(proxy_id);
 CREATE TABLE IF NOT EXISTS owner_sessions (
     token_hash TEXT PRIMARY KEY,
     csrf_hash TEXT NOT NULL,
@@ -297,6 +318,7 @@ def connect(path: str | Path) -> sqlite3.Connection:
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
     _migrate_weekly_slots(connection)
+    _migrate_send_proxy_pool(connection)
     connection.execute("CREATE INDEX IF NOT EXISTS idx_weekly_due ON weekly_slots(group_id, scheduled_date, status)")
     columns = {row[1] for row in connection.execute("PRAGMA table_info(accounts)")}
     if "send_day_pair" not in columns:
@@ -342,15 +364,6 @@ def initialize(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE server_ips ADD COLUMN manual_disabled INTEGER NOT NULL DEFAULT 0 CHECK(manual_disabled IN (0,1))"
         )
-    send_proxy_columns = {row[1] for row in connection.execute("PRAGMA table_info(send_proxies)")}
-    if "check_status" not in send_proxy_columns:
-        connection.execute("ALTER TABLE send_proxies ADD COLUMN check_status TEXT NOT NULL DEFAULT 'unchecked'")
-    if "last_checked_at" not in send_proxy_columns:
-        connection.execute("ALTER TABLE send_proxies ADD COLUMN last_checked_at TEXT")
-    if "manual_disabled" not in send_proxy_columns:
-        connection.execute(
-            "ALTER TABLE send_proxies ADD COLUMN manual_disabled INTEGER NOT NULL DEFAULT 0 CHECK(manual_disabled IN (0,1))"
-        )
     operation_columns = {row[1] for row in connection.execute("PRAGMA table_info(operations)")}
     if "destination_chat_id" not in operation_columns:
         connection.execute("ALTER TABLE operations ADD COLUMN destination_chat_id TEXT")
@@ -377,6 +390,52 @@ def initialize(connection: sqlite3.Connection) -> None:
     connection.executemany(
         "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", DEFAULTS.items()
     )
+
+
+def _migrate_send_proxy_pool(connection: sqlite3.Connection) -> None:
+    migration_key = "send_proxy_pool_migrated"
+    with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(send_proxies)")}
+        if "check_status" not in columns:
+            connection.execute("ALTER TABLE send_proxies ADD COLUMN check_status TEXT NOT NULL DEFAULT 'unchecked'")
+        if "last_checked_at" not in columns:
+            connection.execute("ALTER TABLE send_proxies ADD COLUMN last_checked_at TEXT")
+        if "manual_disabled" not in columns:
+            connection.execute(
+                "ALTER TABLE send_proxies ADD COLUMN manual_disabled INTEGER NOT NULL DEFAULT 0 CHECK(manual_disabled IN (0,1))"
+            )
+
+        route_columns = {row[1] for row in connection.execute("PRAGMA table_info(send_proxy_routes)")}
+        if "manual_disabled" not in route_columns:
+            connection.execute(
+                "ALTER TABLE send_proxy_routes ADD COLUMN manual_disabled INTEGER NOT NULL DEFAULT 0 CHECK(manual_disabled IN (0,1))"
+            )
+            # Keep checked routes that were disabled in the preview disabled across automatic checks.
+            connection.execute(
+                "UPDATE send_proxy_routes SET manual_disabled=1 WHERE enabled=0 AND check_status<>'unchecked'"
+            )
+        if connection.execute("SELECT 1 FROM settings WHERE key=?", (migration_key,)).fetchone() is not None:
+            return
+
+        # Keep the largest existing ID for each URL so future inserts follow the legacy ID range.
+        connection.execute(
+            "INSERT INTO send_proxy_pool(id,url_ciphertext,url_fingerprint) "
+            "SELECT id,url_ciphertext,url_fingerprint FROM send_proxies "
+            "WHERE id IN (SELECT MAX(id) FROM send_proxies GROUP BY url_fingerprint)"
+        )
+        connection.execute(
+            "INSERT INTO send_proxy_routes(ip_id,proxy_id,enabled,manual_disabled,check_status,last_checked_at) "
+            "SELECT old.ip_id,p.id,old.enabled,old.manual_disabled,old.check_status,old.last_checked_at FROM send_proxies old "
+            "LEFT JOIN send_proxy_pool p ON p.url_fingerprint=old.url_fingerprint"
+        )
+        connection.execute(
+            "INSERT INTO send_proxy_pool_assignments(account_id,proxy_id,assigned_at) "
+            "SELECT a.account_id,p.id,a.assigned_at FROM send_proxy_assignments a "
+            "LEFT JOIN send_proxies old ON old.id=a.proxy_id "
+            "LEFT JOIN send_proxy_pool p ON p.url_fingerprint=old.url_fingerprint"
+        )
+        connection.execute("INSERT INTO settings(key,value) VALUES(?,'1')", (migration_key,))
 
 
 def _migrate_weekly_slots(connection: sqlite3.Connection) -> None:

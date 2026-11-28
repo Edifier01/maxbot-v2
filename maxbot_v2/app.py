@@ -503,7 +503,7 @@ def create_app(
             proxy = assigned_or_allocate_proxy(connection, slot["account_id"], row["ip_id"])
             if proxy is None:
                 raise DispatchPaused("send_proxy_required", blocked=True)
-            if not proxy["enabled"] or proxy["check_status"] != "ok" or proxy["ip_id"] != row["ip_id"]:
+            if not proxy["enabled"] or proxy["manual_disabled"] or proxy["check_status"] != "ok":
                 raise DispatchPaused("send_proxy_unavailable", blocked=True)
             connection.commit()
         if row["address"] not in host_addresses():
@@ -524,11 +524,12 @@ def create_app(
                 with db() as connection:
                     current = connection.execute(
                         "SELECT ia.ip_id,p.address,p.enabled,p.available,a.lifecycle,a.auth_state,"
-                        "sp.id AS proxy_id,sp.ip_id AS proxy_ip_id,sp.enabled AS proxy_enabled,sp.check_status AS proxy_check_status "
+                        "sa.proxy_id,sr.enabled AS proxy_enabled,sr.manual_disabled,sr.check_status AS proxy_check_status "
                         "FROM ip_assignments ia "
                         "JOIN server_ips p ON p.id=ia.ip_id JOIN accounts a ON a.id=ia.account_id "
-                        "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id "
-                        "LEFT JOIN send_proxies sp ON sp.id=sa.proxy_id WHERE ia.account_id=?",
+                        "LEFT JOIN send_proxy_pool_assignments sa ON sa.account_id=a.id "
+                        "LEFT JOIN send_proxy_routes sr ON sr.proxy_id=sa.proxy_id AND sr.ip_id=ia.ip_id "
+                        "WHERE ia.account_id=?",
                         (slot["account_id"],),
                     ).fetchone()
                     if (current is None or current["lifecycle"] != "active" or not current["enabled"] or not current["available"]
@@ -538,7 +539,7 @@ def create_app(
                         raise DispatchPaused("account_reauthentication_required", blocked=True)
                     if current["proxy_id"] != proxy["id"]:
                         raise DispatchPaused("send_proxy_changed")
-                    if not current["proxy_enabled"] or current["proxy_check_status"] != "ok" or current["proxy_ip_id"] != row["ip_id"]:
+                    if not current["proxy_enabled"] or current["manual_disabled"] or current["proxy_check_status"] != "ok":
                         raise DispatchPaused("send_proxy_unavailable", blocked=True)
                     paused = _dispatch_block(
                         connection, slot, expected_ip_id=row["ip_id"], expected_address=row["address"], available_hosts=available_hosts,
@@ -575,12 +576,13 @@ def create_app(
         def read_route(connection: sqlite3.Connection) -> sqlite3.Row:
             row = connection.execute(
                 "SELECT a.phone,a.status,a.auth_state,a.lifecycle,a.session_generation,p.id AS ip_id,p.address,"
-                "p.enabled AS ip_enabled,p.available,sp.id AS proxy_id,sp.ip_id AS proxy_ip_id,"
-                "sp.enabled AS proxy_enabled,sp.check_status,sp.url_ciphertext "
+                "p.enabled AS ip_enabled,p.available,sa.proxy_id,"
+                "sr.enabled AS proxy_enabled,sr.manual_disabled,sr.check_status,sp.url_ciphertext "
                 "FROM accounts a LEFT JOIN ip_assignments ia ON ia.account_id=a.id "
                 "LEFT JOIN server_ips p ON p.id=ia.ip_id "
-                "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id "
-                "LEFT JOIN send_proxies sp ON sp.id=sa.proxy_id WHERE a.id=?",
+                "LEFT JOIN send_proxy_pool_assignments sa ON sa.account_id=a.id "
+                "LEFT JOIN send_proxy_pool sp ON sp.id=sa.proxy_id "
+                "LEFT JOIN send_proxy_routes sr ON sr.proxy_id=sa.proxy_id AND sr.ip_id=ia.ip_id WHERE a.id=?",
                 (account_id,),
             ).fetchone()
             if row is None or row["status"] != "active" or row["lifecycle"] != "active":
@@ -594,7 +596,7 @@ def create_app(
         def validate_proxy(row: sqlite3.Row) -> None:
             if row["proxy_id"] is None:
                 raise DispatchPaused("send_proxy_required", blocked=True)
-            if row["proxy_ip_id"] != row["ip_id"] or not row["proxy_enabled"] or row["check_status"] != "ok":
+            if not row["proxy_enabled"] or row["manual_disabled"] or row["check_status"] != "ok":
                 raise DispatchPaused("send_proxy_unavailable", blocked=True)
 
         def require_same_route() -> None:
@@ -941,11 +943,12 @@ def create_app(
             stopped = connection.execute("SELECT value FROM settings WHERE key='global_stop'").fetchone()[0] == "1"
             active_groups = connection.execute("SELECT COUNT(*) FROM groups WHERE active=1").fetchone()[0]
             readiness = connection.execute(
-                "SELECT COUNT(*) AS ready_accounts,COUNT(CASE WHEN EXISTS (SELECT 1 FROM send_proxies sp "
-                "WHERE sp.ip_id=i.ip_id AND sp.enabled=1 AND sp.check_status='ok' AND (sa.proxy_id IS NULL OR sp.id=sa.proxy_id)) "
+                "SELECT COUNT(*) AS ready_accounts,COUNT(CASE WHEN EXISTS (SELECT 1 FROM send_proxy_routes sr "
+                "WHERE sr.ip_id=i.ip_id AND sr.enabled=1 AND sr.manual_disabled=0 AND sr.check_status='ok' "
+                "AND (sa.proxy_id IS NULL OR sr.proxy_id=sa.proxy_id)) "
                 "THEN 1 END) AS routed_accounts FROM accounts a JOIN groups g ON g.id=a.group_id "
                 "JOIN ip_assignments i ON i.account_id=a.id JOIN server_ips p ON p.id=i.ip_id "
-                "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id "
+                "LEFT JOIN send_proxy_pool_assignments sa ON sa.account_id=a.id "
                 "WHERE a.lifecycle='active' AND a.status='active' AND a.auth_state='authenticated' AND g.active=1 AND g.chat_id IS NOT NULL AND p.enabled=1 AND p.available=1"
             ).fetchone()
         if stopped:
@@ -1120,51 +1123,77 @@ def create_app(
     async def refresh_server_ips(_session: sqlite3.Row = Depends(require_csrf)) -> list[dict[str, object]]:
         return await refresh_ip_pool()
 
-    @app.get("/api/ips/{ip_id}/send-proxies")
-    def list_send_proxies(ip_id: int, _session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
+    @app.get("/api/send-proxies")
+    def list_send_proxy_pool(_session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
         with db() as connection:
             rows = connection.execute(
-                "SELECT p.id,p.enabled,p.manual_disabled,p.check_status,p.last_checked_at,COUNT(a.id) AS assigned_count "
-                "FROM send_proxies p "
-                "LEFT JOIN send_proxy_assignments s ON s.proxy_id=p.id "
+                "SELECT p.id,COUNT(a.id) AS assigned_count FROM send_proxy_pool p "
+                "LEFT JOIN send_proxy_pool_assignments s ON s.proxy_id=p.id "
                 "LEFT JOIN accounts a ON a.id=s.account_id AND a.lifecycle='active' "
-                "WHERE p.ip_id=? GROUP BY p.id ORDER BY p.id", (ip_id,),
+                "GROUP BY p.id ORDER BY p.id",
             ).fetchall()
         return [dict(row) for row in rows]
 
-    @app.post("/api/ips/{ip_id}/send-proxies", status_code=201)
-    def add_send_proxies(ip_id: int, body: ProxyPoolBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, int | list[int]]:
+    @app.get("/api/ips/{ip_id}/send-proxies")
+    def list_send_proxy_routes(ip_id: int, _session: sqlite3.Row = Depends(current_session)) -> list[dict[str, object]]:
+        with db() as connection:
+            if connection.execute("SELECT 1 FROM server_ips WHERE id=?", (ip_id,)).fetchone() is None:
+                raise HTTPException(404, "ip_not_found")
+            rows = connection.execute(
+                "SELECT p.id,COALESCE(r.enabled,0) AS enabled,COALESCE(r.manual_disabled,0) AS manual_disabled,"
+                "COALESCE(r.check_status,'unchecked') AS check_status,"
+                "r.last_checked_at,COUNT(a.id) AS assigned_count FROM send_proxy_pool p "
+                "LEFT JOIN send_proxy_routes r ON r.proxy_id=p.id AND r.ip_id=? "
+                "LEFT JOIN send_proxy_pool_assignments s ON s.proxy_id=p.id "
+                "LEFT JOIN accounts a ON a.id=s.account_id AND a.lifecycle='active' "
+                "GROUP BY p.id ORDER BY p.id", (ip_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def import_send_proxies(raw_urls: list[str]) -> dict[str, int | list[int]]:
         try:
-            urls = [normalize_proxy_url(url) for url in body.urls]
+            urls = [normalize_proxy_url(url) for url in raw_urls]
         except ValueError:
             raise HTTPException(422, "invalid_send_proxy") from None
         box = SecretBox()
         fingerprints = [digest_token(f"send-proxy:{url}") for url in urls]
+        placeholders = ",".join("?" for _ in fingerprints)
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            ip = connection.execute("SELECT address FROM server_ips WHERE id=?", (ip_id,)).fetchone()
-            if ip is None or not allowed_address(ip["address"]):
-                raise HTTPException(404, "ip_not_found")
             added = connection.executemany(
-                "INSERT INTO send_proxies(ip_id,url_ciphertext,url_fingerprint) VALUES(?,?,?) "
-                "ON CONFLICT(ip_id,url_fingerprint) DO NOTHING",
-                [(ip_id, box.encrypt(url), fingerprint) for url, fingerprint in zip(urls, fingerprints, strict=True)],
+                "INSERT INTO send_proxy_pool(url_ciphertext,url_fingerprint) VALUES(?,?) "
+                "ON CONFLICT(url_fingerprint) DO NOTHING",
+                [(box.encrypt(url), fingerprint) for url, fingerprint in zip(urls, fingerprints, strict=True)],
             ).rowcount
-            ids = dict(connection.execute("SELECT url_fingerprint,id FROM send_proxies WHERE ip_id=?", (ip_id,)).fetchall())
+            ids = dict(connection.execute(
+                f"SELECT url_fingerprint,id FROM send_proxy_pool WHERE url_fingerprint IN ({placeholders})", fingerprints,
+            ).fetchall())
             connection.commit()
         return {"added": added, "duplicates": len(urls) - added, "proxy_ids": [ids[fingerprint] for fingerprint in fingerprints]}
+
+    @app.post("/api/send-proxies", status_code=201)
+    def add_send_proxies(body: ProxyPoolBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, int | list[int]]:
+        return import_send_proxies(body.urls)
+
+    @app.post("/api/ips/{ip_id}/send-proxies", status_code=201)
+    def add_send_proxies_for_ip(ip_id: int, body: ProxyPoolBody, _session: sqlite3.Row = Depends(require_csrf)) -> dict[str, int | list[int]]:
+        with db() as connection:
+            ip = connection.execute("SELECT address FROM server_ips WHERE id=?", (ip_id,)).fetchone()
+        if ip is None or not allowed_address(ip["address"]):
+            raise HTTPException(404, "ip_not_found")
+        return import_send_proxies(body.urls)
 
     async def check_proxy_routes(ip_id: int, proxy_ids: list[int]) -> list[dict[str, object]]:
         """Run a batch while the caller holds the shared proxy check lock."""
         placeholders = ",".join("?" for _ in proxy_ids)
         with db() as connection:
             ip = connection.execute("SELECT address,enabled,available FROM server_ips WHERE id=?", (ip_id,)).fetchone()
-            routes = dict(connection.execute(
-                f"SELECT id,url_ciphertext FROM send_proxies WHERE ip_id=? AND id IN ({placeholders})", (ip_id, *proxy_ids),
+            proxies = dict(connection.execute(
+                f"SELECT id,url_ciphertext FROM send_proxy_pool WHERE id IN ({placeholders})", proxy_ids,
             ).fetchall())
         if ip is None:
             raise HTTPException(404, "ip_not_found")
-        if len(routes) != len(proxy_ids):
+        if len(proxies) != len(proxy_ids):
             raise HTTPException(404, "send_proxy_not_found")
         source_ip = ip["address"]
         if not ip["enabled"] or not ip["available"] or not allowed_address(source_ip):
@@ -1183,7 +1212,7 @@ def create_app(
                 if current_ip is None:
                     return None
                 try:
-                    url = SecretBox().decrypt(routes[proxy_id])
+                    url = SecretBox().decrypt(proxies[proxy_id])
                 except ValueError:
                     status = "config_invalid"
                 else:
@@ -1192,10 +1221,12 @@ def create_app(
                 # Dispatch uses this status before sending. Save it as soon as this route finishes.
                 with db() as connection:
                     updated = connection.execute(
-                        "UPDATE send_proxies SET check_status=:check_status,last_checked_at=:last_checked_at,"
-                        "enabled=(manual_disabled=0 AND :check_status='ok') "
-                        "WHERE id=:id AND ip_id=:ip_id AND EXISTS ("
-                        "SELECT 1 FROM server_ips WHERE id=:ip_id AND address=:source_ip AND enabled=1 AND available=1)",
+                        "INSERT INTO send_proxy_routes(ip_id,proxy_id,enabled,check_status,last_checked_at) "
+                        "SELECT id,:id,(:check_status='ok'),:check_status,:last_checked_at FROM server_ips "
+                        "WHERE id=:ip_id AND address=:source_ip AND enabled=1 AND available=1 "
+                        "ON CONFLICT(ip_id,proxy_id) DO UPDATE SET "
+                        "check_status=excluded.check_status,last_checked_at=excluded.last_checked_at,"
+                        "enabled=(send_proxy_routes.manual_disabled=0 AND excluded.check_status='ok')",
                         {**result, "ip_id": ip_id, "source_ip": source_ip},
                     ).rowcount
                 return result if updated else None
@@ -1222,10 +1253,11 @@ def create_app(
                     # A manual check may have finished while the background task waited.
                     with db() as connection:
                         proxy_ids = [row[0] for row in connection.execute(
-                            "SELECT id FROM send_proxies WHERE ip_id=? AND manual_disabled=0 "
-                            "AND (julianday(last_checked_at) IS NULL OR julianday(last_checked_at)<=julianday(?) "
-                            "OR (enabled=0 AND check_status='ok')) "
-                            "ORDER BY id LIMIT ?", (ip_id, cutoff, SEND_PROXY_BATCH_SIZE),
+                            "SELECT p.id FROM send_proxy_pool p "
+                            "LEFT JOIN send_proxy_routes r ON r.proxy_id=p.id AND r.ip_id=? "
+                            "WHERE COALESCE(r.manual_disabled,0)=0 AND (julianday(r.last_checked_at) IS NULL "
+                            "OR julianday(r.last_checked_at)<=julianday(?) OR (r.enabled=0 AND r.check_status='ok')) "
+                            "ORDER BY p.id LIMIT ?", (ip_id, cutoff, SEND_PROXY_BATCH_SIZE),
                         )]
                     if not proxy_ids:
                         break
@@ -1266,15 +1298,19 @@ def create_app(
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT check_status FROM send_proxies WHERE id=? AND ip_id=?", (proxy_id, ip_id),
+                "SELECT r.check_status FROM send_proxy_pool p CROSS JOIN server_ips i "
+                "LEFT JOIN send_proxy_routes r ON r.proxy_id=p.id AND r.ip_id=i.id "
+                "WHERE p.id=? AND i.id=?", (proxy_id, ip_id),
             ).fetchone()
             if row is None:
                 raise HTTPException(404, "send_proxy_not_found")
             if body.enabled and row["check_status"] != "ok":
                 raise HTTPException(409, "send_proxy_check_required")
             connection.execute(
-                "UPDATE send_proxies SET enabled=?,manual_disabled=? WHERE id=?",
-                (int(body.enabled), int(not body.enabled), proxy_id),
+                "INSERT INTO send_proxy_routes(ip_id,proxy_id,enabled,manual_disabled) VALUES(?,?,?,?) "
+                "ON CONFLICT(ip_id,proxy_id) DO UPDATE SET "
+                "enabled=excluded.enabled,manual_disabled=excluded.manual_disabled",
+                (ip_id, proxy_id, int(body.enabled), int(not body.enabled)),
             )
             connection.commit()
         return {"enabled": body.enabled}
@@ -2158,13 +2194,16 @@ def create_app(
             rows = connection.execute(
                 "SELECT a.id,a.full_name,a.status,a.auth_state,a.lifecycle,a.ever_authenticated,a.send_day_pair,"
                 "ia.ip_id,p.address AS ip_address,p.enabled AS ip_enabled,p.available AS ip_available,"
-                "sp.id AS send_proxy_id,sp.enabled AS send_proxy_enabled,sp.manual_disabled AS send_proxy_manual_disabled,"
-                "sp.check_status AS send_proxy_check_status,"
+                "sa.proxy_id AS send_proxy_id,"
+                "CASE WHEN sa.proxy_id IS NOT NULL THEN COALESCE(sr.enabled,0) END AS send_proxy_enabled,"
+                "CASE WHEN sa.proxy_id IS NOT NULL THEN COALESCE(sr.manual_disabled,0) END AS send_proxy_manual_disabled,"
+                "CASE WHEN sa.proxy_id IS NOT NULL THEN COALESCE(sr.check_status,'unchecked') END AS send_proxy_check_status,"
                 "(SELECT os.state FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_state,"
                 "(SELECT os.error_code FROM onboarding_sessions os WHERE os.account_id=a.id ORDER BY os.created_at DESC LIMIT 1) AS onboarding_error "
                 "FROM accounts a "
                 "LEFT JOIN ip_assignments ia ON ia.account_id=a.id LEFT JOIN server_ips p ON p.id=ia.ip_id "
-                "LEFT JOIN send_proxy_assignments sa ON sa.account_id=a.id LEFT JOIN send_proxies sp ON sp.id=sa.proxy_id "
+                "LEFT JOIN send_proxy_pool_assignments sa ON sa.account_id=a.id "
+                "LEFT JOIN send_proxy_routes sr ON sr.proxy_id=sa.proxy_id AND sr.ip_id=ia.ip_id "
                 "WHERE a.group_id=? AND a.lifecycle<>'deleted' ORDER BY a.id",
                 (group_id,),
             ).fetchall()
@@ -2202,7 +2241,8 @@ def create_app(
             if current is None:
                 raise HTTPException(409, "send_proxy_account_unavailable")
             proxy = connection.execute(
-                "SELECT url_ciphertext FROM send_proxies WHERE id=? AND ip_id=? AND enabled=1 AND check_status='ok'",
+                "SELECT p.url_ciphertext FROM send_proxy_routes r JOIN send_proxy_pool p ON p.id=r.proxy_id "
+                "WHERE r.proxy_id=? AND r.ip_id=? AND r.enabled=1 AND r.manual_disabled=0 AND r.check_status='ok'",
                 (body.proxy_id, current["ip_id"]),
             ).fetchone()
             if proxy is None:
@@ -2212,7 +2252,7 @@ def create_app(
             except ValueError:
                 raise HTTPException(409, "send_proxy_config_invalid") from None
             connection.execute(
-                "INSERT INTO send_proxy_assignments(account_id,proxy_id) VALUES(?,?) "
+                "INSERT INTO send_proxy_pool_assignments(account_id,proxy_id) VALUES(?,?) "
                 "ON CONFLICT(account_id) DO UPDATE SET proxy_id=excluded.proxy_id,assigned_at=CURRENT_TIMESTAMP",
                 (account_id, body.proxy_id),
             )
@@ -2425,10 +2465,6 @@ def create_app(
                 connection.rollback()
                 raise HTTPException(422, "ip_unavailable")
             connection.execute("INSERT INTO ip_assignments(account_id,ip_id) VALUES(?,?) ON CONFLICT(account_id) DO UPDATE SET ip_id=excluded.ip_id,assigned_at=CURRENT_TIMESTAMP", (account_id, body.ip_id))
-            connection.execute(
-                "DELETE FROM send_proxy_assignments WHERE account_id=? AND proxy_id IN "
-                "(SELECT id FROM send_proxies WHERE ip_id<>?)", (account_id, body.ip_id),
-            )
             today = datetime.now(SCHEDULE_TZ).date().isoformat()
             connection.execute(
                 "UPDATE weekly_slots SET status=CASE WHEN scheduled_date>=? THEN 'queued' ELSE 'missed' END,"
