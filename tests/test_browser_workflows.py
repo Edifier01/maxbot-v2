@@ -336,44 +336,94 @@ def test_ip_list_is_compact_and_keyboard_operable(page: Page, local_app, monkeyp
 
 
 @pytest.mark.parametrize("width", [390, 768, 1440])
-def test_owner_imports_external_proxies_in_selected_ip_pool(page: Page, local_app, monkeypatch, width):
+def test_owner_imports_shared_proxies_and_checks_each_source_ip(page: Page, local_app, monkeypatch, width):
+    from maxbot_v2.egress import refresh_ips
+
+    first_ip = "62.109.20.186"
+    second_ip = "62.109.20.187"
+    addresses = {first_ip, second_ip}
+
     async def probe(*, source_ip, url):
-        assert source_ip == "62.109.20.186"
-        return "auth_failed" if "example-password" in url else "ok"
+        assert source_ip in addresses
+        return "auth_failed" if source_ip == second_ip and "example-password" in url else "ok"
 
     monkeypatch.setattr("maxbot_v2.app.PyMaxAdapter.check_send_proxy", staticmethod(probe))
+    monkeypatch.setattr("maxbot_v2.app.host_addresses", lambda: addresses)
+    monkeypatch.setattr(
+        "maxbot_v2.app.refresh_ips",
+        lambda connection: refresh_ips(connection, addresses=addresses, probe=lambda _address: True),
+    )
+    connection = connect(local_app.app.state.database)
+    try:
+        connection.execute("DELETE FROM server_ips")
+        connection.commit()
+    finally:
+        connection.close()
+
     page.set_viewport_size({"width": width, "height": 900})
     login(page, local_app)
     page.get_by_role("button", name="Группы, номера и IP").click()
-    page.locator("#ip-panel summary").press("Enter")
-    ip = page.locator("#ip-list .row").filter(has_text="62.109.20.186")
-    ip.get_by_role("button", name="Прокси").press("Enter")
     pool = page.locator("#send-proxy-pool")
-    expect(pool.get_by_role("heading")).to_contain_text("62.109.20.186")
-    pool.get_by_label("Список SOCKS5 в TXT").set_input_files({
+    expect(pool.get_by_role("heading", name="Общий пул SOCKS5")).to_be_visible()
+    source = pool.get_by_label("Исходящий IPv4")
+    expect(source).to_be_disabled()
+    file_input = pool.get_by_label("Список SOCKS5 в TXT")
+    file_input.set_input_files({
         "name": "pool.txt", "mimeType": "text/plain",
         "buffer": b"socks5://example-user:example-password@8.8.4.4:1080\nsocks5://1.1.1.1:1080\n",
     })
-    pool.get_by_role("button", name="Добавить прокси").click()
-    expect(pool.get_by_text("Ожидает проверки", exact=False)).to_have_count(2)
+    pool.get_by_role("button", name="Добавить прокси").press("Enter")
+    expect(page.locator("#notice")).to_have_text("Добавлено: 2 · уже в пуле: 0")
+    expect(file_input).to_have_value("")
+    proxies = pool.locator(".proxy-entries .row")
+    expect(proxies).to_have_count(2)
     expect(pool).to_contain_text("Номера в порядке импорта: №")
-    assert "example-password" not in pool.inner_text()
-    pool.get_by_role("button", name="Проверить импортированные").press("Enter")
-    expect(pool).to_contain_text("SOCKS5 отклонил авторизацию")
-    expect(pool).to_contain_text("TLS до MAX установлен")
-    failed = pool.locator(".row").filter(has_text="SOCKS5 отклонил авторизацию")
-    expect(failed).to_contain_text("Приостановлен")
-    healthy = pool.locator(".row").filter(has_text="TLS до MAX установлен")
-    expect(healthy).to_contain_text("Включён")
-    healthy.get_by_role("button", name="Отключить", exact=True).press("Enter")
-    expect(healthy).to_contain_text("Отключён вручную")
-    healthy.get_by_role("button", name="Проверить", exact=True).press("Enter")
-    expect(page.locator("#notice")).to_have_text("Доступно через SOCKS5: 1 из 1")
-    expect(healthy).to_contain_text("Отключён вручную")
-    enable = healthy.get_by_role("button", name="Включить", exact=True)
-    expect(enable).to_be_enabled()
-    enable.press("Enter")
-    expect(healthy).to_contain_text("Включён")
+    expect(pool).not_to_contain_text("example-password")
+    expect(pool.get_by_role("button", name="Проверить", exact=True)).to_have_count(0)
+    assert page_has_no_overflow(page)
+
+    page.locator("#ip-panel summary").press("Enter")
+    page.get_by_role("button", name="Обновить IP").press("Enter")
+    first_ip_row = page.locator("#ip-list .row").filter(has_text=first_ip)
+    second_ip_row = page.locator("#ip-list .row").filter(has_text=second_ip)
+    for row in (first_ip_row, second_ip_row):
+        expect(row).to_contain_text("Доступен на VDS · включён")
+    expect(source.locator("option:checked")).to_have_text(first_ip)
+    proxy = proxies.first
+    proxy_id_label = proxy.inner_text().split(" · ")[0]
+    expect(proxy).to_contain_text("Ожидает проверки")
+    expect(proxy).to_contain_text("Проверка ещё не запускалась")
+    proxy.get_by_role("button", name="Отключить", exact=True).press("Enter")
+    expect(proxy).to_contain_text("Отключён вручную")
+    expect(proxy.get_by_role("button", name="Включить", exact=True)).to_be_disabled()
+    batch = pool.get_by_role("button", name="Проверить импортированные")
+    batch.press("Enter")
+    expect(proxy).to_contain_text("TLS до MAX установлен")
+    expect(proxy).to_contain_text("Отключён вручную")
+    expect(proxies.last).to_contain_text("Включён")
+    expect(batch).to_be_focused()
+
+    source.press("ArrowDown")
+    expect(source.locator("option:checked")).to_have_text(second_ip)
+    expect(proxy).to_contain_text(proxy_id_label)
+    expect(proxy).to_contain_text("Ожидает проверки")
+    proxy.get_by_role("button", name="Проверить", exact=True).press("Enter")
+    expect(proxy).to_contain_text("SOCKS5 отклонил авторизацию")
+    expect(proxy).to_contain_text("Приостановлен")
+
+    second_ip_row.get_by_role("button", name="Отключить", exact=True).press("Enter")
+    expect(source.locator("option:checked")).to_have_text(f"{second_ip} (отключён вручную)")
+    expect(proxy).to_contain_text("SOCKS5 отклонил авторизацию")
+    expect(proxy.get_by_role("button", name="Проверить", exact=True)).to_be_disabled()
+    source.press("ArrowUp")
+    expect(source.locator("option:checked")).to_have_text(first_ip)
+    expect(proxy).to_contain_text(proxy_id_label)
+    expect(proxy).to_contain_text("TLS до MAX установлен")
+    expect(proxy).to_contain_text("Отключён вручную")
+    proxy.get_by_role("button", name="Включить", exact=True).press("Enter")
+    expect(proxy).to_contain_text("Включён")
+    expect(proxy.get_by_role("button", name="Отключить", exact=True)).to_be_focused()
+    expect(pool.get_by_role("button", name="Добавить прокси")).to_have_count(1)
     assert page_has_no_overflow(page)
 
 

@@ -1,11 +1,16 @@
 import sqlite3
 import asyncio
 import logging
+from contextlib import closing
+from datetime import date
 from types import SimpleNamespace
 
+import pytest
+
 from maxbot_v2.crypto import SecretBox
-from maxbot_v2.db import connect, initialize
+from maxbot_v2.db import SCHEMA, connect, initialize
 from maxbot_v2.egress import assign_ip
+from maxbot_v2.send_proxies import assigned_or_allocate_proxy, resume_proxy_blocked_slots
 from maxbot_v2.session_vault import EncryptedSessionFile
 from maxbot_v2.max_adapter import PyMaxAdapter
 from maxbot_v2.onboarding import join_group_and_confirm_membership, member_proof, normalize_russian_phone
@@ -15,28 +20,243 @@ from scripts.restore import restore_backup
 
 def test_send_proxy_check_migration_preserves_legacy_proxy_rows(tmp_path):
     database = tmp_path / "prior-release.db"
-    with sqlite3.connect(database) as connection:
+    with closing(connect(database)) as connection:
         connection.executescript(
+            "CREATE TABLE server_ips (id INTEGER PRIMARY KEY, address TEXT NOT NULL UNIQUE, "
+            "enabled INTEGER NOT NULL DEFAULT 0, available INTEGER NOT NULL DEFAULT 0, last_checked_at TEXT); "
+            "INSERT INTO server_ips(id,address,enabled,available) VALUES(1,'62.109.20.186',1,1); "
             "CREATE TABLE send_proxies (id INTEGER PRIMARY KEY, ip_id INTEGER NOT NULL REFERENCES server_ips(id), "
             "url_ciphertext TEXT NOT NULL, url_fingerprint TEXT NOT NULL, "
             "enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)), UNIQUE(ip_id,url_fingerprint)); "
             "INSERT INTO send_proxies VALUES(100,1,'encrypted-fixture','fingerprint-fixture',1);"
         )
-    connection = connect(database)
-    try:
         initialize(connection)
         initialize(connection)
-        connection.execute("INSERT INTO server_ips(id,address,enabled,available) VALUES(1,'62.109.20.186',1,1)")
         proxy = connection.execute("SELECT * FROM send_proxies").fetchone()
         assert (proxy["id"], proxy["url_ciphertext"], proxy["url_fingerprint"], proxy["enabled"]) == (
             100, "encrypted-fixture", "fingerprint-fixture", 1,
         )
         assert proxy["check_status"] == "unchecked"
         assert proxy["last_checked_at"] is None
+        assert proxy["manual_disabled"] == 0
+        assert tuple(connection.execute("SELECT enabled,manual_disabled FROM server_ips WHERE id=1").fetchone()) == (1, 0)
+        assert tuple(connection.execute(
+            "SELECT ip_id,proxy_id,enabled,manual_disabled,check_status,last_checked_at FROM send_proxy_routes"
+        ).fetchone()) == (1, 100, 1, 0, "unchecked", None)
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-    finally:
-        connection.close()
+
+
+def test_shared_send_proxy_migration_keeps_per_ip_health_and_assignments_after_restore(tmp_path):
+    source = tmp_path / "prior-release.db"
+    box = SecretBox(SecretBox.generate_key())
+    shared_url = "socks5://fixture-user:fixture-secret@8.8.4.4:1080"
+    unique_url = "socks5://1.1.1.1:1080"
+    unique_ciphertext = box.encrypt(unique_url)
+    shared_ciphertext = box.encrypt(shared_url)
+    with closing(connect(source)) as connection:
+        connection.executescript(SCHEMA)
+        connection.executescript("""
+            DROP TABLE IF EXISTS send_proxy_pool_assignments;
+            DROP TABLE IF EXISTS send_proxy_routes;
+            DROP TABLE IF EXISTS send_proxy_pool;
+            INSERT INTO groups(id,name,invite_link) VALUES(1,'Group','https://max.ru/join/fixture');
+            INSERT INTO accounts(id,group_id,phone,full_name) VALUES
+                (1,1,'+70000000001','Fixture A'), (2,1,'+70000000002','Fixture B'), (3,1,'+70000000003','Fixture C');
+            INSERT INTO server_ips(id,address,enabled,available) VALUES(1,'62.109.20.186',1,1), (2,'62.109.20.187',1,1);
+            INSERT INTO ip_assignments(account_id,ip_id) VALUES(1,1), (2,2), (3,1);
+            INSERT INTO proxies(id,group_id,url_ciphertext,label,position) VALUES(7,1,'encrypted-historical','historical',1);
+            INSERT INTO proxy_assignments(account_id,proxy_id,assigned_at) VALUES(1,7,'2026-11-01 12:00:00');
+        """)
+        connection.executemany(
+            "INSERT INTO send_proxies(id,ip_id,url_ciphertext,url_fingerprint,enabled,manual_disabled,check_status,last_checked_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (
+                (11, 1, box.encrypt(shared_url), "fingerprint-shared", 1, 0, "ok", "2026-11-18T08:00:00+00:00"),
+                (23, 2, unique_ciphertext, "fingerprint-unique", 0, 0, "unchecked", None),
+                (42, 2, shared_ciphertext, "fingerprint-shared", 0, 1, "tls_failed", "2026-11-19T08:00:00+00:00"),
+            ),
+        )
+        connection.executescript("""
+            INSERT INTO send_proxy_assignments(account_id,proxy_id,assigned_at) VALUES
+                (1,11,'2026-11-18 09:00:00'), (2,42,'2026-11-19 09:00:00'), (3,23,'2026-11-19 10:00:00');
+        """)
+
+    archive = create_backup(source, tmp_path, tmp_path / "legacy-backup.zip")
+    restored = tmp_path / "restored"
+    restore_backup(archive, restored)
+
+    with closing(connect(restored / "maxbot.sqlite3")) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        connection.executescript(SCHEMA)
+        connection.execute(
+            "CREATE TRIGGER fail_route_migration BEFORE INSERT ON send_proxy_routes "
+            "BEGIN SELECT RAISE(ABORT, 'fixture_route_migration_failure'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="fixture_route_migration_failure"):
+            initialize(connection)
+        assert connection.execute("SELECT COUNT(*) FROM send_proxy_pool").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM send_proxy_assignments").fetchone()[0] == 3
+        connection.execute("DROP TRIGGER fail_route_migration")
+        initialize(connection)
+
+        assert [tuple(row) for row in connection.execute("SELECT * FROM send_proxy_pool ORDER BY id")] == [
+            (23, unique_ciphertext, "fingerprint-unique"), (42, shared_ciphertext, "fingerprint-shared"),
+        ]
+        assert [tuple(row) for row in connection.execute(
+            "SELECT ip_id,proxy_id,enabled,manual_disabled,check_status,last_checked_at FROM send_proxy_routes ORDER BY ip_id,proxy_id"
+        )] == [
+            (1, 42, 1, 0, "ok", "2026-11-18T08:00:00+00:00"),
+            (2, 23, 0, 0, "unchecked", None),
+            (2, 42, 0, 1, "tls_failed", "2026-11-19T08:00:00+00:00"),
+        ]
+        assert [tuple(row) for row in connection.execute("SELECT * FROM send_proxy_pool_assignments ORDER BY account_id")] == [
+            (1, 42, "2026-11-18 09:00:00"), (2, 42, "2026-11-19 09:00:00"), (3, 23, "2026-11-19 10:00:00"),
+        ]
+        assert [box.decrypt(row[0]) for row in connection.execute(
+            "SELECT p.url_ciphertext FROM send_proxy_pool_assignments a JOIN send_proxy_pool p ON p.id=a.proxy_id "
+            "ORDER BY a.account_id"
+        )] == [shared_url, shared_url, unique_url]
+        assert [row[0] for row in connection.execute("SELECT id FROM send_proxies ORDER BY id")] == [11, 23, 42]
+        assert [tuple(row) for row in connection.execute("SELECT * FROM send_proxy_assignments ORDER BY account_id")] == [
+            (1, 11, "2026-11-18 09:00:00"), (2, 42, "2026-11-19 09:00:00"), (3, 23, "2026-11-19 10:00:00"),
+        ]
+        assert connection.execute("SELECT url_ciphertext FROM proxies WHERE id=7").fetchone()[0] == "encrypted-historical"
+        assert tuple(connection.execute("SELECT * FROM proxy_assignments").fetchone()) == (1, 7, "2026-11-01 12:00:00")
+
+        connection.execute(
+            "UPDATE send_proxy_routes SET enabled=1,manual_disabled=0,check_status='ok',last_checked_at='2026-11-20T08:00:00+00:00' "
+            "WHERE ip_id=2 AND proxy_id=42"
+        )
+        connection.execute("DELETE FROM send_proxy_routes WHERE ip_id=2 AND proxy_id=23")
+        connection.execute("UPDATE send_proxy_pool_assignments SET proxy_id=23,assigned_at='2026-11-20 09:00:00' WHERE account_id=1")
+        initialize(connection)
+
+        assert [tuple(row) for row in connection.execute(
+            "SELECT ip_id,proxy_id,enabled,manual_disabled,check_status,last_checked_at FROM send_proxy_routes WHERE ip_id=2 ORDER BY proxy_id"
+        )] == [
+            (2, 42, 1, 0, "ok", "2026-11-20T08:00:00+00:00"),
+        ]
+        assert tuple(connection.execute("SELECT * FROM send_proxy_pool_assignments WHERE account_id=1").fetchone()) == (
+            1, 23, "2026-11-20 09:00:00",
+        )
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_shared_proxy_pool_preview_backfills_manual_disabling_without_remigrating_assignments(tmp_path):
+    with closing(connect(tmp_path / "shared-pool-preview.db")) as connection:
+        connection.executescript(SCHEMA)
+        connection.executescript("""
+            DROP TABLE send_proxy_routes;
+            CREATE TABLE send_proxy_routes (
+                ip_id INTEGER NOT NULL REFERENCES server_ips(id),
+                proxy_id INTEGER NOT NULL REFERENCES send_proxy_pool(id),
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+                check_status TEXT NOT NULL DEFAULT 'unchecked',
+                last_checked_at TEXT,
+                PRIMARY KEY(ip_id, proxy_id)
+            );
+            INSERT INTO groups(id,name,invite_link) VALUES(1,'Group','https://max.ru/join/fixture');
+            INSERT INTO accounts(id,group_id,phone,full_name) VALUES(1,1,'+70000000001','Fixture');
+            INSERT INTO server_ips(id,address,enabled,available) VALUES(1,'62.109.20.186',1,1), (2,'62.109.20.187',1,1);
+            INSERT INTO send_proxies(id,ip_id,url_ciphertext,url_fingerprint) VALUES(17,1,'encrypted-old','fingerprint-old');
+            INSERT INTO send_proxy_assignments(account_id,proxy_id,assigned_at) VALUES(1,17,'2026-11-19 09:00:00');
+            INSERT INTO send_proxy_pool VALUES(17,'encrypted-old','fingerprint-old'), (18,'encrypted-new','fingerprint-new');
+            INSERT INTO send_proxy_pool_assignments(account_id,proxy_id,assigned_at) VALUES(1,18,'2026-11-27 10:00:00');
+            INSERT INTO send_proxy_routes VALUES
+                (1,17,0,'ok','2026-11-27T08:00:00+00:00'), (2,17,1,'ok','2026-11-27T09:00:00+00:00'),
+                (1,18,0,'unchecked',NULL), (2,18,0,'tls_failed','2026-11-27T10:00:00+00:00');
+            INSERT INTO settings(key,value) VALUES('send_proxy_pool_migrated','1');
+        """)
+
+        initialize(connection)
+
+        assert [tuple(row) for row in connection.execute(
+            "SELECT ip_id,proxy_id,enabled,manual_disabled,check_status,last_checked_at FROM send_proxy_routes ORDER BY ip_id,proxy_id"
+        )] == [
+            (1, 17, 0, 1, "ok", "2026-11-27T08:00:00+00:00"),
+            (1, 18, 0, 0, "unchecked", None),
+            (2, 17, 1, 0, "ok", "2026-11-27T09:00:00+00:00"),
+            (2, 18, 0, 0, "tls_failed", "2026-11-27T10:00:00+00:00"),
+        ]
+        connection.execute("UPDATE send_proxy_routes SET manual_disabled=0 WHERE ip_id=1 AND proxy_id=17")
+        initialize(connection)
+        assert connection.execute("SELECT manual_disabled FROM send_proxy_routes WHERE ip_id=1 AND proxy_id=17").fetchone()[0] == 0
+        assert tuple(connection.execute("SELECT * FROM send_proxy_pool_assignments").fetchone()) == (1, 18, "2026-11-27 10:00:00")
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_send_proxy_allocation_counts_active_assignments_across_ips_and_keeps_existing_proxy():
+    with closing(connect(":memory:")) as connection:
+        initialize(connection)
+        connection.executescript("""
+            INSERT INTO groups(id,name,invite_link) VALUES(1,'Group','https://max.ru/join/fixture');
+            INSERT INTO accounts(id,group_id,phone,full_name,lifecycle) VALUES
+                (1,1,'+70000000001','Fixture A','active'), (2,1,'deleted:2','','deleted'),
+                (3,1,'+70000000003','Fixture C','active'), (4,1,'+70000000004','Fixture D','active');
+            INSERT INTO server_ips(id,address,enabled,available) VALUES
+                (1,'62.109.20.186',1,1), (2,'62.109.20.187',1,1), (3,'62.109.20.188',1,1);
+            INSERT INTO ip_assignments(account_id,ip_id) VALUES(1,2), (3,1), (4,3);
+            INSERT INTO send_proxy_pool VALUES
+                (1,'encrypted-first','fingerprint-first'), (2,'encrypted-second','fingerprint-second'),
+                (3,'encrypted-third','fingerprint-third'), (4,'encrypted-fourth','fingerprint-fourth'),
+                (5,'encrypted-fifth','fingerprint-fifth');
+            INSERT INTO send_proxy_routes(ip_id,proxy_id,enabled,manual_disabled,check_status) VALUES
+                (1,1,1,0,'tls_failed'), (1,2,0,0,'ok'), (1,3,1,1,'ok'),
+                (1,4,1,0,'ok'), (2,4,1,0,'ok'), (1,5,1,0,'ok');
+            INSERT INTO send_proxy_pool_assignments(account_id,proxy_id) VALUES(1,4),(2,5);
+            BEGIN IMMEDIATE;
+        """)
+
+        chosen = assigned_or_allocate_proxy(connection, 3, 1)
+        assert (chosen["id"], chosen["enabled"], chosen["manual_disabled"], chosen["check_status"]) == (5, 1, 0, "ok")
+        assert assigned_or_allocate_proxy(connection, 4, 3) is None
+
+        connection.execute("UPDATE ip_assignments SET ip_id=2 WHERE account_id=3")
+        assigned = assigned_or_allocate_proxy(connection, 3, 2)
+        assert (assigned["id"], assigned["enabled"], assigned["manual_disabled"], assigned["check_status"]) == (5, None, None, None)
+        assert [tuple(row) for row in connection.execute(
+            "SELECT account_id,proxy_id FROM send_proxy_pool_assignments ORDER BY account_id"
+        )] == [(1, 4), (2, 5), (3, 5)]
+        connection.commit()
+
+
+def test_proxy_blocked_slots_resume_only_for_ready_route_on_the_assigned_ip():
+    with closing(connect(":memory:")) as connection:
+        initialize(connection)
+        connection.executescript("""
+            INSERT INTO groups(id,name,invite_link) VALUES(1,'Group','https://max.ru/join/fixture');
+            INSERT INTO accounts(id,group_id,phone,full_name) VALUES(1,1,'+70000000001','Fixture A'), (2,1,'+70000000002','Fixture B');
+            INSERT INTO server_ips(id,address,enabled,available) VALUES(1,'62.109.20.186',1,1), (2,'62.109.20.187',1,1);
+            INSERT INTO ip_assignments(account_id,ip_id) VALUES(1,1), (2,1);
+            INSERT INTO send_proxy_pool VALUES(1,'encrypted-first','fingerprint-first'), (2,'encrypted-second','fingerprint-second');
+            INSERT INTO send_proxy_routes(ip_id,proxy_id,enabled,check_status) VALUES(2,1,1,'ok'), (1,2,1,'ok');
+            INSERT INTO send_proxy_pool_assignments(account_id,proxy_id) VALUES(1,1);
+            INSERT INTO message_versions(id,created_at,checksum) VALUES(1,'2026-11-23','checksum-fixture');
+            INSERT INTO weekly_slots(slot_id,account_id,group_id,week_start,scheduled_date,message_version_id,text,status,error_code,updated_at) VALUES
+                ('assigned-past',1,1,'2026-11-23','2026-11-23',1,'fixture','blocked','send_proxy_unavailable','2026-11-23'),
+                ('assigned-today',1,1,'2026-11-23','2026-11-26',1,'fixture','blocked','send_proxy_unavailable','2026-11-26'),
+                ('unassigned-today',2,1,'2026-11-23','2026-11-26',1,'fixture','blocked','send_proxy_required','2026-11-26');
+        """)
+        today = date(2026, 11, 26)
+
+        resume_proxy_blocked_slots(connection, 1, today)
+
+        assert [tuple(row) for row in connection.execute("SELECT status,error_code FROM weekly_slots ORDER BY id")] == [
+            ("blocked", "send_proxy_unavailable"), ("blocked", "send_proxy_unavailable"), ("queued", None),
+        ]
+        connection.execute("INSERT INTO send_proxy_routes(ip_id,proxy_id,enabled,manual_disabled,check_status) VALUES(1,1,1,1,'ok')")
+        resume_proxy_blocked_slots(connection, 1, today)
+        assert connection.execute("SELECT status FROM weekly_slots WHERE slot_id='assigned-today'").fetchone()[0] == "blocked"
+
+        connection.execute("UPDATE send_proxy_routes SET manual_disabled=0 WHERE ip_id=1 AND proxy_id=1")
+        resume_proxy_blocked_slots(connection, 1, today)
+
+        assert [tuple(row) for row in connection.execute("SELECT status,error_code FROM weekly_slots ORDER BY id")] == [
+            ("missed", None), ("queued", None), ("queued", None),
+        ]
 
 
 def test_pymax_adapter_calls_provider_without_local_authorization_file():
